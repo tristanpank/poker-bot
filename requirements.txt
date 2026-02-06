@@ -1,0 +1,8 @@
+rlcard
+torch
+matplotlib
+seaborn
+jupyter
+numpy
+pokerkit
+gymnasium
