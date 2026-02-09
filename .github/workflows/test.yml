@@ -5,7 +5,7 @@ name: Backend Tests
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, '*']  # Run on all branches
   pull_request:
     branches: [main, master]
 
