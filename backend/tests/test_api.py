@@ -124,11 +124,13 @@ class TestActionEndpoint:
             "big_blind": 10
         }
     
+    @pytest.mark.requires_models
     def test_action_returns_200(self, client, valid_game_state):
         """Action endpoint should return 200 OK for valid input."""
         response = client.post("/poker/action", json=valid_game_state)
         assert response.status_code == 200
     
+    @pytest.mark.requires_models
     def test_action_response_structure(self, client, valid_game_state):
         """Action response should have all required fields."""
         response = client.post("/poker/action", json=valid_game_state)
@@ -141,6 +143,7 @@ class TestActionEndpoint:
         assert "hand_strength_category" in data
         assert "q_values" in data
     
+    @pytest.mark.requires_models
     def test_action_id_is_valid(self, client, valid_game_state):
         """Action ID should be between 0 and 5."""
         response = client.post("/poker/action", json=valid_game_state)
@@ -148,6 +151,7 @@ class TestActionEndpoint:
         
         assert 0 <= data["action_id"] <= 5
     
+    @pytest.mark.requires_models
     def test_action_name_matches_id(self, client, valid_game_state):
         """Action name should match the action ID."""
         action_names = {
@@ -165,6 +169,7 @@ class TestActionEndpoint:
         expected_name = action_names[data["action_id"]]
         assert data["action"] == expected_name
     
+    @pytest.mark.requires_models
     def test_equity_is_valid_range(self, client, valid_game_state):
         """Equity should be between 0 and 1."""
         response = client.post("/poker/action", json=valid_game_state)
@@ -172,6 +177,7 @@ class TestActionEndpoint:
         
         assert 0 <= data["equity"] <= 1
     
+    @pytest.mark.requires_models
     def test_hand_strength_is_valid(self, client, valid_game_state):
         """Hand strength category should be a valid value."""
         valid_categories = ["Trash", "Marginal", "Decent", "Strong", "Monster"]
@@ -181,6 +187,7 @@ class TestActionEndpoint:
         
         assert data["hand_strength_category"] in valid_categories
     
+    @pytest.mark.requires_models
     def test_q_values_has_all_actions(self, client, valid_game_state):
         """Q-values should include all 6 actions."""
         response = client.post("/poker/action", json=valid_game_state)
@@ -189,6 +196,7 @@ class TestActionEndpoint:
         expected_keys = {"FOLD", "CALL", "RAISE_SMALL", "RAISE_MEDIUM", "RAISE_LARGE", "ALL_IN"}
         assert set(data["q_values"].keys()) == expected_keys
     
+    @pytest.mark.requires_models
     def test_action_with_flop(self, client):
         """Test action with community cards on the flop."""
         game_state = {

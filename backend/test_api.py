@@ -24,8 +24,6 @@ def test_card_conversion():
     card2 = CardSchema(rank='K', suit='s')
     result2 = card_schema_to_pokerkit(card2)
     print(f"  ✅ Converted 'Ks': rank={result2.rank}, suit={result2.suit}")
-    
-    return True
 
 
 def test_game_service():
@@ -68,8 +66,6 @@ def test_game_service():
     
     legal_actions = game_service.get_legal_actions(game_state)
     print(f"  ✅ Legal actions: {legal_actions}")
-    
-    return True
 
 
 def test_model_service():
@@ -85,7 +81,7 @@ def test_model_service():
     
     if not available:
         print("  ⚠️ No models found - skipping inference test")
-        return True
+        return
     
     # Load default model
     version = available[-1]  # Use latest
@@ -94,7 +90,7 @@ def test_model_service():
         print(f"  ✅ Loaded model: {version}")
     except Exception as e:
         print(f"  ❌ Failed to load model: {e}")
-        return False
+        assert False, f"Failed to load model: {e}"
     
     # Test inference
     observation = np.zeros(520, dtype=np.float32)
@@ -102,8 +98,6 @@ def test_model_service():
     
     action, q_values = model_service.get_action(observation, legal_actions, version)
     print(f"  ✅ Inference: action={action}, q_values={list(q_values.values())[:3]}...")
-    
-    return True
 
 
 def test_full_pipeline():
@@ -123,7 +117,7 @@ def test_full_pipeline():
     available = model_service.get_available_models()
     if not available:
         print("  ⚠️ No models - skipping full pipeline test")
-        return True
+        return
     
     # Create game state
     game_state = GameStateRequest(
@@ -169,8 +163,6 @@ def test_full_pipeline():
     print(f"  ✅ Amount: {amount}")
     print(f"  ✅ Equity: {equity:.2%}")
     print(f"  ✅ Hand Strength: {HAND_STRENGTH_CATEGORIES[strength_cat]}")
-    
-    return True
 
 
 if __name__ == "__main__":

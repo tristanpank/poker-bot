@@ -30,7 +30,7 @@ jobs:
       
       - name: Run tests
         run: |
-          pytest backend/tests/test_api.py -v --tb=short --junitxml=test-results.xml
+          pytest backend/tests/test_api.py -v --tb=short -rs --junitxml=test-results.xml
       
       - name: Upload test results
         uses: actions/upload-artifact@v4
