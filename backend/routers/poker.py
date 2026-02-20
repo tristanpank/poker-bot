@@ -4,6 +4,7 @@ Poker API router with endpoints for bot actions and health checks.
 
 from fastapi import APIRouter, HTTPException, Depends
 
+from backend.config import get_settings
 from backend.models.schemas import (
     GameStateRequest,
     ActionResponse,
@@ -12,7 +13,6 @@ from backend.models.schemas import (
     ACTION_NAMES,
     HAND_STRENGTH_CATEGORIES,
 )
-from backend.services.model_service import get_model_service, ModelService
 from backend.services.game_service import get_game_service, GameService, compute_hand_strength_category
 
 
@@ -20,36 +20,34 @@ router = APIRouter(prefix="/poker", tags=["poker"])
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check(
-    model_service: ModelService = Depends(get_model_service)
-) -> HealthResponse:
+async def health_check() -> HealthResponse:
     """
     Health check endpoint.
     
     Returns API status and available models.
     """
-    available_models = model_service.get_available_models()
-    model_loaded = any(model_service.is_loaded(v) for v in available_models)
+    settings = get_settings()
+    available_models = settings.get_available_models()
     
     return HealthResponse(
         status="healthy",
-        model_loaded=model_loaded,
+        # Keep health lightweight and independent of torch/model runtime imports.
+        model_loaded=False,
         available_models=available_models,
     )
 
 
 @router.get("/models", response_model=list[ModelInfo])
-async def list_models(
-    model_service: ModelService = Depends(get_model_service)
-) -> list[ModelInfo]:
+async def list_models() -> list[ModelInfo]:
     """
     List available model versions.
     """
-    available = model_service.get_available_models()
+    settings = get_settings()
+    available = settings.get_available_models()
     models = []
     
     for version in available:
-        path = model_service.settings.get_model_path(version)
+        path = settings.get_model_path(version)
         models.append(ModelInfo(
             version=version,
             path=str(path),
@@ -63,7 +61,6 @@ async def list_models(
 @router.post("/action", response_model=ActionResponse)
 async def get_action(
     game_state: GameStateRequest,
-    model_service: ModelService = Depends(get_model_service),
     game_service: GameService = Depends(get_game_service),
 ) -> ActionResponse:
     """
@@ -78,6 +75,16 @@ async def get_action(
         
         # Get legal actions
         legal_actions = game_service.get_legal_actions(game_state)
+
+        # Lazily import model service so route registration doesn't require torch.
+        try:
+            from backend.services.model_service import get_model_service
+            model_service = get_model_service()
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Model service unavailable: {str(e)}",
+            ) from e
         
         # Get model's action
         version = game_state.model_version
@@ -107,5 +114,7 @@ async def get_action(
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
