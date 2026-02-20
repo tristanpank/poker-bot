@@ -246,8 +246,14 @@ class CvService:
             )
 
         min_second = second - (BASELINE_WINDOW_MS // 1000)
-        while session.baseline_buckets and session.baseline_buckets[0].second < min_second:
-            session.baseline_buckets.pop(0)
+        drop_count = 0
+        for bucket in session.baseline_buckets:
+            if bucket.second < min_second:
+                drop_count += 1
+            else:
+                break
+        if drop_count:
+            session.baseline_buckets = session.baseline_buckets[drop_count:]
 
         if not session.baseline_buckets:
             return stress, bluff_risk, 0.0
