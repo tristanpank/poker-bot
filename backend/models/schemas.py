@@ -2,7 +2,7 @@
 Pydantic schemas for API request/response models.
 """
 
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -185,3 +185,70 @@ class ModelInfo(BaseModel):
     path: str
     state_dim: int = 520
     num_actions: int = 6
+
+
+class CvAnalyzeRequest(BaseModel):
+    """Frame analysis request from frontend webcam stream."""
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_schema_extra={
+            "example": {
+                "sessionId": "session-123",
+                "timestamp": 1765935300000,
+                "width": 160,
+                "height": 90,
+                "rgbaBase64": "AAECAwQFBgcICQ==",
+                "streamFps": 24.3,
+            }
+        }
+    )
+
+    session_id: str = Field(..., alias="sessionId")
+    timestamp: int = Field(..., ge=0)
+    width: int = Field(..., ge=1, le=2048)
+    height: int = Field(..., ge=1, le=2048)
+    rgba_base64: str = Field(..., alias="rgbaBase64", min_length=1)
+    stream_fps: float = Field(..., alias="streamFps", ge=0)
+
+
+class CvMetrics(BaseModel):
+    """Computed CV and bluff-related metrics."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    brightness: float = Field(..., ge=0, le=100)
+    motion: float = Field(..., ge=0, le=100)
+    edge_density: float = Field(..., alias="edgeDensity", ge=0, le=100)
+    activity_zone: Literal["none", "left", "center", "right"] = Field(
+        ..., alias="activityZone"
+    )
+    pulse_bpm: Optional[float] = Field(default=None, alias="pulseBpm", ge=0, le=240)
+    pulse_confidence: float = Field(..., alias="pulseConfidence", ge=0, le=100)
+    skin_coverage: float = Field(..., alias="skinCoverage", ge=0, le=100)
+    stress: float = Field(..., ge=0, le=100)
+    emotion: Literal["unknown", "calm", "focused", "tense", "agitated"]
+    bluff_risk: float = Field(..., alias="bluffRisk", ge=0, le=100)
+    bluff_level: Literal["low", "watch", "elevated"] = Field(..., alias="bluffLevel")
+    baseline_progress: float = Field(..., alias="baselineProgress", ge=0, le=100)
+    baseline_stress: float = Field(..., alias="baselineStress", ge=0, le=100)
+    baseline_bluff: float = Field(..., alias="baselineBluff", ge=0, le=100)
+    bluff_delta: float = Field(..., alias="bluffDelta", ge=-100, le=100)
+    signal_quality: Literal["poor", "fair", "good"] = Field(..., alias="signalQuality")
+    analysis_fps: float = Field(..., alias="analysisFps", ge=0)
+    stream_fps: float = Field(..., alias="streamFps", ge=0)
+    updated_at: str = Field(..., alias="updatedAt")
+
+
+class CvAnalyzeResponse(BaseModel):
+    """Response payload for frame analysis."""
+
+    metrics: CvMetrics
+
+
+class CvSessionClearRequest(BaseModel):
+    """Request payload for clearing per-session backend CV state."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_id: str = Field(..., alias="sessionId")
