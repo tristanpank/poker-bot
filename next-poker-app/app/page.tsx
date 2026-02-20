@@ -417,6 +417,7 @@ export default function Home() {
                     return;
                   }
 
+                  setError(null);
                   setMetrics(result.metrics);
                   setBluffHistory((previous) => {
                     const now = performance.now();
