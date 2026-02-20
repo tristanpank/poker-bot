@@ -1,4 +1,4 @@
-﻿"""
+"""
 FastAPI application entry point for the Poker Bot API.
 
 Run with: uvicorn backend.main:app --reload
