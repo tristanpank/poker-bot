@@ -40,22 +40,35 @@ type BluffPoint = {
   value: number;
 };
 
-type CvAnalyzeResponse = {
-  metrics: VisionMetrics;
-};
-
 type CaptureResult = {
   fps: number;
   width: number;
   height: number;
 };
 
-const W = 256;
-const H = 144;
-const ANALYSIS_FRAME_MS = 16;
+/** Per-frame metadata sent by requestVideoFrameCallback (where available). */
+type VideoFrameCallbackMetadata = {
+  presentationTime: DOMHighResTimeStamp;
+  expectedDisplayTime: DOMHighResTimeStamp;
+  width: number;
+  height: number;
+  mediaTime: number;
+  presentedFrames: number;
+  processingDuration?: number;
+};
+
+type HTMLVideoElementWithRVFC = HTMLVideoElement & {
+  requestVideoFrameCallback(
+    cb: (now: DOMHighResTimeStamp, meta: VideoFrameCallbackMetadata) => void,
+  ): number;
+  cancelVideoFrameCallback(id: number): void;
+};
+
 const BLUFF_WINDOW_MS = 30_000;
 const SEND_MAX_BITRATE = 45_000_000;
 const SEND_MAX_FPS = 60;
+/** Center-crop factor: keep center 70% of each dimension before sending to backend. */
+const CENTER_CROP_FACTOR = 0.7;
 const BACKEND_BASE_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ??
   "http://localhost:8000";
@@ -251,24 +264,43 @@ async function tuneCaptureTrack(track: MediaStreamTrack): Promise<CaptureResult>
   return best;
 }
 
+/** Wait until the RTCPeerConnection has finished gathering ICE candidates. */
+function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") {
+      resolve();
+      return;
+    }
+    const onStateChange = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", onStateChange);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", onStateChange);
+  });
+}
+
 export default function Home() {
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  /** Shows the center-cropped stream being sent to the backend. */
+  const cropPreviewRef = useRef<HTMLVideoElement | null>(null);
 
   const localStreamRef = useRef<MediaStream | null>(null);
-  const senderPcRef = useRef<RTCPeerConnection | null>(null);
-  const receiverPcRef = useRef<RTCPeerConnection | null>(null);
+  /** RTCPeerConnection to the backend server for video ingest. */
+  const backendPcRef = useRef<RTCPeerConnection | null>(null);
+  /** DataChannel for metadata (frontend→backend) and metrics (backend→frontend). */
+  const metaChannelRef = useRef<RTCDataChannel | null>(null);
+  /** MediaStream produced by the center-crop canvas (sent to backend). */
+  const captureStreamRef = useRef<MediaStream | null>(null);
+  /** Hidden canvas that holds the center-cropped frame. */
+  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cropCtxRef = useRef<CanvasRenderingContext2D | null>(null);
 
-  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const lastSampleTsRef = useRef<number | null>(null);
-  const lastDecodedTsRef = useRef<number | null>(null);
-  const lastDecodedFramesRef = useRef<number | null>(null);
-  const lastAnalyzedDecodedFramesRef = useRef<number | null>(null);
-  const lastAnalyzedVideoTimeRef = useRef<number | null>(null);
   const smoothStreamFpsRef = useRef(0);
-  const requestInFlightRef = useRef(false);
+  const lastRvfcTsRef = useRef<number | null>(null);
+  const rvfcHandleRef = useRef<number | null>(null);
+  const frameIdRef = useRef(0);
   const sessionIdRef = useRef(createSessionId());
   const activeRef = useRef(false);
 
@@ -282,15 +314,25 @@ export default function Home() {
     const { resetMetrics = false, updateState = true } = opts;
     activeRef.current = false;
 
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
+    // Cancel requestVideoFrameCallback or requestAnimationFrame, whichever is active.
+    // Both cancel functions are no-ops for unknown handles per spec.
+    if (rvfcHandleRef.current !== null) {
+      const handle = rvfcHandleRef.current;
+      rvfcHandleRef.current = null;
+      cancelAnimationFrame(handle);
+      const lv = localVideoRef.current;
+      if (lv && "cancelVideoFrameCallback" in lv) {
+        (lv as HTMLVideoElementWithRVFC).cancelVideoFrameCallback(handle);
+      }
     }
 
-    senderPcRef.current?.close();
-    receiverPcRef.current?.close();
-    senderPcRef.current = null;
-    receiverPcRef.current = null;
+    backendPcRef.current?.close();
+    backendPcRef.current = null;
+    metaChannelRef.current = null;
+
+    // Stop the canvas capture stream tracks.
+    captureStreamRef.current?.getTracks().forEach((t) => t.stop());
+    captureStreamRef.current = null;
 
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -298,20 +340,13 @@ export default function Home() {
     }
 
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
-    if (remoteVideoRef.current) {
-      const s = remoteVideoRef.current.srcObject;
-      if (s instanceof MediaStream) s.getTracks().forEach((t) => t.stop());
-      remoteVideoRef.current.srcObject = null;
-    }
+    if (cropPreviewRef.current) cropPreviewRef.current.srcObject = null;
 
-    ctxRef.current = null;
-    lastSampleTsRef.current = null;
-    lastDecodedTsRef.current = null;
-    lastDecodedFramesRef.current = null;
-    lastAnalyzedDecodedFramesRef.current = null;
-    lastAnalyzedVideoTimeRef.current = null;
+    cropCanvasRef.current = null;
+    cropCtxRef.current = null;
+    lastRvfcTsRef.current = null;
     smoothStreamFpsRef.current = 0;
-    requestInFlightRef.current = false;
+    frameIdRef.current = 0;
 
     const previousSessionId = sessionIdRef.current;
     sessionIdRef.current = createSessionId();
@@ -328,129 +363,6 @@ export default function Home() {
       setCaptureInfo("--");
     }
   }, []);
-  const runAnalysis = useCallback(
-    function loop(ts: number) {
-      if (!activeRef.current) return;
-
-      if (lastSampleTsRef.current === null || ts - lastSampleTsRef.current >= ANALYSIS_FRAME_MS) {
-        lastSampleTsRef.current = ts;
-
-        const video = remoteVideoRef.current;
-        const canvas = canvasRef.current;
-
-        if (video && canvas && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-          let streamFps = smoothStreamFpsRef.current;
-          let decodedFrames: number | null = null;
-          if (typeof video.getVideoPlaybackQuality === "function") {
-            const quality = video.getVideoPlaybackQuality();
-            decodedFrames = quality.totalVideoFrames;
-
-            if (lastDecodedFramesRef.current !== null && lastDecodedTsRef.current !== null) {
-              const frameDelta = decodedFrames - lastDecodedFramesRef.current;
-              const dt = ts - lastDecodedTsRef.current;
-              if (frameDelta >= 0 && dt > 0) {
-                const instantStreamFps = (frameDelta * 1000) / dt;
-                streamFps =
-                  smoothStreamFpsRef.current === 0
-                    ? instantStreamFps
-                    : smoothStreamFpsRef.current * 0.75 + instantStreamFps * 0.25;
-                smoothStreamFpsRef.current = streamFps;
-              }
-            }
-
-            lastDecodedFramesRef.current = decodedFrames;
-            lastDecodedTsRef.current = ts;
-          }
-
-          const hasNewDecodedFrame =
-            decodedFrames !== null
-              ? lastAnalyzedDecodedFramesRef.current === null ||
-                decodedFrames > lastAnalyzedDecodedFramesRef.current
-              : lastAnalyzedVideoTimeRef.current === null ||
-                video.currentTime > lastAnalyzedVideoTimeRef.current + 0.0005;
-
-          if (!hasNewDecodedFrame) {
-            rafRef.current = requestAnimationFrame(loop);
-            return;
-          }
-
-          if (canvas.width !== W) canvas.width = W;
-          if (canvas.height !== H) canvas.height = H;
-
-          if (!ctxRef.current) {
-            ctxRef.current = canvas.getContext("2d", { willReadFrequently: true });
-          }
-
-          const ctx = ctxRef.current;
-          if (ctx) {
-            ctx.drawImage(video, 0, 0, W, H);
-            if (!requestInFlightRef.current) {
-              const frame = ctx.getImageData(0, 0, W, H);
-              const timestamp = Date.now();
-              const params = new URLSearchParams({
-                sessionId: sessionIdRef.current,
-                timestamp: String(timestamp),
-                width: String(W),
-                height: String(H),
-                streamFps: String(r1(streamFps)),
-              });
-
-              requestInFlightRef.current = true;
-              if (decodedFrames !== null) {
-                lastAnalyzedDecodedFramesRef.current = decodedFrames;
-              }
-              lastAnalyzedVideoTimeRef.current = video.currentTime;
-
-              void fetch(`${BACKEND_BASE_URL}/cv/analyze-raw?${params.toString()}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/octet-stream" },
-                body: frame.data,
-              })
-                .then(async (response) => {
-                  if (!response.ok) {
-                    throw new Error(`Backend analysis failed (${response.status})`);
-                  }
-                  return (await response.json()) as CvAnalyzeResponse;
-                })
-                .then((result) => {
-                  if (!activeRef.current) {
-                    return;
-                  }
-
-                  setError(null);
-                  setMetrics(result.metrics);
-                  setBluffHistory((previous) => {
-                    const now = performance.now();
-                    const next = [...previous, { t: now, value: result.metrics.bluffRisk }];
-                    const minTs = now - BLUFF_WINDOW_MS;
-                    let firstValidIndex = 0;
-
-                    while (firstValidIndex < next.length && next[firstValidIndex].t < minTs) {
-                      firstValidIndex += 1;
-                    }
-
-                    return firstValidIndex > 0 ? next.slice(firstValidIndex) : next;
-                  });
-                })
-                .catch((caughtError) => {
-                  const message =
-                    caughtError instanceof Error
-                      ? caughtError.message
-                      : "Unknown backend analysis error.";
-                  setError(message);
-                })
-                .finally(() => {
-                  requestInFlightRef.current = false;
-                });
-            }
-          }
-        }
-      }
-
-      rafRef.current = requestAnimationFrame(loop);
-    },
-    [],
-  );
 
   const startStream = useCallback(async () => {
     if (isStreaming) return;
@@ -479,26 +391,6 @@ export default function Home() {
         void localVideoRef.current.play().catch(() => undefined);
       }
 
-      const sender = new RTCPeerConnection();
-      const receiver = new RTCPeerConnection();
-      senderPcRef.current = sender;
-      receiverPcRef.current = receiver;
-
-      sender.onicecandidate = (e) => {
-        if (e.candidate) void receiver.addIceCandidate(e.candidate).catch(() => undefined);
-      };
-      receiver.onicecandidate = (e) => {
-        if (e.candidate) void sender.addIceCandidate(e.candidate).catch(() => undefined);
-      };
-
-      receiver.ontrack = (e) => {
-        const [stream] = e.streams;
-        if (stream && remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = stream;
-          void remoteVideoRef.current.play().catch(() => undefined);
-        }
-      };
-
       const [videoTrack] = localStream.getVideoTracks();
       if (!videoTrack) {
         throw new Error("No video track available from camera.");
@@ -518,38 +410,224 @@ export default function Home() {
           : "--",
       );
 
-      const transceiver = sender.addTransceiver(videoTrack, {
+      // ── Create the center-crop canvas and capture stream ────────────────────
+      const cropCanvas = document.createElement("canvas");
+      // Initial placeholder dimensions; updated each frame.
+      const initialCropW = Math.max(1, Math.floor((capture.width || 640) * CENTER_CROP_FACTOR));
+      const initialCropH = Math.max(1, Math.floor((capture.height || 480) * CENTER_CROP_FACTOR));
+      cropCanvas.width = initialCropW;
+      cropCanvas.height = initialCropH;
+      cropCanvasRef.current = cropCanvas;
+      cropCtxRef.current = cropCanvas.getContext("2d", { willReadFrequently: false });
+
+      const captureStream = cropCanvas.captureStream(SEND_MAX_FPS);
+      captureStreamRef.current = captureStream;
+
+      // Show the crop preview in the secondary video element.
+      if (cropPreviewRef.current) {
+        cropPreviewRef.current.srcObject = captureStream;
+        void cropPreviewRef.current.play().catch(() => undefined);
+      }
+
+      // ── Create backend RTCPeerConnection ────────────────────────────────────
+      const pc = new RTCPeerConnection();
+      backendPcRef.current = pc;
+
+      // DataChannel must be created before the offer (so it's included in the SDP).
+      const metaChannel = pc.createDataChannel("metadata", { ordered: true });
+      metaChannelRef.current = metaChannel;
+
+      // Receive CV metrics back from the backend via the DataChannel.
+      metaChannel.onmessage = (event) => {
+        if (!activeRef.current) return;
+        try {
+          const receivedMetrics = JSON.parse(event.data as string) as VisionMetrics;
+          setError(null);
+          setMetrics(receivedMetrics);
+          setBluffHistory((previous) => {
+            const now = performance.now();
+            const next = [...previous, { t: now, value: receivedMetrics.bluffRisk }];
+            const minTs = now - BLUFF_WINDOW_MS;
+            let firstValidIndex = 0;
+            while (firstValidIndex < next.length && next[firstValidIndex].t < minTs) {
+              firstValidIndex += 1;
+            }
+            return firstValidIndex > 0 ? next.slice(firstValidIndex) : next;
+          });
+        } catch {
+          // Ignore malformed metrics messages.
+        }
+      };
+
+      metaChannel.onerror = () => {
+        if (activeRef.current) setError("DataChannel error; metrics may be unavailable.");
+      };
+
+      // Add the center-cropped canvas stream track to the peer connection.
+      const [cropTrack] = captureStream.getVideoTracks();
+      if (!cropTrack) {
+        throw new Error("No video track from crop canvas capture stream.");
+      }
+      const transceiver = pc.addTransceiver(cropTrack, {
         direction: "sendonly",
-        streams: [localStream],
+        streams: [captureStream],
       });
       preferVideoCodecs(transceiver);
       await tuneVideoSender(transceiver.sender);
 
-      const offer = await sender.createOffer();
-      await sender.setLocalDescription(offer);
-      await receiver.setRemoteDescription(offer);
-      const answer = await receiver.createAnswer();
-      await receiver.setLocalDescription(answer);
-      await sender.setRemoteDescription(answer);
+      // Build the offer and wait for ICE gathering to complete so that
+      // all candidates are embedded in the SDP before sending to the backend.
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
 
-      lastSampleTsRef.current = null;
-      lastDecodedTsRef.current = null;
-      lastDecodedFramesRef.current = null;
-      lastAnalyzedDecodedFramesRef.current = null;
-      lastAnalyzedVideoTimeRef.current = null;
-      smoothStreamFpsRef.current = 0;
-      requestInFlightRef.current = false;
-      sessionIdRef.current = createSessionId();
+      const response = await fetch(`${BACKEND_BASE_URL}/cv/webrtc/offer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sdp: pc.localDescription!.sdp,
+          type: pc.localDescription!.type,
+          sessionId: sessionIdRef.current,
+        }),
+      });
 
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Backend WebRTC signaling failed (${response.status}): ${detail}`);
+      }
+
+      const answer = (await response.json()) as { sdp: string; type: RTCSdpType };
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+      // ── Start per-frame processing loop ────────────────────────────────────
       activeRef.current = true;
       setIsStreaming(true);
-      rafRef.current = requestAnimationFrame(runAnalysis);
+
+      const localVideo = localVideoRef.current;
+      if (localVideo) {
+        const videoWithRVFC = localVideo as unknown as HTMLVideoElementWithRVFC;
+
+        if ("requestVideoFrameCallback" in videoWithRVFC) {
+          // High-resolution per-frame callback: draw crop and send metadata.
+          const onRvfcFrame = (now: DOMHighResTimeStamp) => {
+            if (!activeRef.current) return;
+
+            const vw = localVideo.videoWidth;
+            const vh = localVideo.videoHeight;
+
+            if (vw > 0 && vh > 0) {
+              // Smooth stream FPS estimate from inter-frame timing.
+              if (lastRvfcTsRef.current !== null) {
+                const dt = now - lastRvfcTsRef.current;
+                if (dt > 0) {
+                  const instantFps = 1000 / dt;
+                  smoothStreamFpsRef.current =
+                    smoothStreamFpsRef.current === 0
+                      ? instantFps
+                      : smoothStreamFpsRef.current * 0.9 + instantFps * 0.1;
+                }
+              }
+              lastRvfcTsRef.current = now;
+
+              const canvas = cropCanvasRef.current;
+              const ctx = cropCtxRef.current;
+              if (canvas && ctx) {
+                const cropW = Math.floor(vw * CENTER_CROP_FACTOR);
+                const cropH = Math.floor(vh * CENTER_CROP_FACTOR);
+                const cropX = Math.floor((vw - cropW) / 2);
+                const cropY = Math.floor((vh - cropH) / 2);
+
+                if (canvas.width !== cropW) canvas.width = cropW;
+                if (canvas.height !== cropH) canvas.height = cropH;
+
+                ctx.drawImage(localVideo, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+              }
+
+              // Send per-frame metadata via DataChannel.
+              const channel = metaChannelRef.current;
+              if (channel && channel.readyState === "open") {
+                // Convert performance.now()-relative timestamp to Unix epoch ms.
+                const captureTs = Math.round(performance.timeOrigin + now);
+                channel.send(
+                  JSON.stringify({
+                    sessionId: sessionIdRef.current,
+                    frameId: frameIdRef.current++,
+                    captureTs,
+                    streamFps: r1(smoothStreamFpsRef.current),
+                    cropWidth: canvas?.width ?? 0,
+                    cropHeight: canvas?.height ?? 0,
+                  }),
+                );
+              }
+            }
+
+            rvfcHandleRef.current = videoWithRVFC.requestVideoFrameCallback(onRvfcFrame);
+          };
+
+          rvfcHandleRef.current = videoWithRVFC.requestVideoFrameCallback(onRvfcFrame);
+        } else {
+          // Fallback: rAF loop that draws the crop and sends metadata.
+          const onRafFrame = (ts: DOMHighResTimeStamp) => {
+            if (!activeRef.current) return;
+
+            const vw = localVideo.videoWidth;
+            const vh = localVideo.videoHeight;
+
+            if (vw > 0 && vh > 0 && localVideo.readyState >= 2) {
+              if (lastRvfcTsRef.current !== null) {
+                const dt = ts - lastRvfcTsRef.current;
+                if (dt > 0) {
+                  const instantFps = 1000 / dt;
+                  smoothStreamFpsRef.current =
+                    smoothStreamFpsRef.current === 0
+                      ? instantFps
+                      : smoothStreamFpsRef.current * 0.9 + instantFps * 0.1;
+                }
+              }
+              lastRvfcTsRef.current = ts;
+
+              const canvas = cropCanvasRef.current;
+              const ctx = cropCtxRef.current;
+              if (canvas && ctx) {
+                const cropW = Math.floor(vw * CENTER_CROP_FACTOR);
+                const cropH = Math.floor(vh * CENTER_CROP_FACTOR);
+                const cropX = Math.floor((vw - cropW) / 2);
+                const cropY = Math.floor((vh - cropH) / 2);
+
+                if (canvas.width !== cropW) canvas.width = cropW;
+                if (canvas.height !== cropH) canvas.height = cropH;
+
+                ctx.drawImage(localVideo, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+              }
+
+              const channel = metaChannelRef.current;
+              if (channel && channel.readyState === "open") {
+                const captureTs = Math.round(performance.timeOrigin + ts);
+                channel.send(
+                  JSON.stringify({
+                    sessionId: sessionIdRef.current,
+                    frameId: frameIdRef.current++,
+                    captureTs,
+                    streamFps: r1(smoothStreamFpsRef.current),
+                    cropWidth: canvas?.width ?? 0,
+                    cropHeight: canvas?.height ?? 0,
+                  }),
+                );
+              }
+            }
+
+            rvfcHandleRef.current = requestAnimationFrame(onRafFrame);
+          };
+
+          rvfcHandleRef.current = requestAnimationFrame(onRafFrame);
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error while starting stream.";
       setError(`Unable to start camera stream: ${msg}`);
       teardown({ resetMetrics: true, updateState: true });
     }
-  }, [isStreaming, runAnalysis, teardown]);
+  }, [isStreaming, teardown]);
 
   const stopStream = useCallback(() => {
     teardown({ resetMetrics: true, updateState: true });
@@ -618,9 +696,9 @@ export default function Home() {
           </div>
 
           <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
-            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">WebRTC received stream</h2>
+            <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">Center-crop preview (sent to backend)</h2>
             <video
-              ref={remoteVideoRef}
+              ref={cropPreviewRef}
               className="aspect-video w-full rounded-lg border border-slate-700 bg-black object-cover"
               autoPlay
               muted
@@ -672,8 +750,6 @@ export default function Home() {
           <p className="mt-4 text-xs text-slate-400">
             Optimized for low compute cost and responsiveness, not forensic certainty.
           </p>
-
-          <canvas ref={canvasRef} className="hidden" />
         </section>
       </main>
     </div>
