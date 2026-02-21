@@ -52,7 +52,7 @@ type CaptureResult = {
 
 const W = 256;
 const H = 144;
-const ANALYSIS_FRAME_MS = 16;
+const ANALYSIS_FRAME_MS = 120;
 const BLUFF_WINDOW_MS = 30_000;
 const SEND_MAX_BITRATE = 45_000_000;
 const SEND_MAX_FPS = 60;
