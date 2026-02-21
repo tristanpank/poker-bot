@@ -149,3 +149,41 @@ def test_cv_session_delete_returns_ok() -> None:
     )
     assert response.status_code == 200
     assert response.json()["ok"] is True
+
+
+def test_cv_webrtc_offer_returns_answer() -> None:
+    """A valid SDP offer should be answered with an SDP answer."""
+    import asyncio
+
+    from aiortc import RTCPeerConnection
+
+    async def _make_offer() -> dict:
+        pc = RTCPeerConnection()
+        pc.createDataChannel("frames")
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        await pc.close()
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
+    offer = asyncio.run(_make_offer())
+
+    client = TestClient(app)
+    response = client.post(
+        "/cv/webrtc-offer",
+        json={"sdp": offer["sdp"], "type": offer["type"], "sessionId": "wrtc-test"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["type"] == "answer"
+    assert "sdp" in data
+    assert len(data["sdp"]) > 0
+
+
+def test_cv_webrtc_offer_rejects_invalid_type() -> None:
+    """Offering a non-offer SDP type should return a validation error."""
+    client = TestClient(app)
+    response = client.post(
+        "/cv/webrtc-offer",
+        json={"sdp": "v=0\r\n", "type": "answer", "sessionId": "wrtc-bad"},
+    )
+    assert response.status_code == 422

@@ -13,6 +13,9 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 
+# WebRTC ingest
+aiortc
+
 # Testing
 pytest
 httpx

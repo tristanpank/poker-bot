@@ -52,6 +52,7 @@ type CaptureResult = {
 
 const W = 256;
 const H = 144;
+const CROP_FACTOR = 0.70; // Center crop: keep middle 70% of width and height.
 const ANALYSIS_FRAME_MS = 16;
 const BLUFF_WINDOW_MS = 30_000;
 const SEND_MAX_BITRATE = 45_000_000;
@@ -259,6 +260,8 @@ export default function Home() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const senderPcRef = useRef<RTCPeerConnection | null>(null);
   const receiverPcRef = useRef<RTCPeerConnection | null>(null);
+  const backendPcRef = useRef<RTCPeerConnection | null>(null);
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
 
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -291,6 +294,12 @@ export default function Home() {
     receiverPcRef.current?.close();
     senderPcRef.current = null;
     receiverPcRef.current = null;
+
+    if (backendPcRef.current) {
+      backendPcRef.current.close();
+      backendPcRef.current = null;
+    }
+    dataChannelRef.current = null;
 
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -383,8 +392,42 @@ export default function Home() {
 
           const ctx = ctxRef.current;
           if (ctx) {
-            ctx.drawImage(video, 0, 0, W, H);
-            if (!requestInFlightRef.current) {
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
+            const cropX = vw * ((1 - CROP_FACTOR) / 2);
+            const cropY = vh * ((1 - CROP_FACTOR) / 2);
+            ctx.drawImage(video, cropX, cropY, vw * CROP_FACTOR, vh * CROP_FACTOR, 0, 0, W, H);
+
+            const dc = dataChannelRef.current;
+            if (dc && dc.readyState === "open") {
+              // WebRTC DataChannel transport: fire-and-forget, metrics arrive via dc.onmessage.
+              const frame = ctx.getImageData(0, 0, W, H);
+              const timestamp = Date.now();
+              const headerJson = JSON.stringify({
+                sessionId: sessionIdRef.current,
+                timestamp,
+                width: W,
+                height: H,
+                streamFps: r1(streamFps),
+              });
+              const headerBytes = new TextEncoder().encode(headerJson);
+              const lenBuf = new ArrayBuffer(4);
+              new DataView(lenBuf).setUint32(0, headerBytes.length, true);
+              const payload = new Uint8Array(4 + headerBytes.length + frame.data.length);
+              payload.set(new Uint8Array(lenBuf), 0);
+              payload.set(headerBytes, 4);
+              payload.set(frame.data, 4 + headerBytes.length);
+              if (decodedFrames !== null) {
+                lastAnalyzedDecodedFramesRef.current = decodedFrames;
+              }
+              lastAnalyzedVideoTimeRef.current = video.currentTime;
+              try {
+                dc.send(payload.buffer);
+              } catch {
+                // DataChannel send failed; next tick will retry or fall back to HTTP POST.
+              }
+            } else if (!requestInFlightRef.current) {
+              // HTTP POST fallback.
               const frame = ctx.getImageData(0, 0, W, H);
               const timestamp = Date.now();
               const params = new URLSearchParams({
@@ -544,6 +587,65 @@ export default function Home() {
       activeRef.current = true;
       setIsStreaming(true);
       rafRef.current = requestAnimationFrame(runAnalysis);
+
+      // Attempt to set up a WebRTC DataChannel to the backend for efficient
+      // frame delivery.  Failures are non-fatal; HTTP POST remains the fallback.
+      try {
+        const backendPc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        backendPcRef.current = backendPc;
+
+        const dc = backendPc.createDataChannel("frames", {
+          // Unordered, unreliable: drop stale frames rather than buffer them.
+          // For real-time analysis it is always better to process the freshest
+          // frame available than to deliver an old one reliably.
+          ordered: false,
+          maxRetransmits: 0,
+        });
+        dataChannelRef.current = dc;
+
+        dc.onmessage = (event) => {
+          if (!activeRef.current) return;
+          try {
+            const result = JSON.parse(event.data as string) as CvAnalyzeResponse;
+            setError(null);
+            setMetrics(result.metrics);
+            setBluffHistory((previous) => {
+              const now = performance.now();
+              const next = [...previous, { t: now, value: result.metrics.bluffRisk }];
+              const minTs = now - BLUFF_WINDOW_MS;
+              let firstValidIndex = 0;
+              while (firstValidIndex < next.length && next[firstValidIndex].t < minTs) {
+                firstValidIndex += 1;
+              }
+              return firstValidIndex > 0 ? next.slice(firstValidIndex) : next;
+            });
+          } catch {
+            // Ignore malformed responses.
+          }
+        };
+
+        const offer = await backendPc.createOffer();
+        await backendPc.setLocalDescription(offer);
+
+        const sigResp = await fetch(`${BACKEND_BASE_URL}/cv/webrtc-offer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: offer.sdp,
+            type: offer.type,
+            sessionId: sessionIdRef.current,
+          }),
+        });
+
+        if (sigResp.ok) {
+          const answer = (await sigResp.json()) as { sdp: string; type: string };
+          await backendPc.setRemoteDescription(new RTCSessionDescription(answer));
+        }
+      } catch {
+        // WebRTC DataChannel setup failed; HTTP POST will be used for all frames.
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error while starting stream.";
       setError(`Unable to start camera stream: ${msg}`);
