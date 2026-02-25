@@ -8,8 +8,11 @@ from backend.models.schemas import (
     CvAnalyzeRequest,
     CvAnalyzeResponse,
     CvSessionClearRequest,
+    WebRtcAnswerResponse,
+    WebRtcOfferRequest,
 )
 from backend.services.cv_service import CvService, get_cv_service
+from backend.services.webrtc_service import WebRtcIngestService, get_webrtc_service
 
 
 router = APIRouter(prefix="/cv", tags=["cv"])
@@ -66,3 +69,29 @@ async def clear_session(
     """Clear session analysis state."""
     cv_service.clear_session(request.session_id)
     return {"ok": True}
+
+
+@router.post("/webrtc/offer", response_model=WebRtcAnswerResponse)
+async def webrtc_offer(
+    request: WebRtcOfferRequest,
+    webrtc_service: WebRtcIngestService = Depends(get_webrtc_service),
+) -> WebRtcAnswerResponse:
+    """
+    Exchange SDP to establish a WebRTC ingest connection.
+
+    The frontend sends a video track and a DataChannel named 'metadata'.
+    The DataChannel carries per-frame metadata (sessionId, frameId,
+    captureTs, streamFps) from the frontend to the backend, and CV
+    metrics from the backend back to the frontend.
+    """
+    try:
+        answer_sdp, answer_type = await webrtc_service.handle_offer(
+            sdp=request.sdp,
+            offer_type=request.type,
+            session_id=request.session_id,
+        )
+        return WebRtcAnswerResponse(sdp=answer_sdp, type=answer_type)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"WebRTC offer failed: {str(exc)}"
+        ) from exc

@@ -137,17 +137,61 @@ Available actions: `FOLD`, `CALL`, `RAISE_SMALL`, `RAISE_MEDIUM`, `RAISE_LARGE`,
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/cv/analyze` | Analyze a Base64-encoded RGBA frame and return bluff/stress metrics |
-| `POST` | `/cv/analyze-raw` | Analyze a raw RGBA byte-stream frame (used by the frontend) |
+| `POST` | `/cv/analyze-raw` | Analyze a raw RGBA byte-stream frame |
+| `POST` | `/cv/webrtc/offer` | WebRTC signaling: accept an SDP offer and return an SDP answer |
 | `DELETE` | `/cv/session` | Clear per-session baseline state |
 
 Metrics returned include: brightness, motion, edge density, activity zone, pulse BPM (POS algorithm), pulse confidence, skin coverage, stress index, emotion state (`calm` / `focused` / `tense` / `agitated`), bluff risk score, bluff level (`low` / `watch` / `elevated`), bluff delta vs. baseline, and analysis/stream FPS.
+
+#### WebRTC ingest (`POST /cv/webrtc/offer`)
+
+The primary ingest path. The frontend opens a WebRTC peer connection directly to the backend and sends a center-cropped (center 70% of width × height) video stream. A DataChannel (`metadata`) carries accurate per-frame capture timestamps from the frontend to the backend, and CV metrics are returned to the frontend over the same channel.
+
+**Request body**
+
+```json
+{
+  "sdp": "<SDP offer string>",
+  "type": "offer",
+  "sessionId": "<uuid>"
+}
+```
+
+**Response**
+
+```json
+{
+  "sdp": "<SDP answer string>",
+  "type": "answer"
+}
+```
+
+**DataChannel metadata message (frontend → backend)**
+
+```json
+{
+  "sessionId": "<uuid>",
+  "frameId": 42,
+  "captureTs": 1765935300123,
+  "streamFps": 29.9,
+  "cropWidth": 896,
+  "cropHeight": 504
+}
+```
+
+`captureTs` is a Unix epoch millisecond timestamp derived from `performance.timeOrigin + requestVideoFrameCallback.now`, providing sub-millisecond accuracy for heart-rate estimation.
+
+**DataChannel metrics message (backend → frontend)**
+
+The backend responds to each decoded frame with the full `CvMetrics` JSON (same schema as `/cv/analyze` responses).
 
 ## Frontend
 
 The Next.js app (`next-poker-app/`) provides a real-time deception-proxy dashboard:
 
-- **WebRTC loopback stream** – captures your camera at the highest negotiated resolution and frame rate, routes it through a local WebRTC peer connection for frame decoding, and samples frames for analysis
-- **Live CV metrics panel** – displays all backend CV metrics (pulse, stress, emotion, bluff risk, signal quality, etc.) updated in real time
+- **WebRTC backend stream** – captures your camera at the highest negotiated resolution and frame rate, applies a center crop (central 70% × 70%) to focus on the face region, and sends the cropped stream directly to the backend via a WebRTC peer connection
+- **DataChannel** – opens a `metadata` DataChannel on the same peer connection; the frontend sends accurate per-frame capture timestamps (via `requestVideoFrameCallback`) with each frame, and the backend returns CV metrics on the same channel
+- **Live CV metrics panel** – displays all backend CV metrics (pulse, stress, emotion, bluff risk, signal quality, etc.) updated in real time via the DataChannel
 - **Bluff-pressure trend chart** – SVG chart showing bluff-risk history over a rolling 30-second window
 - **Session management** – automatically creates and clears per-session baseline state on the backend
 

@@ -12,6 +12,7 @@ gymnasium
 fastapi
 uvicorn[standard]
 pydantic-settings
+aiortc
 
 # Testing
 pytest

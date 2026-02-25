@@ -252,3 +252,20 @@ class CvSessionClearRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     session_id: str = Field(..., alias="sessionId")
+
+
+class WebRtcOfferRequest(BaseModel):
+    """SDP offer from the frontend to initiate a WebRTC ingest connection."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    sdp: str = Field(..., min_length=1)
+    type: str = Field(..., pattern="^offer$")
+    session_id: str = Field(..., alias="sessionId")
+
+
+class WebRtcAnswerResponse(BaseModel):
+    """SDP answer returned by the backend after processing the offer."""
+
+    sdp: str
+    type: str
