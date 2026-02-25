@@ -3,3 +3,6 @@ venv
 .venv
 checkpoints
 test_repos
+
+# Docker
+docker-compose.override.yml

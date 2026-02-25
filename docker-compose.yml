@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount backend source for hot-reload during development
+      - ./backend:/app/backend
+      # Mount model checkpoints at runtime (keeps image small)
+      - ./training/checkpoints:/app/training/checkpoints:ro
+    environment:
+      - ENABLE_POKER_ROUTER=1
+      - ENABLE_POKER_PRELOAD=0
+    # --reload watches for file changes and auto-restarts uvicorn
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    restart: unless-stopped
