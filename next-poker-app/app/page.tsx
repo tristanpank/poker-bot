@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 
 type ActivityZone = "none" | "left" | "center" | "right";
 type EmotionState = "unknown" | "calm" | "focused" | "tense" | "agitated";
@@ -671,6 +672,15 @@ export default function Home() {
             >
               Stop stream
             </button>
+
+            <Link href="/design">
+              <button
+                type="button"
+                className="rounded-md bg-rose-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-rose-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
+              >
+                Go to Design
+              </button>
+            </Link>
 
             <span className={`rounded-md px-3 py-1 text-xs font-medium ${isStreaming ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700 text-slate-200"}`}>
               {isStreaming ? "Live" : "Offline"}
