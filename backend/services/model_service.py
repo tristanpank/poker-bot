@@ -89,8 +89,12 @@ class ModelService:
         
         # Try to import the version-specific model
         try:
-            if version_num >= "15":
-                # V15+ uses 520-dim state for 6-max
+            if version_num >= "19":
+                # V19+ uses 520-dim state with weighted equity
+                from poker_model_v19 import DuelingPokerNet
+                return DuelingPokerNet(state_dim=520)
+            elif version_num >= "15":
+                # V15-18 uses 520-dim state for 6-max
                 from poker_model_v18 import DuelingPokerNet
                 return DuelingPokerNet(state_dim=520)
             elif version_num >= "13":
@@ -99,11 +103,11 @@ class ModelService:
                 return DuelingPokerNet(state_dim=385)
             else:
                 # Fallback to latest architecture
-                from poker_model_v18 import DuelingPokerNet
+                from poker_model_v19 import DuelingPokerNet
                 return DuelingPokerNet(state_dim=520)
         except ImportError:
-            # Fallback: try V18 model as it's the latest
-            from poker_model_v18 import DuelingPokerNet
+            # Fallback: try V19 model as it's the latest
+            from poker_model_v19 import DuelingPokerNet
             return DuelingPokerNet(state_dim=520)
     
     def get_action(

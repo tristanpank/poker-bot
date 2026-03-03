@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     debug: bool = False
     
     # Model Settings
-    model_version: str = "v18"
+    model_version: str = "v19"
     model_checkpoint_dir: Path = Path(__file__).parent.parent / "training" / "checkpoints"
     default_model_path: str = ""  # Set dynamically below
     
