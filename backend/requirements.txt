@@ -1,0 +1,14 @@
+# Backend API dependencies
+fastapi
+uvicorn[standard]
+pydantic-settings
+pokerkit
+numpy
+aiortc
+
+# PyTorch CPU-only (keeps image small; inference doesn't need CUDA)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# Testing
+httpx
