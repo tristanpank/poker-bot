@@ -24,8 +24,8 @@ function PokerGame() {
   const [bigBlind, setBigBlind] = useState<number>(2);
   const [buyIn, setBuyIn] = useState<number>(200);
   const [spotsFromBB, setSpotsFromBB] = useState<number>(0);
-
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMounted(true);
   }, []);
 
