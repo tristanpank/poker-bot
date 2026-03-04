@@ -12,6 +12,8 @@ services:
       - ./backend:/app/backend
       # Mount model checkpoints at runtime (keeps image small)
       - ./training/checkpoints:/app/training/checkpoints:ro
+      # Mount model class definitions so new models are available without rebuild
+      - ./training/src/models:/app/training/src/models:ro
     environment:
       - ENABLE_POKER_ROUTER=1
       - ENABLE_POKER_PRELOAD=0
