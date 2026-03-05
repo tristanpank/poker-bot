@@ -1,11 +1,17 @@
 """
-Poker Model V19: Pluribus-like Training Overhaul
+Poker Model V19: Range-Weighted Monte Carlo Equity
 
-Key improvements over V18:
-1. 100% self-play training with 5 frozen snapshots.
-2. Linearly-weighted opponent sampling (newer models sampled more often).
-3. Pure BB profit/loss as reward (no artificial shaping).
-4. No opponent adaptation.
+Key improvement over V18:
+1. Range-weighted Monte Carlo equity for more realistic post-flop equity estimates
+   - Opponent hands sampled with weights based on hand strength rankings
+   - Street-aware: later streets = tighter opponent ranges
+   - Preflop remains unweighted (all hands equally likely)
+
+Everything else is identical to V18:
+- Massive bust penalty (-200 BB)
+- Stronger all-in loss penalty (-15 BB base)
+- No bonus for winning all-ins
+- Supports hybrid training modes (scripted + self-play)
 """
 
 import torch
@@ -15,19 +21,16 @@ from typing import List, Dict, Optional
 from collections import deque
 import random
 import copy
+from enum import Enum
 
 # 6 actions for expanded bet sizing
-NUM_ACTIONS_V19 = 10
+NUM_ACTIONS_V19 = 6
 ACTION_FOLD = 0
-ACTION_CHECK = 1
-ACTION_CALL = 2
-ACTION_RAISE_33POT = 3
-ACTION_RAISE_50POT = 4
-ACTION_RAISE_66POT = 5
-ACTION_RAISE_75POT = 6
-ACTION_RAISE_100POT = 7
-ACTION_RAISE_150POT = 8
-ACTION_ALL_IN = 9
+ACTION_CALL = 1
+ACTION_RAISE_SMALL = 2
+ACTION_RAISE_MEDIUM = 3
+ACTION_RAISE_LARGE = 4
+ACTION_ALL_IN = 5
 
 # Position constants (6-max)
 POS_UTG = 0
@@ -36,6 +39,23 @@ POS_CO = 2
 POS_BTN = 3
 POS_SB = 4
 POS_BB = 5
+
+# V19 PENALTY PARAMETERS (same as V18)
+ALLIN_LOSS_PENALTY_BASE = -15.0
+ALLIN_LOSS_MARGINAL = -10.0
+ALLIN_LOSS_OKAY = -5.0
+ALLIN_LOSS_UNLUCKY = -2.0
+BUST_PENALTY = -200.0
+ALLIN_FREQUENCY_FREE = 2
+ALLIN_FREQUENCY_PENALTY = -2.0
+
+
+class SessionMode(Enum):
+    """Training session modes for hybrid training."""
+    SCRIPTED = "scripted"     # All opponents are scripted bots
+    SELF_PLAY = "self_play"   # All opponents are from self-play pool
+    MIXED = "mixed"           # Mix of scripted and self-play
+
 
 class DuelingPokerNet(nn.Module):
     """
@@ -97,7 +117,7 @@ class OpponentPool:
         snapshot.to(self.device)
         
         self.models.append(snapshot)
-        self.creation_steps.append(max(1, training_step))
+        self.creation_steps.append(training_step)
         
         # Remove oldest if over capacity (FIFO)
         if len(self.models) > self.max_size:
@@ -105,30 +125,16 @@ class OpponentPool:
             self.creation_steps.pop(0)
     
     def sample_opponent(self) -> Optional[DuelingPokerNet]:
-        """Linearly-weighted sampling based on training_step (Pluribus style)."""
+        """Randomly sample an opponent from the pool."""
         if not self.models:
             return None
-            
-        weights = np.array(self.creation_steps, dtype=np.float32)
-        if weights.sum() == 0:
-            weights = np.ones_like(weights)
-            
-        probs = weights / weights.sum()
-        idx = np.random.choice(len(self.models), p=probs)
-        return self.models[idx]
+        return random.choice(self.models)
     
     def sample_opponents(self, n: int) -> List[Optional[DuelingPokerNet]]:
-        """Sample n opponents with replacement, weighted by training step."""
+        """Sample n opponents (with replacement if pool is smaller)."""
         if not self.models:
             return [None] * n
-            
-        weights = np.array(self.creation_steps, dtype=np.float32)
-        if weights.sum() == 0:
-            weights = np.ones_like(weights)
-            
-        probs = weights / weights.sum()
-        indices = np.random.choice(len(self.models), size=n, p=probs, replace=True)
-        return [self.models[i] for i in indices]
+        return [random.choice(self.models) for _ in range(n)]
     
     def __len__(self):
         return len(self.models)
@@ -140,6 +146,36 @@ class OpponentPool:
             'max_size': self.max_size,
             'steps': self.creation_steps.copy()
         }
+
+
+def get_session_mode(session_num: int) -> SessionMode:
+    """
+    Determine the session mode based on training phase.
+    
+    Phase 1 (sessions 1-1000): Learn basics against scripted bots
+      - 60% scripted, 10% self-play, 30% mixed
+    
+    Phase 2 (sessions 1000+): Balanced hybrid training
+      - 33% scripted, 33% self-play, 34% mixed
+    """
+    r = random.random()
+    
+    if session_num <= 1000:
+        # Phase 1: Heavy scripted to learn fundamentals
+        if r < 0.60:
+            return SessionMode.SCRIPTED
+        elif r < 0.70:
+            return SessionMode.SELF_PLAY
+        else:
+            return SessionMode.MIXED
+    else:
+        # Phase 2: Balanced
+        if r < 0.33:
+            return SessionMode.SCRIPTED
+        elif r < 0.66:
+            return SessionMode.SELF_PLAY
+        else:
+            return SessionMode.MIXED
 
 
 class PrioritizedReplayBuffer:
@@ -214,9 +250,176 @@ def compute_hand_strength_category(equity: float) -> int:
         return 4  # Monster
 
 
-def compute_v19_hand_reward(profit_bb: float) -> float:
+# ============== V19 REWARD FUNCTIONS (same as V18) ==============
+
+def compute_allin_outcome_penalty(action: int, won_hand: bool, equity: float) -> float:
     """
-    V19: Pure BB profit/loss.
-    No artificial shaping or penalties. Just raw outcomes.
+    Severe penalty for losing all-ins, scaled by how bad the decision was.
+    V18/V19: Even stronger penalties, NO bonus for winning.
     """
-    return profit_bb
+    if action != ACTION_ALL_IN:
+        return 0.0
+    
+    if not won_hand:
+        # Lost all-in - penalty based on equity
+        if equity < 0.50:
+            return ALLIN_LOSS_PENALTY_BASE  # -15.0: Terrible play
+        elif equity < 0.70:
+            return ALLIN_LOSS_MARGINAL      # -10.0: Marginal spot
+        elif equity < 0.85:
+            return ALLIN_LOSS_OKAY          # -5.0: Okay spot
+        else:
+            return ALLIN_LOSS_UNLUCKY       # -2.0: Just unlucky
+    
+    # Won all-in - NO bonus (gambling shouldn't feel good)
+    return 0.0
+
+
+def compute_allin_frequency_penalty(allin_count: int, session_hands: int = 30) -> float:
+    """
+    Penalize excessive all-in usage.
+    Target <5% all-in rate
+    """
+    if allin_count <= ALLIN_FREQUENCY_FREE:
+        return 0.0
+    
+    excess = allin_count - ALLIN_FREQUENCY_FREE
+    return ALLIN_FREQUENCY_PENALTY * excess  # -2.0 per excess
+
+
+def compute_risk_adjusted_reward(base_reward: float, action: int, equity: float) -> float:
+    """
+    Discount high-variance plays.
+    """
+    if action != ACTION_ALL_IN:
+        return base_reward
+    
+    variance = equity * (1 - equity)
+    discount = 1.0 - variance * 1.5
+    discount = max(0.5, min(1.0, discount))
+    
+    return base_reward * discount
+
+
+def compute_bust_penalty(final_stack_bb: float, bust_threshold: float = 5.0) -> float:
+    """
+    MASSIVE penalty for busting.
+    -200 BB
+    """
+    if final_stack_bb < bust_threshold:
+        return BUST_PENALTY
+    return 0.0
+
+
+def compute_survival_bonus(session_completed: bool, final_stack_bb: float, 
+                           starting_stack_bb: float = 100.0) -> float:
+    """
+    Bonus for completing a full session without busting.
+    """
+    if not session_completed:
+        return 0.0
+    
+    if final_stack_bb > starting_stack_bb:
+        return 5.0  # Profitable session
+    elif final_stack_bb >= starting_stack_bb * 0.8:
+        return 3.0  # Maintained stack
+    else:
+        return 1.0  # Survived but lost chips
+
+
+def compute_v19_session_reward(
+    session_profit_bb: float,
+    final_stack_bb: float,
+    starting_stack_bb: float,
+    session_completed: bool,
+    allin_outcomes: List[Dict],  # List of {'won': bool, 'equity': float}
+    session_hands: int = 30,
+) -> float:
+    """
+    V19 session-level reward calculation.
+    Same as V18: massive bust penalty to teach survival is paramount.
+    """
+    # Base reward is session profit
+    reward = session_profit_bb
+    
+    # All-in outcome penalties
+    allin_count = len(allin_outcomes)
+    for outcome in allin_outcomes:
+        penalty = compute_allin_outcome_penalty(
+            ACTION_ALL_IN, outcome['won'], outcome['equity']
+        )
+        reward += penalty
+    
+    # All-in frequency penalty
+    reward += compute_allin_frequency_penalty(allin_count, session_hands)
+    
+    # Bust penalty (-200 BB!)
+    reward += compute_bust_penalty(final_stack_bb)
+    
+    # Survival bonus
+    reward += compute_survival_bonus(session_completed, final_stack_bb, starting_stack_bb)
+    
+    return reward
+
+
+def compute_position_bonus(position: int, won_hand: bool, profit_bb: float) -> float:
+    """Bonus for winning from disadvantaged position."""
+    if not won_hand or profit_bb <= 0:
+        return 0.0
+    
+    position_multipliers = {
+        POS_UTG: 0.25,
+        POS_MP: 0.15,
+        POS_CO: 0.10,
+        POS_BTN: 0.05,
+        POS_SB: 0.0,
+        POS_BB: 0.0,
+    }
+    
+    multiplier = position_multipliers.get(position, 0)
+    return multiplier * min(profit_bb / 10.0, 1.0)
+
+
+def compute_action_consistency(action: int, equity: float) -> float:
+    """Reward actions that match hand strength."""
+    strength = compute_hand_strength_category(equity)
+    
+    if strength >= 3:
+        if action in [ACTION_RAISE_MEDIUM, ACTION_RAISE_LARGE]:
+            return 0.15
+        if action == ACTION_FOLD:
+            return -0.2
+    
+    if strength <= 1:
+        if action == ACTION_FOLD:
+            return 0.20
+        if action in [ACTION_RAISE_LARGE, ACTION_ALL_IN]:
+            return -0.75
+    
+    return 0.0
+
+
+def compute_v19_hand_shaping(
+    base_reward: float,
+    action: int,
+    equity: float,
+    position: int,
+    won_hand: bool,
+) -> float:
+    """
+    Per-hand shaping for intermediate feedback.
+    """
+    shaped = base_reward
+    
+    # Position bonus
+    shaped += compute_position_bonus(position, won_hand, base_reward)
+    
+    # Action consistency (but NOT all-in penalty here - that's at session level)
+    if action != ACTION_ALL_IN:
+        shaped += compute_action_consistency(action, equity)
+    
+    # Risk adjustment for all-ins
+    if action == ACTION_ALL_IN:
+        shaped = compute_risk_adjusted_reward(shaped, action, equity)
+    
+    return shaped

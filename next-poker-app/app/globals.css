@@ -122,3 +122,71 @@ body {
   position: relative;
   box-shadow: 0 0 40px rgba(0, 0, 0, 0.5);
 }
+
+/* ── Play Page Card Styles ──────────────────────────────────────────────── */
+
+.card-mini {
+  width: 44px;
+  height: 62px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 13px;
+  background: #fff;
+  color: #1e293b;
+  border: 1px solid rgba(255,255,255,0.8);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  position: relative;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.card-mini.suit-h, .card-mini.suit-d {
+  color: #ef4444;
+}
+
+.card-mini.suit-s, .card-mini.suit-c {
+  color: #1e293b;
+}
+
+.card-mini .card-rank {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.card-mini .card-suit {
+  font-size: 20px;
+}
+
+.card-mini.card-placeholder {
+  background: rgba(255,255,255,0.08);
+  border: 2px dashed rgba(255,255,255,0.2);
+  color: rgba(255,255,255,0.25);
+  box-shadow: none;
+}
+
+.suit-btn-h, .suit-btn-d { color: #ef4444; }
+.suit-btn-s, .suit-btn-c { color: #1e293b; }
+
+@keyframes recommend-reveal {
+  from { opacity: 0; transform: scale(0.9) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.animate-recommend {
+  animation: recommend-reveal 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease forwards;
+}
