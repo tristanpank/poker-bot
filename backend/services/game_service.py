@@ -8,29 +8,35 @@ V19+: Uses range-weighted Monte Carlo equity for more realistic post-flop estima
 import math
 import random
 from itertools import combinations
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 from pokerkit import Card, Deck, StandardHighHand
 
 from backend.config import get_settings
 from backend.models.schemas import (
-    GameStateRequest, 
-    CardSchema, 
-    HAND_STRENGTH_CATEGORIES,
-    ACTION_NAMES,
+    GameStateRequest,
+    CardSchema,
+    PlayerState,
 )
 
 
-# Action constants
+# Action constants (v21)
 ACTION_FOLD = 0
-ACTION_CALL = 1
-ACTION_RAISE_SMALL = 2
-ACTION_RAISE_MEDIUM = 3
-ACTION_RAISE_LARGE = 4
-ACTION_ALL_IN = 5
+ACTION_CHECK = 1
+ACTION_CALL = 2
+ACTION_RAISE_HALF_POT = 3
+ACTION_RAISE_POT_OR_ALL_IN = 4
 
-NUM_ACTIONS = 6
+NUM_ACTIONS = 5
+
+FRONTEND_ACTION_FOLD = "fold"
+FRONTEND_ACTION_CHECK = "check"
+FRONTEND_ACTION_CALL = "call"
+FRONTEND_ACTION_RAISE = "raise_amt"
+
+FEATURE_RANKS = "23456789TJQKA"
+FEATURE_SUITS = "cdhs"
 
 
 # =============================================================================
@@ -117,6 +123,72 @@ def get_street_from_board(board_cards: list) -> int:
     elif n == 3: return 1  # Flop
     elif n == 4: return 2  # Turn
     else: return 3         # River
+
+
+def _rank_index(card: Card) -> int:
+    rank = getattr(card.rank, "value", card.rank)
+    return FEATURE_RANKS.index(rank)
+
+
+def _suit_index(card: Card) -> int:
+    suit = getattr(card.suit, "value", card.suit)
+    return FEATURE_SUITS.index(suit)
+
+
+def _normalize(value: float, cap: float) -> float:
+    if cap <= 0:
+        return 0.0
+    clipped = max(0.0, min(cap, value))
+    return float(clipped / cap)
+
+
+def _estimate_preflop_strength(hole_cards: list[Card], num_opponents: int = 1) -> float:
+    if len(hole_cards) != 2:
+        return 0.35
+
+    r1 = _rank_index(hole_cards[0])
+    r2 = _rank_index(hole_cards[1])
+    hi = max(r1, r2) / 12.0
+    lo = min(r1, r2) / 12.0
+    pair = 1.0 if r1 == r2 else 0.0
+    suited = 1.0 if _suit_index(hole_cards[0]) == _suit_index(hole_cards[1]) else 0.0
+    gap = abs(r1 - r2)
+    connected = 1.0 if gap == 1 else 0.0
+    one_gap = 1.0 if gap == 2 else 0.0
+    broadway = 1.0 if max(r1, r2) >= 8 and min(r1, r2) >= 7 else 0.0
+
+    base = (
+        0.08
+        + (0.40 * hi)
+        + (0.16 * lo)
+        + (0.22 * pair)
+        + (0.08 * suited)
+        + (0.04 * connected)
+        + (0.02 * one_gap)
+        + (0.03 * broadway)
+    )
+    opponent_penalty = max(0, num_opponents - 1) * 0.035
+    return float(max(0.0, min(0.99, base - opponent_penalty)))
+
+
+def _board_connected(board_cards: list[Card]) -> float:
+    if len(board_cards) < 3:
+        return 0.0
+    ranks = sorted(set(_rank_index(card) for card in board_cards))
+    if 12 in ranks:
+        ranks = sorted(set(ranks + [-1]))
+    for start in range(len(ranks)):
+        window = ranks[start:start + 3]
+        if len(window) == 3 and (window[-1] - window[0]) <= 4:
+            return 1.0
+    return 0.0
+
+
+def _has_flush_draw(cards: list[Card]) -> float:
+    suit_counts = [0, 0, 0, 0]
+    for card in cards:
+        suit_counts[_suit_index(card)] += 1
+    return 1.0 if max(suit_counts, default=0) >= 4 else 0.0
 
 
 def card_schema_to_pokerkit(card: CardSchema) -> Card:
@@ -251,230 +323,587 @@ class GameService:
         
         return wins / valid_iterations
     
+    def _get_bot_player(self, game_state: GameStateRequest):
+        for player in game_state.players:
+            if player.is_bot:
+                return player
+        return None
+
+    def _get_raise_bounds(self, game_state: GameStateRequest, acting_player) -> tuple[int, int]:
+        current_bet = max(0, int(game_state.current_bet))
+        hero_bet = max(0, int(acting_player.bet))
+        stack = max(0, int(acting_player.stack))
+        big_blind = max(1, int(game_state.big_blind))
+        to_call = max(0, current_bet - hero_bet)
+
+        max_raise_to = hero_bet + stack
+        if stack <= to_call:
+            return 0, max_raise_to
+
+        # Approximate minimum legal no-limit raise sizing from available UI state.
+        min_increment = max(big_blind, to_call)
+        min_raise_to = current_bet + min_increment
+        if current_bet <= 0:
+            min_raise_to = max(big_blind, hero_bet + big_blind)
+
+        return int(min_raise_to), int(max_raise_to)
+
+    def _next_active_player(self, players, after_idx: int) -> int:
+        n = len(players)
+        for offset in range(1, n + 1):
+            idx = (after_idx + offset) % n
+            if players[idx].is_active:
+                return idx
+        return -1
+
+    def _get_legal_action_info_for_actor(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> dict[str, object]:
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            return {
+                "actor_index": -1,
+                "actions": [],
+                "to_call": 0,
+                "min_raise_to": None,
+                "max_raise_to": None,
+            }
+
+        actor = game_state.players[actor_index]
+        if not actor.is_active:
+            return {
+                "actor_index": actor_index,
+                "actions": [],
+                "to_call": 0,
+                "min_raise_to": None,
+                "max_raise_to": None,
+            }
+
+        current_bet = max(0, int(game_state.current_bet))
+        actor_bet = max(0, int(actor.bet))
+        stack = max(0, int(actor.stack))
+        to_call = max(0, current_bet - actor_bet)
+
+        actions: list[Literal["fold", "check", "call", "raise_amt"]] = []
+        if to_call > 0:
+            actions.append(FRONTEND_ACTION_FOLD)
+        if to_call == 0:
+            actions.append(FRONTEND_ACTION_CHECK)
+        elif stack > 0:
+            actions.append(FRONTEND_ACTION_CALL)
+
+        min_raise_to, max_raise_to = self._get_raise_bounds(game_state, actor)
+        can_raise = (
+            stack > to_call
+            and max_raise_to >= min_raise_to
+            and max_raise_to > current_bet
+        )
+        if can_raise:
+            actions.append(FRONTEND_ACTION_RAISE)
+        else:
+            min_raise_to = 0
+            max_raise_to = 0
+
+        return {
+            "actor_index": actor_index,
+            "actions": actions,
+            "to_call": to_call,
+            "min_raise_to": int(min_raise_to) if can_raise else None,
+            "max_raise_to": int(max_raise_to) if can_raise else None,
+        }
+
+    def get_legal_action_info(
+        self,
+        game_state: GameStateRequest,
+        actor_index: Optional[int] = None,
+    ) -> dict[str, object]:
+        idx = game_state.current_player_idx if actor_index is None else actor_index
+        return self._get_legal_action_info_for_actor(game_state, int(idx))
+
+    def get_legal_action_ids_for_actor(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> list[int]:
+        info = self._get_legal_action_info_for_actor(game_state, actor_index)
+        action_ids: list[int] = []
+        for action in info["actions"]:
+            if action == FRONTEND_ACTION_FOLD:
+                action_ids.append(ACTION_FOLD)
+            elif action == FRONTEND_ACTION_CHECK:
+                action_ids.append(ACTION_CHECK)
+            elif action == FRONTEND_ACTION_CALL:
+                action_ids.append(ACTION_CALL)
+            elif action == FRONTEND_ACTION_RAISE:
+                action_ids.extend([ACTION_RAISE_HALF_POT, ACTION_RAISE_POT_OR_ALL_IN])
+        return sorted(set(action_ids))
+
+    def model_action_to_frontend(self, action_id: int) -> Literal["fold", "check", "call", "raise_amt"]:
+        if action_id == ACTION_FOLD:
+            return FRONTEND_ACTION_FOLD
+        if action_id == ACTION_CHECK:
+            return FRONTEND_ACTION_CHECK
+        if action_id == ACTION_CALL:
+            return FRONTEND_ACTION_CALL
+        return FRONTEND_ACTION_RAISE
+
+    def apply_frontend_action(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+        action: Literal["fold", "check", "call", "raise_amt"],
+        raise_amt: Optional[int] = None,
+    ) -> tuple[GameStateRequest, bool, Optional[int]]:
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            raise ValueError("Invalid actor index")
+        if game_state.current_player_idx != actor_index:
+            raise ValueError("Action actor does not match current_player_idx")
+
+        legal = self._get_legal_action_info_for_actor(game_state, actor_index)
+        legal_actions = set(legal["actions"])
+        if action not in legal_actions:
+            raise ValueError(f"Illegal action '{action}' for actor index {actor_index}")
+
+        next_state = game_state.model_copy(deep=True)
+        players = next_state.players
+        actor = players[actor_index]
+        current_bet = max(0, int(next_state.current_bet))
+        pot = max(0, int(next_state.pot))
+        to_call = int(legal["to_call"])
+        applied_raise_amt: Optional[int] = None
+
+        if action == FRONTEND_ACTION_FOLD:
+            actor.is_active = False
+            actor.has_acted = True
+        elif action == FRONTEND_ACTION_CHECK:
+            actor.has_acted = True
+        elif action == FRONTEND_ACTION_CALL:
+            call_amt = min(to_call, max(0, int(actor.stack)))
+            actor.bet += call_amt
+            actor.stack -= call_amt
+            actor.has_acted = True
+            pot += call_amt
+        elif action == FRONTEND_ACTION_RAISE:
+            min_raise_to = legal["min_raise_to"]
+            max_raise_to = legal["max_raise_to"]
+            if min_raise_to is None or max_raise_to is None:
+                raise ValueError("Raise is not legal in this state")
+
+            target = int(min_raise_to if raise_amt is None else raise_amt)
+            if target < int(min_raise_to) or target > int(max_raise_to):
+                raise ValueError(f"Raise amount must be within [{min_raise_to}, {max_raise_to}]")
+
+            additional = target - int(actor.bet)
+            if additional <= 0:
+                raise ValueError("Raise amount must exceed current bet")
+            if additional > int(actor.stack):
+                raise ValueError("Raise amount exceeds actor stack")
+
+            # Reopen action: other active players must act again.
+            for idx, player in enumerate(players):
+                if idx != actor_index and player.is_active:
+                    player.has_acted = False
+
+            actor.bet = target
+            actor.stack -= additional
+            actor.has_acted = True
+            pot += additional
+            current_bet = target
+            applied_raise_amt = target
+
+        next_state.pot = pot
+        next_state.current_bet = current_bet
+
+        active_players = [p for p in players if p.is_active]
+        all_acted_and_matched = all(
+            p.has_acted and (p.bet == current_bet or p.stack == 0)
+            for p in active_players
+        )
+        round_complete = (len(active_players) <= 1) or all_acted_and_matched
+
+        if round_complete:
+            next_state.current_player_idx = -1
+        else:
+            next_idx = self._next_active_player(players, actor_index)
+            if next_idx == -1:
+                next_state.current_player_idx = -1
+                round_complete = True
+            else:
+                next_state.current_player_idx = next_idx
+
+        return next_state, round_complete, applied_raise_amt
+
+    def _best_hand_rank(self, hole_cards: list[Card], board_cards: list[Card]) -> StandardHighHand:
+        if len(hole_cards) != 2:
+            raise ValueError("Expected exactly two hole cards")
+        if len(board_cards) != 5:
+            raise ValueError("Expected exactly five community cards for showdown")
+        combined = hole_cards + board_cards
+        return max(StandardHighHand(combo) for combo in combinations(combined, 5))
+
+    def resolve_hand_result(
+        self,
+        game_state: GameStateRequest,
+        starting_stacks: list[int],
+        opponents: dict[int, dict[str, object]],
+    ) -> dict[str, object]:
+        players = game_state.players
+        n_players = len(players)
+        if len(starting_stacks) != n_players:
+            raise ValueError("starting_stacks length must match players length")
+
+        bot_index = next((idx for idx, player in enumerate(players) if player.is_bot), -1)
+        if bot_index < 0:
+            raise ValueError("No bot player found")
+
+        bot_start = int(starting_stacks[bot_index])
+        bot_stack = int(players[bot_index].stack)
+        if bot_start < bot_stack:
+            raise ValueError("starting_stacks cannot be lower than current stacks")
+        bot_contribution = bot_start - bot_stack
+        pot = int(max(0, game_state.pot))
+
+        for i, player in enumerate(players):
+            if int(starting_stacks[i]) < int(player.stack):
+                raise ValueError("starting_stacks cannot be lower than current stacks")
+
+        active_indices = [idx for idx, player in enumerate(players) if player.is_active]
+        if not active_indices:
+            raise ValueError("Cannot resolve hand: no active players")
+
+        if len(active_indices) == 1:
+            winner_indices = [active_indices[0]]
+        else:
+            board_cards = [card_schema_to_pokerkit(card) for card in game_state.community_cards]
+            if len(board_cards) != 5:
+                raise ValueError("Showdown requires 5 community cards when multiple active players remain")
+
+            seen: set[str] = set()
+            for card in game_state.community_cards:
+                card_id = f"{card.rank.upper()}{card.suit.lower()}"
+                if card_id in seen:
+                    raise ValueError("Duplicate board card detected")
+                seen.add(card_id)
+
+            contender_cards: dict[int, list[Card]] = {}
+            showdown_contenders: list[int] = []
+            for idx in active_indices:
+                player = players[idx]
+                info = opponents.get(idx, {})
+                mucked = bool(info.get("mucked", False))
+                if mucked:
+                    continue
+
+                if player.is_bot:
+                    if player.hole_cards is None or len(player.hole_cards) != 2:
+                        raise ValueError("Bot hole cards are required to resolve showdown")
+                    cards = player.hole_cards
+                else:
+                    cards = info.get("hole_cards")
+                    if cards is None:
+                        raise ValueError(f"Missing revealed hole cards for active opponent index {idx}")
+                    if len(cards) != 2:
+                        raise ValueError(f"Opponent index {idx} must have exactly 2 revealed cards")
+
+                hole_cards = [card_schema_to_pokerkit(card) for card in cards]
+                for card in cards:
+                    card_id = f"{card.rank.upper()}{card.suit.lower()}"
+                    if card_id in seen:
+                        raise ValueError("Duplicate card detected between board and hole cards")
+                    seen.add(card_id)
+
+                contender_cards[idx] = hole_cards
+                showdown_contenders.append(idx)
+
+            if not showdown_contenders:
+                winner_indices = []
+            elif len(showdown_contenders) == 1:
+                winner_indices = showdown_contenders
+            else:
+                ranked = [
+                    (idx, self._best_hand_rank(hole_cards, board_cards))
+                    for idx, hole_cards in contender_cards.items()
+                ]
+                best_rank = max(rank for _, rank in ranked)
+                winner_indices = sorted(idx for idx, rank in ranked if rank == best_rank)
+
+        payouts = [0] * n_players
+        if winner_indices:
+            share = pot // len(winner_indices)
+            remainder = pot % len(winner_indices)
+            for idx in winner_indices:
+                payouts[idx] += share
+            for idx in winner_indices:
+                if remainder <= 0:
+                    break
+                payouts[idx] += 1
+                remainder -= 1
+
+        bot_payout = int(payouts[bot_index])
+        delta = int(bot_payout - bot_contribution)
+        if delta > 0:
+            result = "won"
+        elif delta < 0:
+            result = "lost"
+        else:
+            result = "push"
+
+        final_stacks = [
+            max(0, int(player.stack) + int(payouts[idx]))
+            for idx, player in enumerate(players)
+        ]
+
+        ordered_players = sorted(
+            list(enumerate(players)),
+            key=lambda item: int(item[1].position),
+        )
+        if not ordered_players:
+            raise ValueError("Cannot build next hand state without players")
+        rotated_players = ordered_players[1:] + ordered_players[:1]
+
+        next_players: list[PlayerState] = []
+        next_bot_position = 0
+        for new_position, (old_index, old_player) in enumerate(rotated_players):
+            stack = final_stacks[old_index]
+            is_active = stack > 0
+            next_player = PlayerState(
+                position=new_position,
+                stack=stack,
+                bet=0,
+                hole_cards=[] if old_player.is_bot else None,
+                is_bot=old_player.is_bot,
+                is_active=is_active,
+                has_acted=False,
+            )
+            next_players.append(next_player)
+            if old_player.is_bot:
+                next_bot_position = new_position
+
+        next_actor_idx = -1
+        for idx, player in enumerate(next_players):
+            if player.is_active:
+                next_actor_idx = idx
+                break
+
+        next_game_state = GameStateRequest(
+            session_id=game_state.session_id,
+            community_cards=[],
+            pot=0,
+            players=next_players,
+            bot_position=next_bot_position,
+            current_bet=0,
+            big_blind=int(game_state.big_blind),
+            current_player_idx=next_actor_idx,
+            model_version=game_state.model_version,
+        )
+
+        return {
+            "result": result,
+            "amount": abs(delta),
+            "delta": delta,
+            "bot_payout": bot_payout,
+            "bot_contribution": bot_contribution,
+            "pot": pot,
+            "winner_indices": winner_indices,
+            "next_game_state": next_game_state,
+        }
+
     def build_observation(self, game_state: GameStateRequest) -> tuple[np.ndarray, float]:
         """
-        Build the observation vector from game state.
-        
-        Args:
-            game_state: The game state from the frontend
-            
-        Returns:
-            Tuple of (observation array, equity)
+        Build the 98-dim v21 observation vector and equity estimate.
         """
-        obs = []
-        
-        # Get bot's player state
-        bot_player = None
-        for player in game_state.players:
-            if player.is_bot:
-                bot_player = player
-                break
-        
+        bot_player = self._get_bot_player(game_state)
         if bot_player is None:
             raise ValueError("No bot player found in game state")
-        
         if bot_player.hole_cards is None:
             raise ValueError("Bot player must have hole cards")
-        
-        # Convert cards
+
         hole_cards = [card_schema_to_pokerkit(c) for c in bot_player.hole_cards]
         board_cards = [card_schema_to_pokerkit(c) for c in game_state.community_cards]
-        
-        # Card encoding
-        ranks = '23456789TJQKA'
-        suits = 'cdhs'
-        
-        # Encode hole cards (2 x 52)
-        for i in range(2):
-            encoding = np.zeros(52, dtype=np.float32)
-            if i < len(hole_cards):
-                idx = ranks.index(hole_cards[i].rank) * 4 + suits.index(hole_cards[i].suit)
-                encoding[idx] = 1.0
-            obs.extend(encoding)
-        
-        # Encode board cards (5 x 52)
-        for i in range(5):
-            encoding = np.zeros(52, dtype=np.float32)
-            if i < len(board_cards):
-                idx = ranks.index(board_cards[i].rank) * 4 + suits.index(board_cards[i].suit)
-                encoding[idx] = 1.0
-            obs.extend(encoding)
-        
-        # Calculate equity (V19: street-aware weighted sampling)
+        board_len = len(board_cards)
+        street_idx = get_street_from_board(board_cards)
+
         num_opponents = sum(1 for p in game_state.players if p.is_active and not p.is_bot)
-        current_street = get_street_from_board(board_cards)
         equity = self.monte_carlo_equity(
-            hole_cards, board_cards, max(1, num_opponents), street=current_street
+            hole_cards,
+            board_cards,
+            max(1, num_opponents),
+            street=street_idx,
         )
-        
-        # Stack and pot info
-        total_pot = game_state.pot
-        current_bet = game_state.current_bet
-        my_bet = bot_player.bet
-        to_call = current_bet - my_bet
-        my_stack = bot_player.stack
-        big_blind = game_state.big_blind
-        starting_stack = self.settings.default_starting_stack
-        
-        # Get opponent stacks
-        opp_stacks = [p.stack for p in game_state.players if not p.is_bot]
-        num_players = len(game_state.players)
-        
-        obs.append(equity)
-        
-        pot_odds = to_call / (total_pot + to_call + 1e-6)
-        obs.append(pot_odds)
-        obs.append(min(to_call / (total_pot + 1e-6), 2.0))
-        obs.append(min((my_stack / (total_pot + 1e-6)) / 20.0, 1.0))
-        obs.append(my_stack / starting_stack)
-        obs.append(total_pot / (starting_stack * num_players))
-        
-        # Opponent stacks (pad to 5 opponents for 6-max)
-        for opp_stack in opp_stacks[:5]:
-            obs.append(opp_stack / 1000.0)
-        while len(opp_stacks) < 5:
-            obs.append(0.0)
-            opp_stacks.append(0)  # Just for padding count
-        
-        active_opponents = sum(1 for p in game_state.players if p.is_active and not p.is_bot)
-        obs.append(active_opponents / 5.0)
-        
-        breakeven_equity = to_call / (total_pot + to_call + 1e-6)
-        obs.append(breakeven_equity)
-        obs.append(equity - breakeven_equity)
-        obs.append((starting_stack - my_stack) / starting_stack)
-        obs.append(1.0 if to_call > 0 else 0.0)
-        
-        # Hand strength category (one-hot)
-        strength_cat = compute_hand_strength_category(equity)
-        for i in range(5):
-            obs.append(1.0 if i == strength_cat else 0.0)
-        
-        # Street encoding
-        street = [0.0] * 4
-        num_board = len(board_cards)
-        if num_board == 0:
-            street[0] = 1.0  # Preflop
-        elif num_board == 3:
-            street[1] = 1.0  # Flop
-        elif num_board == 4:
-            street[2] = 1.0  # Turn
-        else:
-            street[3] = 1.0  # River
-        obs.extend(street)
-        
-        # Position encoding (6-max)
-        position_encoding = [0.0] * 6
-        position_encoding[bot_player.position % 6] = 1.0
-        obs.extend(position_encoding)
-        
-        # Players after/before
-        players_after = sum(1 for p in game_state.players 
-                          if p.position > bot_player.position and p.is_active)
-        obs.append(players_after / 5.0)
-        
-        players_before = sum(1 for p in game_state.players 
-                           if p.position < bot_player.position and p.is_active)
-        obs.append(players_before / 5.0)
-        
-        # Pad to 520 dimensions
-        while len(obs) < 520:
-            obs.append(0.0)
-        
-        return np.array(obs[:520], dtype=np.float32), equity
-    
+
+        obs = np.zeros(98, dtype=np.float32)
+
+        if len(hole_cards) == 2:
+            rank_indices = sorted((_rank_index(card) for card in hole_cards))
+            low_rank = rank_indices[0]
+            high_rank = rank_indices[1]
+            obs[high_rank] = 1.0
+            obs[13 + low_rank] = 1.0
+            obs[26] = 1.0 if _suit_index(hole_cards[0]) == _suit_index(hole_cards[1]) else 0.0
+            obs[27] = 1.0 if low_rank == high_rank else 0.0
+
+            gap = high_rank - low_rank
+            if high_rank == 12 and low_rank == 0:
+                gap = 1
+            if gap == 1:
+                obs[28] = 1.0
+            elif gap == 2:
+                obs[29] = 1.0
+            elif gap == 3:
+                obs[30] = 1.0
+            else:
+                obs[31] = 1.0
+
+            obs[96] = float(high_rank / 12.0)
+            obs[97] = float(low_rank / 12.0)
+
+        obs[49 + street_idx] = 1.0
+
+        board_rank_counts = np.zeros(13, dtype=np.int32)
+        board_suit_counts = np.zeros(4, dtype=np.int32)
+        for card in board_cards:
+            board_rank_counts[_rank_index(card)] += 1
+            board_suit_counts[_suit_index(card)] += 1
+
+        if board_len > 0:
+            inv_len = 1.0 / float(board_len)
+            obs[32:45] = board_rank_counts.astype(np.float32) * inv_len
+            obs[45:49] = board_suit_counts.astype(np.float32) * inv_len
+
+        obs[53] = 1.0 if np.any(board_rank_counts >= 2) else 0.0
+        obs[54] = 1.0 if np.any(board_rank_counts >= 3) else 0.0
+        obs[55] = 1.0 if board_len >= 3 and np.any(board_suit_counts == board_len) else 0.0
+        obs[56] = 1.0 if board_len >= 3 and np.count_nonzero(board_suit_counts) == 2 else 0.0
+        obs[57] = _board_connected(board_cards)
+
+        active_opponents = max(1, sum(1 for p in game_state.players if p.is_active and not p.is_bot))
+        obs[58] = _estimate_preflop_strength(hole_cards, num_opponents=active_opponents)
+        obs[59] = _has_flush_draw(hole_cards + board_cards)
+        obs[60] = float(max(0.0, min(1.0, equity)))
+
+        hero_seat = bot_player.position % 6
+        obs[61 + hero_seat] = 1.0
+
+        active_players = sum(1 for p in game_state.players if p.is_active)
+        players_before = sum(1 for p in game_state.players if p.position < bot_player.position and p.is_active)
+        players_after = sum(1 for p in game_state.players if p.position > bot_player.position and p.is_active)
+        obs[67] = _normalize(float(active_players), 6.0)
+        obs[68] = _normalize(float(players_before), 5.0)
+        obs[69] = _normalize(float(players_after), 5.0)
+
+        total_pot = float(max(0, game_state.pot))
+        current_bet = float(max(0, game_state.current_bet))
+        hero_bet = float(max(0, bot_player.bet))
+        to_call = max(0.0, current_bet - hero_bet)
+        hero_stack = float(max(0, bot_player.stack))
+        big_blind = float(max(1, game_state.big_blind))
+
+        active_opp_stacks = [float(max(0, p.stack)) for p in game_state.players if p.is_active and not p.is_bot]
+        effective_stack = min([hero_stack] + active_opp_stacks) if active_opp_stacks else hero_stack
+
+        min_raise_to, max_raise_to = self._get_raise_bounds(game_state, bot_player)
+        min_raise_to_value = float(min_raise_to) if max_raise_to >= min_raise_to and hero_stack > to_call else 0.0
+
+        obs[70] = _normalize(total_pot / big_blind, 200.0)
+        obs[71] = _normalize(to_call / big_blind, 50.0)
+        obs[72] = _normalize(min_raise_to_value / big_blind, 200.0)
+        obs[73] = _normalize(hero_stack / big_blind, 200.0)
+        obs[74] = _normalize(effective_stack / big_blind, 200.0)
+        spr = hero_stack / max(total_pot, big_blind)
+        obs[75] = _normalize(spr, 20.0)
+        obs[76] = float(to_call / max(total_pot + to_call, 1.0))
+
+        hero_contrib = hero_bet
+        obs[77] = float(hero_contrib / max(hero_contrib + hero_stack, 1.0))
+        obs[78] = 0.0
+        obs[79] = _normalize((current_bet / big_blind), 20.0)
+        obs[80] = _normalize((hero_contrib / big_blind), 200.0)
+
+        legal_actions = self.get_legal_actions(game_state)
+        for action_id in legal_actions:
+            if 0 <= action_id < NUM_ACTIONS:
+                obs[81 + action_id] = 1.0
+
+        by_seat = {player.position % 6: player for player in game_state.players}
+        for offset in range(6):
+            seat = (hero_seat + offset) % 6
+            seat_player = by_seat.get(seat)
+            obs[86 + offset] = 1.0 if seat_player and seat_player.is_active else 0.0
+
+        if street_idx == 0:
+            if current_bet <= big_blind:
+                obs[92] = 1.0
+            elif current_bet <= (3.0 * big_blind):
+                obs[93] = 1.0
+            else:
+                obs[94] = 1.0
+
+        obs[95] = 1.0 if (hero_bet >= current_bet and current_bet > 0 and to_call <= 0.0) else 0.0
+
+        return obs, equity
+
     def get_legal_actions(self, game_state: GameStateRequest) -> list[int]:
         """
-        Determine legal actions based on game state.
-        
-        In IRL mode, we infer legal actions from the betting state.
+        Determine legal v21 actions from betting state.
         """
-        legal = []
-        
-        # Get bot's player state
-        bot_player = None
-        for player in game_state.players:
-            if player.is_bot:
-                bot_player = player
-                break
-        
-        if bot_player is None:
-            return [ACTION_CALL]  # Fallback
-        
-        to_call = game_state.current_bet - bot_player.bet
-        
-        # Can always fold if there's something to call
-        if to_call > 0:
-            legal.append(ACTION_FOLD)
-        
-        # Can always check/call
-        legal.append(ACTION_CALL)
-        
-        # Can raise if has chips
-        if bot_player.stack > to_call:
-            legal.append(ACTION_RAISE_SMALL)
-            legal.append(ACTION_RAISE_MEDIUM)
-            legal.append(ACTION_RAISE_LARGE)
-            legal.append(ACTION_ALL_IN)
-        elif bot_player.stack > 0:
-            # Can only go all-in
-            legal.append(ACTION_ALL_IN)
-        
-        return legal if legal else [ACTION_CALL]
-    
+        bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
+        if bot_index < 0:
+            return [ACTION_CHECK]
+        return self.get_legal_action_ids_for_actor(game_state, bot_index)
+
     def calculate_raise_amount(
-        self, 
-        action: int, 
-        game_state: GameStateRequest
+        self,
+        action: int,
+        game_state: GameStateRequest,
+    ) -> Optional[int]:
+        bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
+        if bot_index < 0:
+            return None
+        return self.calculate_raise_amount_for_actor(action, game_state, bot_index)
+
+    def calculate_raise_amount_for_actor(
+        self,
+        action: int,
+        game_state: GameStateRequest,
+        actor_index: int,
     ) -> Optional[int]:
         """
-        Calculate the chip amount for a raise action.
-        
-        Args:
-            action: The action ID
-            game_state: Current game state
-            
-        Returns:
-            Chip amount for raises, None for fold/call
+        Calculate the raise-to amount for a v21 raise action.
         """
-        if action in [ACTION_FOLD, ACTION_CALL]:
+        if action in (ACTION_FOLD, ACTION_CHECK, ACTION_CALL):
             return None
-        
-        bot_player = None
-        for player in game_state.players:
-            if player.is_bot:
-                bot_player = player
-                break
-        
-        if bot_player is None:
+
+        if actor_index < 0 or actor_index >= len(game_state.players):
             return None
-        
-        big_blind = game_state.big_blind
-        pot = game_state.pot
-        stack = bot_player.stack
-        current_bet = game_state.current_bet
-        my_bet = bot_player.bet
-        to_call = current_bet - my_bet
-        
-        # Minimum raise is typically 2x the current bet or big blind
-        min_raise = max(current_bet * 2, big_blind * 2)
-        max_raise = stack + my_bet  # All-in amount
-        
-        if action == ACTION_RAISE_SMALL:
-            # 2x min raise
-            amount = min(min_raise * 2, max_raise)
-        elif action == ACTION_RAISE_MEDIUM:
-            # 0.5x pot
-            amount = min(max(min_raise, int(pot * 0.5) + current_bet), max_raise)
-        elif action == ACTION_RAISE_LARGE:
-            # 1x pot
-            amount = min(max(min_raise, pot + current_bet), max_raise)
-        elif action == ACTION_ALL_IN:
-            amount = max_raise
+        actor_player = game_state.players[actor_index]
+
+        current_bet = max(0, int(game_state.current_bet))
+        hero_bet = max(0, int(actor_player.bet))
+        stack = max(0, int(actor_player.stack))
+        to_call = max(0, current_bet - hero_bet)
+        pot = float(max(0, game_state.pot))
+
+        min_raise_to, max_raise_to = self._get_raise_bounds(game_state, actor_player)
+        if stack <= to_call or max_raise_to < min_raise_to:
+            return None
+
+        if action == ACTION_RAISE_HALF_POT:
+            target = int(round(hero_bet + to_call + (0.5 * pot)))
+        elif action == ACTION_RAISE_POT_OR_ALL_IN:
+            target = int(round(hero_bet + to_call + pot))
         else:
             return None
-        
-        return int(amount)
+
+        target = max(target, min_raise_to)
+        target = min(target, max_raise_to)
+        if target <= current_bet:
+            if max_raise_to > current_bet:
+                target = max_raise_to
+            else:
+                return None
+
+        return int(target)
 
 
 # Singleton instance

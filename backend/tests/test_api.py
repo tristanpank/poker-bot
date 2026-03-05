@@ -145,22 +145,21 @@ class TestActionEndpoint:
     
     @pytest.mark.requires_models
     def test_action_id_is_valid(self, client, valid_game_state):
-        """Action ID should be between 0 and 5."""
+        """Action ID should be between 0 and 4."""
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         
-        assert 0 <= data["action_id"] <= 5
+        assert 0 <= data["action_id"] <= 4
     
     @pytest.mark.requires_models
     def test_action_name_matches_id(self, client, valid_game_state):
         """Action name should match the action ID."""
         action_names = {
             0: "FOLD",
-            1: "CALL",
-            2: "RAISE_SMALL",
-            3: "RAISE_MEDIUM",
-            4: "RAISE_LARGE",
-            5: "ALL_IN"
+            1: "CHECK",
+            2: "CALL",
+            3: "RAISE_HALF_POT",
+            4: "RAISE_POT_OR_ALL_IN",
         }
         
         response = client.post("/poker/action", json=valid_game_state)
@@ -189,11 +188,11 @@ class TestActionEndpoint:
     
     @pytest.mark.requires_models
     def test_q_values_has_all_actions(self, client, valid_game_state):
-        """Q-values should include all 6 actions."""
+        """Q-values should include all v21 actions."""
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         
-        expected_keys = {"FOLD", "CALL", "RAISE_SMALL", "RAISE_MEDIUM", "RAISE_LARGE", "ALL_IN"}
+        expected_keys = {"FOLD", "CHECK", "CALL", "RAISE_HALF_POT", "RAISE_POT_OR_ALL_IN"}
         assert set(data["q_values"].keys()) == expected_keys
     
     @pytest.mark.requires_models

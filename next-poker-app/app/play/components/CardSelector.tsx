@@ -2,14 +2,14 @@ import React from 'react';
 
 const RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'] as const;
 const SUITS = [
-    { key: 's', sym: '♠', label: 'Spades' },
-    { key: 'h', sym: '♥', label: 'Hearts' },
-    { key: 'd', sym: '♦', label: 'Diamonds' },
-    { key: 'c', sym: '♣', label: 'Clubs' },
+    { key: 's', sym: '\u2660', label: 'Spades' },
+    { key: 'h', sym: '\u2665', label: 'Hearts' },
+    { key: 'd', sym: '\u2666', label: 'Diamonds' },
+    { key: 'c', sym: '\u2663', label: 'Clubs' },
 ] as const;
 
 type CardSelectorProps = {
-    pickingFor: 'hole' | 'community' | null;
+    pickingFor: 'hole' | 'community' | 'showdown' | null;
     holeCardsCount: number;
     communityCardsCount: number;
     usedCards: Set<string>;
@@ -31,7 +31,9 @@ export default function CardSelector({
             <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold mb-3">
                 {pickingFor === 'hole'
                     ? `Select hole card ${holeCardsCount + 1} of 2`
-                    : `Select community card (${communityCardsCount + 1}${communityCardsCount < 3 ? '/3 flop' : communityCardsCount === 3 ? ' turn' : ' river'})`
+                    : pickingFor === 'community'
+                        ? `Select community card (${communityCardsCount + 1}${communityCardsCount < 3 ? '/3 flop' : communityCardsCount === 3 ? ' turn' : ' river'})`
+                        : `Select showdown card ${holeCardsCount + 1} of 2`
                 }
             </p>
             {pendingRank ? (
@@ -54,7 +56,7 @@ export default function CardSelector({
                             );
                         })}
                     </div>
-                    <button onClick={() => setPendingRank(null)} className="text-xs text-[var(--color-text-secondary)] hover:text-white mt-1">← Back to ranks</button>
+                    <button onClick={() => setPendingRank(null)} className="text-xs text-[var(--color-text-secondary)] hover:text-white mt-1">&larr; Back to ranks</button>
                 </div>
             ) : (
                 <div className="grid grid-cols-7 gap-2">

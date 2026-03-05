@@ -9,11 +9,10 @@ from pydantic import BaseModel, Field, ConfigDict
 # Action constants matching the model
 ACTION_NAMES = {
     0: "FOLD",
-    1: "CALL", 
-    2: "RAISE_SMALL",
-    3: "RAISE_MEDIUM",
-    4: "RAISE_LARGE",
-    5: "ALL_IN",
+    1: "CHECK",
+    2: "CALL",
+    3: "RAISE_HALF_POT",
+    4: "RAISE_POT_OR_ALL_IN",
 }
 
 HAND_STRENGTH_CATEGORIES = {
@@ -59,6 +58,7 @@ class PlayerState(BaseModel):
     )
     is_bot: bool = Field(default=False, description="Whether this player is the bot")
     is_active: bool = Field(default=True, description="Whether player is still in the hand")
+    has_acted: bool = Field(default=False, description="Whether player has acted in this betting round")
 
 
 class GameStateRequest(BaseModel):
@@ -93,7 +93,7 @@ class GameStateRequest(BaseModel):
                 "bot_position": 0,
                 "current_bet": 50,
                 "big_blind": 10,
-                "model_version": "v18"
+                "model_version": "v21"
             }
         }
     )
@@ -122,11 +122,12 @@ class GameStateRequest(BaseModel):
     # Betting state
     current_bet: int = Field(default=0, ge=0, description="Current bet to call")
     big_blind: int = Field(default=10, gt=0, description="Big blind amount")
+    current_player_idx: int = Field(default=0, ge=-1, le=5, description="Index in players array of the acting player")
     
     # Model selection
     model_version: Optional[str] = Field(
         default=None, 
-        description="Model version to use (e.g., 'v18'). Uses default if not specified."
+        description="Model version to use (e.g., 'v21'). Uses default if not specified."
     )
 
 
@@ -135,30 +136,29 @@ class ActionResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "action": "RAISE_MEDIUM",
+                "action": "RAISE_HALF_POT",
                 "action_id": 3,
                 "amount": 75,
                 "equity": 0.72,
                 "hand_strength_category": "Strong",
                 "q_values": {
                     "FOLD": -5.2,
+                    "CHECK": 1.4,
                     "CALL": 3.1,
-                    "RAISE_SMALL": 4.5,
-                    "RAISE_MEDIUM": 5.8,
-                    "RAISE_LARGE": 4.2,
-                    "ALL_IN": 1.1
+                    "RAISE_HALF_POT": 5.8,
+                    "RAISE_POT_OR_ALL_IN": 4.2
                 }
             }
         }
     )
     
-    action: str = Field(..., description="Action name (e.g., 'RAISE_MEDIUM')")
-    action_id: int = Field(..., ge=0, le=5, description="Action ID (0-5)")
+    action: str = Field(..., description="Action name (e.g., 'RAISE_HALF_POT')")
+    action_id: int = Field(..., ge=0, le=4, description="Action ID (0-4)")
     
     # Betting details
     amount: Optional[int] = Field(
         default=None, 
-        description="Chip amount for raises/bets. None for fold/call."
+        description="Chip amount for raises/bets. None for fold/check/call."
     )
     
     # Analysis info
@@ -172,6 +172,75 @@ class ActionResponse(BaseModel):
     )
 
 
+class LegalActionsResponse(BaseModel):
+    """Legal action set for a specific actor in the current game state."""
+
+    actor_index: int = Field(..., ge=-1, le=5)
+    actions: list[Literal["fold", "check", "call", "raise_amt"]] = Field(default_factory=list)
+    to_call: int = Field(default=0, ge=0)
+    min_raise_to: Optional[int] = Field(default=None, ge=0)
+    max_raise_to: Optional[int] = Field(default=None, ge=0)
+
+
+class AppliedAction(BaseModel):
+    """Normalized applied action payload used by the website."""
+
+    action: Literal["fold", "check", "call", "raise_amt"]
+    raise_amt: Optional[int] = Field(default=None, ge=0)
+    action_id: Optional[int] = Field(default=None, ge=0, le=4)
+    equity: Optional[float] = Field(default=None, ge=0, le=1)
+    hand_strength_category: Optional[str] = None
+    q_values: Optional[dict[str, float]] = None
+
+
+class PokerStepRequest(BaseModel):
+    """Apply one action (bot or opponent) and return updated server-side state."""
+
+    game_state: GameStateRequest
+    actor: Literal["bot", "opponent"]
+    action: Optional[Literal["fold", "check", "call", "raise_amt"]] = None
+    raise_amt: Optional[int] = Field(default=None, ge=0)
+    model_version: Optional[str] = Field(default=None, description="Optional model version override for bot actions.")
+
+
+class PokerStepResponse(BaseModel):
+    """Updated state after applying one action."""
+
+    game_state: GameStateRequest
+    applied_action: AppliedAction
+    legal_actions: LegalActionsResponse
+    round_complete: bool
+
+
+class ShowdownOpponent(BaseModel):
+    """Opponent showdown input. Provide hole cards in reveal order or mark as mucked."""
+
+    player_index: int = Field(..., ge=0, le=5)
+    hole_cards: Optional[list[CardSchema]] = Field(default=None, min_length=2, max_length=2)
+    mucked: bool = Field(default=False)
+
+
+class HandResolveRequest(BaseModel):
+    """Resolve hand result from final state + revealed opponent cards."""
+
+    game_state: GameStateRequest
+    starting_stacks: list[int] = Field(..., min_length=2, max_length=6)
+    opponents: list[ShowdownOpponent] = Field(default_factory=list)
+
+
+class HandResolveResponse(BaseModel):
+    """Backend-computed bot hand result."""
+
+    result: Literal["won", "lost", "push"]
+    amount: int = Field(..., ge=0)
+    delta: int
+    bot_payout: int = Field(..., ge=0)
+    bot_contribution: int = Field(..., ge=0)
+    pot: int = Field(..., ge=0)
+    winner_indices: list[int] = Field(default_factory=list)
+    next_game_state: GameStateRequest
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "healthy"
@@ -183,8 +252,8 @@ class ModelInfo(BaseModel):
     """Information about a loaded model."""
     version: str
     path: str
-    state_dim: int = 520
-    num_actions: int = 6
+    state_dim: int = 98
+    num_actions: int = 5
 
 
 class CvAnalyzeRequest(BaseModel):

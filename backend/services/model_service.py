@@ -3,6 +3,7 @@ Model service for loading and running inference on trained poker models.
 """
 
 import sys
+import re
 from pathlib import Path
 from typing import Optional
 import threading
@@ -20,6 +21,13 @@ from backend.config import get_settings
 from backend.models.schemas import ACTION_NAMES
 
 
+def _version_to_int(version: str) -> int:
+    match = re.search(r"(\d+)", (version or "").lower())
+    if match is None:
+        return 0
+    return int(match.group(1))
+
+
 class ModelService:
     """
     Service for loading and managing poker bot models.
@@ -32,6 +40,46 @@ class ModelService:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._models: dict[str, torch.nn.Module] = {}
         self._lock = threading.Lock()
+
+    def _extract_state_dict(self, checkpoint: object) -> dict[str, torch.Tensor]:
+        if isinstance(checkpoint, dict):
+            if "model_state_dict" in checkpoint and isinstance(checkpoint["model_state_dict"], dict):
+                return checkpoint["model_state_dict"]
+            if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+                return checkpoint["state_dict"]
+            if any(str(key).endswith("weight") for key in checkpoint.keys()):
+                return checkpoint  # assume the payload itself is the state dict
+        if isinstance(checkpoint, dict):
+            raise ValueError("Checkpoint dictionary does not include a recognized model state dict.")
+        raise ValueError("Checkpoint payload is not a dictionary.")
+
+    def _infer_v21_dims(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        checkpoint: object,
+    ) -> tuple[int, int, int]:
+        state_dim = 98
+        hidden_dim = 256
+        action_dim = len(ACTION_NAMES)
+
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("config"), dict):
+            config = checkpoint["config"]
+            state_dim = int(config.get("state_dim", state_dim))
+            hidden_dim = int(config.get("hidden_dim", hidden_dim))
+            action_dim = int(config.get("action_count", action_dim))
+
+        input_weight = state_dict.get("input_layer.weight")
+        strategy_weight = state_dict.get("strategy_head.2.weight")
+        if input_weight is not None and len(input_weight.shape) == 2:
+            hidden_dim = int(input_weight.shape[0])
+            state_dim = int(input_weight.shape[1])
+        if strategy_weight is not None and len(strategy_weight.shape) == 2:
+            action_dim = int(strategy_weight.shape[0])
+
+        return state_dim, hidden_dim, action_dim
+
+    def _action_label(self, action_id: int) -> str:
+        return ACTION_NAMES.get(action_id, f"ACTION_{action_id}")
         
     def load_model(self, version: str = None) -> torch.nn.Module:
         """
@@ -44,6 +92,7 @@ class ModelService:
             Loaded PyTorch model in eval mode.
         """
         version = (version or self.settings.model_version).lower()
+        version_num = _version_to_int(version)
         
         # Return cached model if available
         if version in self._models:
@@ -59,23 +108,25 @@ class ModelService:
             if not model_path.exists():
                 raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
             
-            # Import the appropriate model class based on version
-            model = self._create_model_for_version(version)
-            
             # Load the checkpoint
             checkpoint = torch.load(model_path, map_location=self.device)
-            
-            # Handle different checkpoint formats
-            if isinstance(checkpoint, dict):
-                if "model_state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["model_state_dict"])
-                elif "state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["state_dict"])
-                else:
-                    # Assume the dict IS the state dict
-                    model.load_state_dict(checkpoint)
+
+            if version_num >= 21:
+                from poker_model_v21 import PokerDeepCFRNet
+
+                state_dict = self._extract_state_dict(checkpoint)
+                state_dim, hidden_dim, action_dim = self._infer_v21_dims(state_dict, checkpoint)
+                model = PokerDeepCFRNet(
+                    state_dim=state_dim,
+                    hidden_dim=hidden_dim,
+                    action_dim=action_dim,
+                )
+                model.load_state_dict(state_dict, strict=True)
             else:
-                model.load_state_dict(checkpoint)
+                # Import the appropriate model class based on version
+                model = self._create_model_for_version(version)
+                state_dict = self._extract_state_dict(checkpoint)
+                model.load_state_dict(state_dict)
             
             model.to(self.device)
             model.eval()
@@ -85,28 +136,27 @@ class ModelService:
     
     def _create_model_for_version(self, version: str) -> torch.nn.Module:
         """Create a model instance for the given version."""
-        version_num = version.replace("v", "")
+        version_num = _version_to_int(version)
         
         # Try to import the version-specific model
         try:
-            if version_num >= "19":
+            if version_num >= 19:
                 # V19+ uses 520-dim state with weighted equity
                 from poker_model_v19 import DuelingPokerNet
                 return DuelingPokerNet(state_dim=520)
-            elif version_num >= "15":
+            if version_num >= 15:
                 # V15-18 uses 520-dim state for 6-max
                 from poker_model_v18 import DuelingPokerNet
                 return DuelingPokerNet(state_dim=520)
-            elif version_num >= "13":
+            if version_num >= 13:
                 # V13-14 uses 385-dim state
                 from poker_model_v14 import DuelingPokerNet
                 return DuelingPokerNet(state_dim=385)
-            else:
-                # Fallback to latest architecture
-                from poker_model_v19 import DuelingPokerNet
-                return DuelingPokerNet(state_dim=520)
+            # Fallback to latest legacy architecture
+            from poker_model_v19 import DuelingPokerNet
+            return DuelingPokerNet(state_dim=520)
         except ImportError:
-            # Fallback: try V19 model as it's the latest
+            # Fallback: try V19 model as the latest legacy architecture.
             from poker_model_v19 import DuelingPokerNet
             return DuelingPokerNet(state_dim=520)
     
@@ -127,26 +177,37 @@ class ModelService:
         Returns:
             Tuple of (action_id, q_values_dict)
         """
+        version = (version or self.settings.model_version).lower()
+        version_num = _version_to_int(version)
         model = self.load_model(version)
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
-            q_values = model(state_tensor).squeeze(0).cpu().numpy()
-        
-        # Mask illegal actions
-        masked_q = np.full_like(q_values, float('-inf'))
-        for action in legal_actions:
-            masked_q[action] = q_values[action]
-        
-        best_action = int(np.argmax(masked_q))
-        
-        # Create q_values dict for response
-        q_values_dict = {
-            ACTION_NAMES[i]: float(q_values[i]) 
-            for i in range(len(q_values))
+            if version_num >= 21:
+                from poker_model_v21 import masked_policy
+
+                logits = model.forward_strategy(state_tensor).squeeze(0).cpu().numpy()
+                legal_mask = np.zeros_like(logits, dtype=np.float32)
+                for action in legal_actions:
+                    if 0 <= action < len(legal_mask):
+                        legal_mask[action] = 1.0
+                probs = masked_policy(logits, legal_mask)
+                best_action = int(np.argmax(probs))
+                scores = probs
+            else:
+                scores = model(state_tensor).squeeze(0).cpu().numpy()
+                masked = np.full_like(scores, float("-inf"))
+                for action in legal_actions:
+                    if 0 <= action < len(masked):
+                        masked[action] = scores[action]
+                best_action = int(np.argmax(masked))
+
+        score_dict = {
+            self._action_label(i): float(scores[i])
+            for i in range(len(scores))
         }
-        
-        return best_action, q_values_dict
+
+        return best_action, score_dict
     
     def is_loaded(self, version: str = None) -> bool:
         """Check if a model version is loaded."""

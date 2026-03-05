@@ -7,6 +7,7 @@ Run with: source venv/bin/activate && python backend/test_api.py
 
 import sys
 import os
+import re
 
 # Ensure we can import from the project
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -93,8 +94,12 @@ def test_model_service():
         assert False, f"Failed to load model: {e}"
     
     # Test inference
-    observation = np.zeros(520, dtype=np.float32)
-    legal_actions = [0, 1, 2, 3, 4, 5]
+    match = re.search(r"(\d+)", version)
+    version_num = int(match.group(1)) if match else 0
+    state_dim = 98 if version_num >= 21 else (520 if version_num >= 15 else 385)
+    action_count = 5 if version_num >= 21 else 6
+    observation = np.zeros(state_dim, dtype=np.float32)
+    legal_actions = list(range(action_count))
     
     action, q_values = model_service.get_action(observation, legal_actions, version)
     print(f"  ✅ Inference: action={action}, q_values={list(q_values.values())[:3]}...")
