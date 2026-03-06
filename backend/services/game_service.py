@@ -19,16 +19,19 @@ from backend.models.schemas import (
     CardSchema,
     PlayerState,
 )
+from backend.poker_versions import (
+    ACTION_ALL_IN,
+    ACTION_CALL,
+    ACTION_CHECK,
+    ACTION_FOLD,
+    ACTION_RAISE_HALF_POT,
+    ACTION_RAISE_POT_OR_ALL_IN,
+    V24_NON_ALL_IN_RAISE_ACTIONS,
+    V24_RAISE_MULTIPLIERS,
+    get_version_spec,
+    version_to_int,
+)
 
-
-# Action constants (v21)
-ACTION_FOLD = 0
-ACTION_CHECK = 1
-ACTION_CALL = 2
-ACTION_RAISE_HALF_POT = 3
-ACTION_RAISE_POT_OR_ALL_IN = 4
-
-NUM_ACTIONS = 5
 
 FRONTEND_ACTION_FOLD = "fold"
 FRONTEND_ACTION_CHECK = "check"
@@ -191,6 +194,65 @@ def _has_flush_draw(cards: list[Card]) -> float:
     return 1.0 if max(suit_counts, default=0) >= 4 else 0.0
 
 
+def _current_hand_strength_scalar(hole_cards: list[Card], board_cards: list[Card]) -> float:
+    if len(hole_cards) != 2:
+        return 0.0
+    if len(board_cards) < 3:
+        return _estimate_preflop_strength(hole_cards, num_opponents=1)
+
+    cards = hole_cards + board_cards
+    rank_counts = [0] * 13
+    suit_counts = [0] * 4
+    unique_ranks: set[int] = set()
+    for card in cards:
+        rank_idx = _rank_index(card)
+        suit_idx = _suit_index(card)
+        rank_counts[rank_idx] += 1
+        suit_counts[suit_idx] += 1
+        unique_ranks.add(rank_idx)
+
+    max_rank = max(rank_counts)
+    pair_count = 0
+    has_trips = False
+    has_quads = False
+    for count in rank_counts:
+        if count >= 2:
+            pair_count += 1
+        if count >= 3:
+            has_trips = True
+        if count >= 4:
+            has_quads = True
+    has_flush = max(suit_counts) >= 5
+
+    if 12 in unique_ranks:
+        unique_ranks.add(-1)
+    ordered = sorted(unique_ranks)
+    has_straight = False
+    for idx in range(max(0, len(ordered) - 4)):
+        window = ordered[idx : idx + 5]
+        if len(window) == 5 and window[-1] - window[0] == 4:
+            has_straight = True
+            break
+
+    if has_flush and has_straight:
+        return 0.995
+    if has_quads:
+        return 0.96
+    if has_trips and pair_count >= 2:
+        return 0.90
+    if has_flush:
+        return 0.82
+    if has_straight:
+        return 0.74
+    if has_trips:
+        return 0.64
+    if pair_count >= 2:
+        return 0.50
+    if max_rank >= 2:
+        return 0.34
+    return 0.18
+
+
 def card_schema_to_pokerkit(card: CardSchema) -> Card:
     """Convert a CardSchema to a pokerkit Card."""
     # Normalize rank (handle both 'T' and '10')
@@ -227,6 +289,89 @@ class GameService:
     
     def __init__(self):
         self.settings = get_settings()
+
+    def _resolve_version(self, version: Optional[str], game_state: Optional[GameStateRequest] = None) -> str:
+        if version:
+            return str(version).lower()
+        if game_state is not None and game_state.model_version:
+            return str(game_state.model_version).lower()
+        return str(self.settings.model_version).lower()
+
+    def _street_raise_count(self, game_state: GameStateRequest) -> int:
+        current_bet = max(0, int(game_state.current_bet))
+        big_blind = max(1, int(game_state.big_blind))
+        board_len = len(game_state.community_cards)
+        if board_len == 0:
+            if current_bet <= big_blind:
+                return 0
+            if current_bet <= (3 * big_blind):
+                return 1
+            return 2
+        if current_bet <= 0:
+            return 0
+        return 1
+
+    def _v24_raise_target(
+        self,
+        action: int,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> Optional[int]:
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            return None
+        actor_player = game_state.players[actor_index]
+        current_bet = max(0, int(game_state.current_bet))
+        actor_bet = max(0, int(actor_player.bet))
+        stack = max(0, int(actor_player.stack))
+        to_call = max(0, current_bet - actor_bet)
+        min_raise_to, max_raise_to = self._get_raise_bounds(game_state, actor_player)
+        if stack <= to_call or max_raise_to < min_raise_to:
+            return None
+
+        if action == ACTION_ALL_IN:
+            return int(max_raise_to)
+
+        multiplier = V24_RAISE_MULTIPLIERS.get(int(action))
+        if multiplier is None:
+            return None
+
+        pot = float(max(0, game_state.pot))
+        target = int(round(actor_bet + to_call + (multiplier * pot)))
+        target = max(int(min_raise_to), min(target, int(max_raise_to)))
+        return int(target)
+
+    def _v24_legal_raise_actions(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> list[int]:
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            return []
+        actor_player = game_state.players[actor_index]
+        current_bet = max(0, int(game_state.current_bet))
+        actor_bet = max(0, int(actor_player.bet))
+        stack = max(0, int(actor_player.stack))
+        to_call = max(0, current_bet - actor_bet)
+        min_raise_to, max_raise_to = self._get_raise_bounds(game_state, actor_player)
+        if stack <= to_call or max_raise_to < min_raise_to or max_raise_to <= current_bet:
+            return []
+
+        actions: list[int] = []
+        seen_targets: set[int] = set()
+        max_raise_to = int(max_raise_to)
+        for action_id in V24_NON_ALL_IN_RAISE_ACTIONS:
+            target = self._v24_raise_target(action_id, game_state, actor_index)
+            if target is None:
+                continue
+            if target >= max_raise_to:
+                continue
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            actions.append(action_id)
+
+        actions.append(ACTION_ALL_IN)
+        return actions
     
     def monte_carlo_equity(
         self, 
@@ -425,7 +570,10 @@ class GameService:
         self,
         game_state: GameStateRequest,
         actor_index: int,
+        version: Optional[str] = None,
     ) -> list[int]:
+        resolved_version = self._resolve_version(version, game_state)
+        version_num = version_to_int(resolved_version)
         info = self._get_legal_action_info_for_actor(game_state, actor_index)
         action_ids: list[int] = []
         for action in info["actions"]:
@@ -436,7 +584,10 @@ class GameService:
             elif action == FRONTEND_ACTION_CALL:
                 action_ids.append(ACTION_CALL)
             elif action == FRONTEND_ACTION_RAISE:
-                action_ids.extend([ACTION_RAISE_HALF_POT, ACTION_RAISE_POT_OR_ALL_IN])
+                if version_num >= 24:
+                    action_ids.extend(self._v24_legal_raise_actions(game_state, actor_index))
+                else:
+                    action_ids.extend([ACTION_RAISE_HALF_POT, ACTION_RAISE_POT_OR_ALL_IN])
         return sorted(set(action_ids))
 
     def model_action_to_frontend(self, action_id: int) -> Literal["fold", "check", "call", "raise_amt"]:
@@ -709,10 +860,17 @@ class GameService:
             "next_game_state": next_game_state,
         }
 
-    def build_observation(self, game_state: GameStateRequest) -> tuple[np.ndarray, float]:
+    def build_observation(
+        self,
+        game_state: GameStateRequest,
+        version: Optional[str] = None,
+    ) -> tuple[np.ndarray, float]:
         """
-        Build the 98-dim v21 observation vector and equity estimate.
+        Build the version-appropriate Deep CFR observation vector and equity estimate.
         """
+        resolved_version = self._resolve_version(version, game_state)
+        spec = get_version_spec(resolved_version)
+
         bot_player = self._get_bot_player(game_state)
         if bot_player is None:
             raise ValueError("No bot player found in game state")
@@ -732,7 +890,7 @@ class GameService:
             street=street_idx,
         )
 
-        obs = np.zeros(98, dtype=np.float32)
+        obs = np.zeros(spec.state_dim, dtype=np.float32)
 
         if len(hole_cards) == 2:
             rank_indices = sorted((_rank_index(card) for card in hole_cards))
@@ -780,7 +938,7 @@ class GameService:
         active_opponents = max(1, sum(1 for p in game_state.players if p.is_active and not p.is_bot))
         obs[58] = _estimate_preflop_strength(hole_cards, num_opponents=active_opponents)
         obs[59] = _has_flush_draw(hole_cards + board_cards)
-        obs[60] = float(max(0.0, min(1.0, equity)))
+        obs[60] = _current_hand_strength_scalar(hole_cards, board_cards)
 
         hero_seat = bot_player.position % 6
         obs[61 + hero_seat] = 1.0
@@ -815,15 +973,23 @@ class GameService:
         obs[76] = float(to_call / max(total_pot + to_call, 1.0))
 
         hero_contrib = hero_bet
+        street_raise_count = self._street_raise_count(game_state)
         obs[77] = float(hero_contrib / max(hero_contrib + hero_stack, 1.0))
-        obs[78] = 0.0
+        obs[78] = _normalize(float(street_raise_count), 4.0)
         obs[79] = _normalize((current_bet / big_blind), 20.0)
         obs[80] = _normalize((hero_contrib / big_blind), 200.0)
 
-        legal_actions = self.get_legal_actions(game_state)
-        for action_id in legal_actions:
-            if 0 <= action_id < NUM_ACTIONS:
-                obs[81 + action_id] = 1.0
+        legal_actions = self.get_legal_actions(game_state, version=resolved_version)
+        if spec.summarized_legal_features:
+            obs[81] = 1.0 if ACTION_FOLD in legal_actions else 0.0
+            obs[82] = 1.0 if ACTION_CHECK in legal_actions else 0.0
+            obs[83] = 1.0 if ACTION_CALL in legal_actions else 0.0
+            obs[84] = 1.0 if any(action_id in V24_NON_ALL_IN_RAISE_ACTIONS for action_id in legal_actions) else 0.0
+            obs[85] = 1.0 if ACTION_ALL_IN in legal_actions else 0.0
+        else:
+            for action_id in legal_actions:
+                if 0 <= action_id < min(spec.action_dim, 5):
+                    obs[81 + action_id] = 1.0
 
         by_seat = {player.position % 6: player for player in game_state.players}
         for offset in range(6):
@@ -843,34 +1009,38 @@ class GameService:
 
         return obs, equity
 
-    def get_legal_actions(self, game_state: GameStateRequest) -> list[int]:
+    def get_legal_actions(self, game_state: GameStateRequest, version: Optional[str] = None) -> list[int]:
         """
         Determine legal v21 actions from betting state.
         """
         bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
         if bot_index < 0:
             return [ACTION_CHECK]
-        return self.get_legal_action_ids_for_actor(game_state, bot_index)
+        return self.get_legal_action_ids_for_actor(game_state, bot_index, version=version)
 
     def calculate_raise_amount(
         self,
         action: int,
         game_state: GameStateRequest,
+        version: Optional[str] = None,
     ) -> Optional[int]:
         bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
         if bot_index < 0:
             return None
-        return self.calculate_raise_amount_for_actor(action, game_state, bot_index)
+        return self.calculate_raise_amount_for_actor(action, game_state, bot_index, version=version)
 
     def calculate_raise_amount_for_actor(
         self,
         action: int,
         game_state: GameStateRequest,
         actor_index: int,
+        version: Optional[str] = None,
     ) -> Optional[int]:
         """
-        Calculate the raise-to amount for a v21 raise action.
+        Calculate the raise-to amount for the selected abstract action.
         """
+        resolved_version = self._resolve_version(version, game_state)
+        version_num = version_to_int(resolved_version)
         if action in (ACTION_FOLD, ACTION_CHECK, ACTION_CALL):
             return None
 
@@ -888,7 +1058,11 @@ class GameService:
         if stack <= to_call or max_raise_to < min_raise_to:
             return None
 
-        if action == ACTION_RAISE_HALF_POT:
+        if version_num >= 24:
+            target = self._v24_raise_target(action, game_state, actor_index)
+            if target is None:
+                return None
+        elif action == ACTION_RAISE_HALF_POT:
             target = int(round(hero_bet + to_call + (0.5 * pot)))
         elif action == ACTION_RAISE_POT_OR_ALL_IN:
             target = int(round(hero_bet + to_call + pot))

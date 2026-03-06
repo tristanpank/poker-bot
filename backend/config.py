@@ -9,6 +9,8 @@ from pathlib import Path
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from backend.poker_versions import version_to_int
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -23,7 +25,7 @@ class Settings(BaseSettings):
     debug: bool = False
     
     # Model Settings
-    model_version: str = "v21"
+    model_version: str = "v24"
     model_checkpoint_dir: Path = Path(__file__).parent.parent / "training" / "models"
     legacy_model_checkpoint_dir: Path = Path(__file__).parent.parent / "training" / "checkpoints"
     default_model_path: str = ""  # Set dynamically below
@@ -83,7 +85,7 @@ class Settings(BaseSettings):
                 if match:
                     versions.add(f"v{match.group(1)}")
 
-        return sorted(versions)
+        return sorted(versions, key=version_to_int)
 
 
 @lru_cache
