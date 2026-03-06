@@ -2,8 +2,6 @@
 Poker API router with endpoints for bot actions and health checks.
 """
 
-import re
-
 from fastapi import APIRouter, HTTPException, Depends
 
 from backend.config import get_settings
@@ -18,20 +16,13 @@ from backend.models.schemas import (
     ModelInfo,
     PokerStepRequest,
     PokerStepResponse,
-    ACTION_NAMES,
     HAND_STRENGTH_CATEGORIES,
 )
+from backend.poker_versions import get_action_names, get_version_spec
 from backend.services.game_service import get_game_service, GameService, compute_hand_strength_category
 
 
 router = APIRouter(prefix="/poker", tags=["poker"])
-
-
-def _version_to_int(version: str) -> int:
-    match = re.search(r"(\d+)", (version or "").lower())
-    if match is None:
-        return 0
-    return int(match.group(1))
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -63,12 +54,12 @@ async def list_models() -> list[ModelInfo]:
     
     for version in available:
         path = settings.get_model_path(version)
-        version_num = _version_to_int(version)
+        spec = get_version_spec(version)
         models.append(ModelInfo(
             version=version,
             path=str(path),
-            state_dim=98 if version_num >= 21 else (520 if version_num >= 15 else 385),
-            num_actions=5 if version_num >= 21 else 6,
+            state_dim=spec.state_dim,
+            num_actions=spec.action_dim,
         ))
     
     return models
@@ -107,8 +98,9 @@ async def step_action(
             if not game_state.players[actor_index].is_bot:
                 raise ValueError("Current actor is not the bot")
 
-            observation, equity = game_service.build_observation(game_state)
-            legal_action_ids = game_service.get_legal_action_ids_for_actor(game_state, actor_index)
+            version = request.model_version or game_state.model_version
+            observation, equity = game_service.build_observation(game_state, version=version)
+            legal_action_ids = game_service.get_legal_action_ids_for_actor(game_state, actor_index, version=version)
             if not legal_action_ids:
                 raise ValueError("No legal actions available for bot actor")
 
@@ -121,10 +113,9 @@ async def step_action(
                     detail=f"Model service unavailable: {str(e)}",
                 ) from e
 
-            version = request.model_version or game_state.model_version
             action_id, q_values = model_service.get_action(observation, legal_action_ids, version=version)
             normalized_action = game_service.model_action_to_frontend(action_id)
-            raise_amt = game_service.calculate_raise_amount_for_actor(action_id, game_state, actor_index)
+            raise_amt = game_service.calculate_raise_amount_for_actor(action_id, game_state, actor_index, version=version)
 
             next_state, round_complete, applied_raise_amt = game_service.apply_frontend_action(
                 game_state,
@@ -213,10 +204,11 @@ async def get_action(
     """
     try:
         # Build observation from game state
-        observation, equity = game_service.build_observation(game_state)
+        version = game_state.model_version
+        observation, equity = game_service.build_observation(game_state, version=version)
         
         # Get legal actions
-        legal_actions = game_service.get_legal_actions(game_state)
+        legal_actions = game_service.get_legal_actions(game_state, version=version)
 
         # Lazily import model service so route registration doesn't require torch.
         try:
@@ -229,7 +221,6 @@ async def get_action(
             ) from e
         
         # Get model's action
-        version = game_state.model_version
         action_id, q_values = model_service.get_action(
             observation, 
             legal_actions,
@@ -237,14 +228,15 @@ async def get_action(
         )
         
         # Calculate raise amount if applicable
-        amount = game_service.calculate_raise_amount(action_id, game_state)
+        amount = game_service.calculate_raise_amount(action_id, game_state, version=version)
         
         # Get hand strength category
         strength_cat = compute_hand_strength_category(equity)
         strength_name = HAND_STRENGTH_CATEGORIES.get(strength_cat, "Unknown")
+        action_names = get_action_names(version)
         
         return ActionResponse(
-            action=ACTION_NAMES[action_id],
+            action=action_names.get(action_id, f"ACTION_{action_id}"),
             action_id=action_id,
             amount=amount,
             equity=round(equity, 4),

@@ -3,7 +3,7 @@ Model service for loading and running inference on trained poker models.
 """
 
 import sys
-import re
+import importlib
 from pathlib import Path
 from typing import Optional
 import threading
@@ -18,14 +18,7 @@ if str(_models_path) not in sys.path:
     sys.path.insert(0, str(_models_path))
 
 from backend.config import get_settings
-from backend.models.schemas import ACTION_NAMES
-
-
-def _version_to_int(version: str) -> int:
-    match = re.search(r"(\d+)", (version or "").lower())
-    if match is None:
-        return 0
-    return int(match.group(1))
+from backend.poker_versions import get_action_names, get_version_spec, version_to_int
 
 
 class ModelService:
@@ -53,14 +46,16 @@ class ModelService:
             raise ValueError("Checkpoint dictionary does not include a recognized model state dict.")
         raise ValueError("Checkpoint payload is not a dictionary.")
 
-    def _infer_v21_dims(
+    def _infer_deepcfr_dims(
         self,
         state_dict: dict[str, torch.Tensor],
         checkpoint: object,
+        default_state_dim: int,
+        default_action_dim: int,
     ) -> tuple[int, int, int]:
-        state_dim = 98
+        state_dim = int(default_state_dim)
         hidden_dim = 256
-        action_dim = len(ACTION_NAMES)
+        action_dim = int(default_action_dim)
 
         if isinstance(checkpoint, dict) and isinstance(checkpoint.get("config"), dict):
             config = checkpoint["config"]
@@ -78,8 +73,26 @@ class ModelService:
 
         return state_dim, hidden_dim, action_dim
 
-    def _action_label(self, action_id: int) -> str:
-        return ACTION_NAMES.get(action_id, f"ACTION_{action_id}")
+    def _deepcfr_runtime(self, version: str):
+        version_num = version_to_int(version)
+        if version_num >= 24:
+            module_name = "poker_model_v24"
+        elif version_num >= 23:
+            module_name = "poker_model_v23"
+        elif version_num >= 22:
+            module_name = "poker_model_v22"
+        else:
+            module_name = "poker_model_v21"
+
+        module = importlib.import_module(module_name)
+        return (
+            module.PokerDeepCFRNet,
+            getattr(module, "load_compatible_state_dict", None),
+            module.masked_policy,
+        )
+
+    def _action_label(self, action_id: int, version: str) -> str:
+        return get_action_names(version).get(action_id, f"ACTION_{action_id}")
         
     def load_model(self, version: str = None) -> torch.nn.Module:
         """
@@ -92,7 +105,7 @@ class ModelService:
             Loaded PyTorch model in eval mode.
         """
         version = (version or self.settings.model_version).lower()
-        version_num = _version_to_int(version)
+        version_num = version_to_int(version)
         
         # Return cached model if available
         if version in self._models:
@@ -112,16 +125,27 @@ class ModelService:
             checkpoint = torch.load(model_path, map_location=self.device)
 
             if version_num >= 21:
-                from poker_model_v21 import PokerDeepCFRNet
-
                 state_dict = self._extract_state_dict(checkpoint)
-                state_dim, hidden_dim, action_dim = self._infer_v21_dims(state_dict, checkpoint)
-                model = PokerDeepCFRNet(
-                    state_dim=state_dim,
-                    hidden_dim=hidden_dim,
-                    action_dim=action_dim,
+                spec = get_version_spec(version)
+                model_cls, compatible_loader, _ = self._deepcfr_runtime(version)
+                state_dim, hidden_dim, action_dim = self._infer_deepcfr_dims(
+                    state_dict,
+                    checkpoint,
+                    default_state_dim=spec.state_dim,
+                    default_action_dim=spec.action_dim,
                 )
-                model.load_state_dict(state_dict, strict=True)
+                init_kwargs = {
+                    "state_dim": state_dim,
+                    "hidden_dim": hidden_dim,
+                    "action_dim": action_dim,
+                }
+                if "init_weights" in model_cls.__init__.__code__.co_varnames:
+                    init_kwargs["init_weights"] = False
+                model = model_cls(**init_kwargs)
+                if compatible_loader is not None:
+                    compatible_loader(model, state_dict)
+                else:
+                    model.load_state_dict(state_dict, strict=True)
             else:
                 # Import the appropriate model class based on version
                 model = self._create_model_for_version(version)
@@ -136,7 +160,7 @@ class ModelService:
     
     def _create_model_for_version(self, version: str) -> torch.nn.Module:
         """Create a model instance for the given version."""
-        version_num = _version_to_int(version)
+        version_num = version_to_int(version)
         
         # Try to import the version-specific model
         try:
@@ -178,13 +202,13 @@ class ModelService:
             Tuple of (action_id, q_values_dict)
         """
         version = (version or self.settings.model_version).lower()
-        version_num = _version_to_int(version)
+        version_num = version_to_int(version)
         model = self.load_model(version)
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
             if version_num >= 21:
-                from poker_model_v21 import masked_policy
+                _, _, masked_policy = self._deepcfr_runtime(version)
 
                 logits = model.forward_strategy(state_tensor).squeeze(0).cpu().numpy()
                 legal_mask = np.zeros_like(logits, dtype=np.float32)
@@ -203,7 +227,7 @@ class ModelService:
                 best_action = int(np.argmax(masked))
 
         score_dict = {
-            self._action_label(i): float(scores[i])
+            self._action_label(i, version): float(scores[i])
             for i in range(len(scores))
         }
 

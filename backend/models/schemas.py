@@ -5,15 +5,7 @@ Pydantic schemas for API request/response models.
 from typing import Optional, Literal
 from pydantic import BaseModel, Field, ConfigDict
 
-
-# Action constants matching the model
-ACTION_NAMES = {
-    0: "FOLD",
-    1: "CHECK",
-    2: "CALL",
-    3: "RAISE_HALF_POT",
-    4: "RAISE_POT_OR_ALL_IN",
-}
+from backend.poker_versions import ACTION_NAMES
 
 HAND_STRENGTH_CATEGORIES = {
     0: "Trash",
@@ -93,7 +85,7 @@ class GameStateRequest(BaseModel):
                 "bot_position": 0,
                 "current_bet": 50,
                 "big_blind": 10,
-                "model_version": "v21"
+                "model_version": "v24"
             }
         }
     )
@@ -127,7 +119,7 @@ class GameStateRequest(BaseModel):
     # Model selection
     model_version: Optional[str] = Field(
         default=None, 
-        description="Model version to use (e.g., 'v21'). Uses default if not specified."
+        description="Model version to use (e.g., 'v24'). Uses default if not specified."
     )
 
 
@@ -136,24 +128,30 @@ class ActionResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "action": "RAISE_HALF_POT",
-                "action_id": 3,
-                "amount": 75,
+                "action": "RAISE_THREE_QUARTER_POT",
+                "action_id": 5,
+                "amount": 110,
                 "equity": 0.72,
                 "hand_strength_category": "Strong",
                 "q_values": {
                     "FOLD": -5.2,
                     "CHECK": 1.4,
                     "CALL": 3.1,
-                    "RAISE_HALF_POT": 5.8,
-                    "RAISE_POT_OR_ALL_IN": 4.2
+                    "RAISE_QUARTER_POT": 4.6,
+                    "RAISE_HALF_POT": 5.2,
+                    "RAISE_THREE_QUARTER_POT": 5.8,
+                    "RAISE_POT": 5.1,
+                    "RAISE_125_POT": 4.8,
+                    "RAISE_150_POT": 4.3,
+                    "RAISE_200_POT": 3.9,
+                    "ALL_IN": 2.7
                 }
             }
         }
     )
     
     action: str = Field(..., description="Action name (e.g., 'RAISE_HALF_POT')")
-    action_id: int = Field(..., ge=0, le=4, description="Action ID (0-4)")
+    action_id: int = Field(..., ge=0, le=10, description="Action ID (0-10)")
     
     # Betting details
     amount: Optional[int] = Field(
@@ -187,7 +185,7 @@ class AppliedAction(BaseModel):
 
     action: Literal["fold", "check", "call", "raise_amt"]
     raise_amt: Optional[int] = Field(default=None, ge=0)
-    action_id: Optional[int] = Field(default=None, ge=0, le=4)
+    action_id: Optional[int] = Field(default=None, ge=0, le=10)
     equity: Optional[float] = Field(default=None, ge=0, le=1)
     hand_strength_category: Optional[str] = None
     q_values: Optional[dict[str, float]] = None
