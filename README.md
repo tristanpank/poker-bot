@@ -90,6 +90,31 @@ jupyter notebook training/notebooks/training/poker_agent_v18.ipynb
 jupyter notebook training/notebooks/play_against_bot.ipynb
 ```
 
+## Docker Setup
+
+For consistent local development, you can run the backend using Docker and Docker Compose.
+
+### 1 – Prerequisites
+- **Docker** and **Docker Compose V2** are required.
+- **Important for Linux Users**: Older versions of `docker-compose` (v1.x) will crash with a `KeyError: 'ContainerConfig'` when handling modern builds. 
+  - On Ubuntu 24.04+, install the modern plugin: `sudo apt update && sudo apt install docker-compose-v2`
+  - Always use the space command: `docker compose` (not `docker-compose`).
+
+### 2 – Build and Run
+From the root directory, run:
+
+```bash
+docker compose up --build backend
+```
+
+- **Hot Reloading**: The `backend/` directory is mounted into the container via volumes, so changes you make locally will auto-restart the server inside Docker.
+- **Baked-in Models**: Trained models, checkpoints, and feature definitions are baked directly into the image to ensure the container is self-contained and ready to run.
+
+### 3 – Monitoring
+```bash
+docker compose logs -f backend
+```
+
 ## Backend API
 
 ### Poker endpoints (`/poker`)
