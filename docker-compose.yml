@@ -10,8 +10,6 @@ services:
     volumes:
       # Mount backend source for hot-reload during development
       - ./backend:/app/backend
-      # Mount model checkpoints at runtime (keeps image small)
-      - ./training/checkpoints:/app/training/checkpoints:ro
       # Mount model class definitions so new models are available without rebuild
       - ./training/src/models:/app/training/src/models:ro
     environment:

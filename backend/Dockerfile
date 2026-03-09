@@ -18,8 +18,10 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 COPY backend/ /app/backend/
 
 # Copy training model class definitions (needed for torch.load)
-# Checkpoints (.pt files) are mounted at runtime via volumes
+# Checkpoints (.pt files) are baked into the image
 COPY training/src/models/ /app/training/src/models/
+COPY training/src/features/ /app/training/src/features/
+COPY training/models/ /app/training/models/
 
 EXPOSE 8000
 

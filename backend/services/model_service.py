@@ -16,6 +16,9 @@ _project_root = Path(__file__).parent.parent.parent
 _models_path = _project_root / "training" / "src" / "models"
 if str(_models_path) not in sys.path:
     sys.path.insert(0, str(_models_path))
+_features_path = _project_root / "training" / "src" / "features"
+if str(_features_path) not in sys.path:
+    sys.path.insert(0, str(_features_path))
 
 from backend.config import get_settings
 from backend.poker_versions import get_action_names, get_version_spec, version_to_int
