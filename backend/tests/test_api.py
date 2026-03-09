@@ -10,6 +10,7 @@ import json
 from fastapi.testclient import TestClient
 
 from backend.main import app
+from backend.poker_versions import ACTION_NAMES_V24
 
 
 def log_response(test_name: str, response):
@@ -121,7 +122,8 @@ class TestActionEndpoint:
             ],
             "bot_position": 0,
             "current_bet": 10,
-            "big_blind": 10
+            "big_blind": 10,
+            "model_version": "v24",
         }
     
     @pytest.mark.requires_models
@@ -145,28 +147,19 @@ class TestActionEndpoint:
     
     @pytest.mark.requires_models
     def test_action_id_is_valid(self, client, valid_game_state):
-        """Action ID should be between 0 and 5."""
+        """Action ID should be between 0 and 10 for v24."""
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         
-        assert 0 <= data["action_id"] <= 5
+        assert 0 <= data["action_id"] <= 10
     
     @pytest.mark.requires_models
     def test_action_name_matches_id(self, client, valid_game_state):
         """Action name should match the action ID."""
-        action_names = {
-            0: "FOLD",
-            1: "CALL",
-            2: "RAISE_SMALL",
-            3: "RAISE_MEDIUM",
-            4: "RAISE_LARGE",
-            5: "ALL_IN"
-        }
-        
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         
-        expected_name = action_names[data["action_id"]]
+        expected_name = ACTION_NAMES_V24[data["action_id"]]
         assert data["action"] == expected_name
     
     @pytest.mark.requires_models
@@ -189,11 +182,11 @@ class TestActionEndpoint:
     
     @pytest.mark.requires_models
     def test_q_values_has_all_actions(self, client, valid_game_state):
-        """Q-values should include all 6 actions."""
+        """Q-values should include the full v24 action ladder."""
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         
-        expected_keys = {"FOLD", "CALL", "RAISE_SMALL", "RAISE_MEDIUM", "RAISE_LARGE", "ALL_IN"}
+        expected_keys = set(ACTION_NAMES_V24.values())
         assert set(data["q_values"].keys()) == expected_keys
     
     @pytest.mark.requires_models
@@ -229,7 +222,8 @@ class TestActionEndpoint:
             ],
             "bot_position": 0,
             "current_bet": 0,
-            "big_blind": 10
+            "big_blind": 10,
+            "model_version": "v24",
         }
         
         response = client.post("/poker/action", json=game_state)

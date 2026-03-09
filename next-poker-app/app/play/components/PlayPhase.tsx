@@ -1,38 +1,69 @@
 import React from 'react';
 
 type Card = { rank: string; suit: string };
-type PlayerState = { position: number; stack: number; bet: number; hole_cards: Card[] | null; is_bot: boolean; is_active: boolean; has_acted: boolean; };
-type BotResponse = { action: string; action_id: number; amount: number | null; equity: number; hand_strength_category: string; q_values: Record<string, number> | null };
+type PlayerState = { position: number; stack: number; bet: number; hole_cards: Card[] | null; is_bot: boolean; is_active: boolean; has_acted: boolean };
+type BotResponse = { action: string; action_id: number | null; amount: number | null };
+type LegalActionState = {
+    canFold: boolean;
+    canCheck: boolean;
+    canCall: boolean;
+    canRaise: boolean;
+    toCall: number;
+    minRaiseTo: number | null;
+    maxRaiseTo: number | null;
+};
+type ShowdownEntry = { playerIndex: number; position: number; cards: Card[]; mucked: boolean };
+type ShowdownResult = { result: 'won' | 'lost' | 'push'; amount: number; delta: number };
+type ResultFlash = { result: 'won' | 'lost' | 'push'; delta: number };
 
 const ACTION_COLORS: Record<string, string> = {
-    FOLD: 'text-red-400', CALL: 'text-blue-400', RAISE_SMALL: 'text-emerald-400',
-    RAISE_MEDIUM: 'text-emerald-300', RAISE_LARGE: 'text-yellow-400', ALL_IN: 'text-amber-300',
+    FOLD: 'text-red-400',
+    CHECK: 'text-blue-300',
+    CALL: 'text-blue-400',
+    RAISE_HALF_POT: 'text-emerald-300',
+    RAISE_POT_OR_ALL_IN: 'text-amber-300',
+    fold: 'text-red-400',
+    check: 'text-blue-300',
+    call: 'text-blue-400',
+    raise_amt: 'text-emerald-300',
 };
 
-const suitSym = (s: string) => ({ s: '♠', h: '♥', d: '♦', c: '♣' }[s] ?? s);
+const seatRoleByPlayers: Record<number, string[]> = {
+    2: ['BTN/SB', 'BB'],
+    3: ['BTN', 'SB', 'BB'],
+    4: ['BTN', 'SB', 'BB', 'UTG'],
+    5: ['BTN', 'SB', 'BB', 'UTG', 'CO'],
+    6: ['BTN', 'SB', 'BB', 'UTG', 'HJ', 'CO'],
+};
 
-function relativeLabel(pos: number, botPos: number, total: number): string {
-    const diff = ((pos - botPos) % total + total) % total;
-    if (diff === 0) return 'Bot';
-    return `Player ${pos} — ${diff} seat${diff > 1 ? 's' : ''} left of Bot`;
+const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
+
+function getSeatRole(position: number, numPlayers: number): string {
+    const roles = seatRoleByPlayers[numPlayers] ?? seatRoleByPlayers[6];
+    return roles[position] ?? `Seat ${position + 1}`;
 }
 
-// Helper to determine the badge (D, SB, BB) for a given seat position
-function getPlayerBadge(position: number, numPlayers: number): string | null {
-    if (numPlayers === 2) {
-        if (position === 0) return 'SB/D';
-        if (position === 1) return 'BB';
-    } else {
-        if (position === 0) return 'D';
-        if (position === 1) return 'SB';
-        if (position === 2) return 'BB';
-    }
-    return null;
+function getPlayerName(player: PlayerState, numPlayers: number): string {
+    const role = getSeatRole(player.position, numPlayers);
+    if (player.is_bot) return `Bot (${role})`;
+    return `Player ${player.position + 1} (${role})`;
+}
+
+function normalizeAction(action: string): string {
+    if (action === 'RAISE_HALF_POT' || action === 'RAISE_POT_OR_ALL_IN') return 'raise_amt';
+    return action.toLowerCase();
+}
+
+function displayAction(action: string): string {
+    const normalized = normalizeAction(action);
+    if (normalized === 'raise_amt') return 'RAISE';
+    return normalized.toUpperCase();
 }
 
 type PlayPhaseProps = {
     pot: number;
     currentBet: number;
+    bigBlind: number;
     botPosition: number;
     holeCards: Card[];
     communityCards: Card[];
@@ -41,41 +72,91 @@ type PlayPhaseProps = {
     currentPlayerIdx: number;
     isLoading: boolean;
     botResponse: BotResponse | null;
-    showQValues: boolean;
-    setShowQValues: (show: boolean) => void;
     showRaiseInput: boolean;
     setShowRaiseInput: (show: boolean) => void;
     raiseInput: string;
     setRaiseInput: (val: string) => void;
-    pickingFor: 'hole' | 'community' | null;
     onOpenCommunityPicker: () => void;
     onQueryBot: () => void;
     onRecordAction: (action: 'fold' | 'check_call' | 'raise', amount?: number) => void;
     onUndo: () => void;
-    onEndHand: () => void;
     canUndo: boolean;
     undoLabel?: string;
-    children?: React.ReactNode; // For injecting CardSelector
+    legalActions: LegalActionState;
+    showdownMode: boolean;
+    showdownEntries: ShowdownEntry[];
+    currentShowdownPlayerIndex: number | null;
+    showdownCanResolve: boolean;
+    isResolvingShowdown: boolean;
+    showdownError: string | null;
+    showdownResult: ShowdownResult | null;
+    resultFlash: ResultFlash | null;
+    onMuckShowdown: () => void;
+    onClearShowdown: () => void;
+    onResolveShowdown: () => void;
+    children?: React.ReactNode;
 };
 
 export default function PlayPhase({
-    pot, currentBet, botPosition, holeCards, communityCards, street, players, currentPlayerIdx,
-    isLoading, botResponse, showQValues, setShowQValues, showRaiseInput, setShowRaiseInput,
-    raiseInput, setRaiseInput, pickingFor, onOpenCommunityPicker, onQueryBot, onRecordAction,
-    onUndo, onEndHand, canUndo, undoLabel, children
+    pot,
+    currentBet,
+    bigBlind,
+    botPosition,
+    holeCards,
+    communityCards,
+    street,
+    players,
+    currentPlayerIdx,
+    isLoading,
+    botResponse,
+    showRaiseInput,
+    setShowRaiseInput,
+    raiseInput,
+    setRaiseInput,
+    onOpenCommunityPicker,
+    onQueryBot,
+    onRecordAction,
+    onUndo,
+    canUndo,
+    undoLabel,
+    legalActions,
+    showdownMode,
+    showdownEntries,
+    currentShowdownPlayerIndex,
+    showdownCanResolve,
+    isResolvingShowdown,
+    showdownError,
+    showdownResult,
+    resultFlash,
+    onMuckShowdown,
+    onClearShowdown,
+    onResolveShowdown,
+    children,
 }: PlayPhaseProps) {
-
     const currentPlayer = players[currentPlayerIdx];
     const isBotTurn = currentPlayer?.is_bot ?? false;
-    const botPlayer = players.find(p => p.is_bot);
+    const botPlayer = players.find((p) => p.is_bot);
+    const raiseMin = legalActions.minRaiseTo ?? 0;
+    const raiseMax = legalActions.maxRaiseTo ?? 0;
+    const raiseValue = Number(raiseInput);
+    const hasRaiseValue = Number.isFinite(raiseValue);
+    const raiseIsLegal = legalActions.canRaise && hasRaiseValue && raiseValue >= raiseMin && raiseValue <= raiseMax;
+    const canDealNextStreet = (
+        !showdownMode
+        && currentPlayerIdx === -1
+        && (
+            (street === 'preflop' && communityCards.length === 0)
+            || (street === 'flop' && communityCards.length === 3)
+            || (street === 'turn' && communityCards.length === 4)
+        )
+    );
 
     return (
         <div className="flex-1 flex flex-col min-h-[100dvh]">
-            {/* Header */}
             <header className="p-4 flex justify-between items-center border-b border-[var(--color-border-color)] bg-slate-950/30 sticky top-0 z-10">
                 <div className="flex flex-col gap-0.5">
                     <div className="flex items-center gap-2">
-                        <span className="text-lg text-[var(--color-accent)]">♠</span>
+                        <span className="text-lg text-[var(--color-accent)]">{"\u2660"}</span>
                         <span className="text-lg font-bold text-[var(--color-text-primary)]">PokerBot</span>
                     </div>
                     {botPlayer && (
@@ -96,10 +177,9 @@ export default function PlayPhase({
                 </div>
             </header>
 
-            <main className="flex-1 p-4 flex flex-col gap-4 overflow-y-auto pb-36">
-                {/* Bot's Cards */}
+            <main className="flex-1 p-4 flex flex-col gap-4 overflow-y-auto pb-28">
                 <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
-                    <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold mb-2">Bot&apos;s Hand (Seat {botPosition})</p>
+                    <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold mb-2">Bot&apos;s Hand (Seat {botPosition + 1})</p>
                     <div className="flex gap-2">
                         {holeCards.map((c, i) => (
                             <div key={i} className={`card-mini suit-${c.suit}`}>
@@ -110,17 +190,16 @@ export default function PlayPhase({
                     </div>
                 </section>
 
-                {/* Community Cards */}
                 <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
                     <div className="flex justify-between items-center mb-2">
                         <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold">
-                            Board — {street}
+                            Board - {street}
                         </p>
-                        {((street === 'preflop' && communityCards.length === 0) ||
-                            (street === 'flop' && communityCards.length === 3) ||
-                            (street === 'turn' && communityCards.length === 4)) && (
-                                <button onClick={onOpenCommunityPicker}
-                                    className="text-xs font-semibold px-3 py-1 rounded-lg bg-[var(--color-accent)]/15 text-[var(--color-accent)] border border-[var(--color-accent)]/30 hover:bg-[var(--color-accent)]/25 active:scale-95 transition-all">
+                        {canDealNextStreet && (
+                                <button
+                                    onClick={onOpenCommunityPicker}
+                                    className="text-xs font-semibold px-3 py-1 rounded-lg bg-[var(--color-accent)]/15 text-[var(--color-accent)] border border-[var(--color-accent)]/30 hover:bg-[var(--color-accent)]/25 active:scale-95 transition-all"
+                                >
                                     + Deal {communityCards.length === 0 ? 'Flop' : communityCards.length === 3 ? 'Turn' : 'River'}
                                 </button>
                             )}
@@ -137,10 +216,104 @@ export default function PlayPhase({
                     </div>
                 </section>
 
-                {/* Card Selector (if active) */}
-                {children}
+                {!showdownMode && children}
 
-                {/* Bot Recommendation */}
+                <section className="sticky top-20 z-20 bg-[var(--color-surface)]/95 backdrop-blur border border-[var(--color-border-color)] rounded-2xl p-4">
+                    <div className="flex justify-between items-center mb-3">
+                        <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold">Table</p>
+                        <p className="text-xs text-[var(--color-text-secondary)]">Pot {pot} | Bet {currentBet}</p>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                        {players.map((player, idx) => (
+                            <div
+                                key={idx}
+                                className={`rounded-xl border px-3 py-2 ${idx === currentPlayerIdx ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'} ${!player.is_active ? 'opacity-60' : ''}`}
+                            >
+                                <div className="flex items-center justify-between">
+                                    <span className="text-sm font-semibold text-[var(--color-text-primary)]">
+                                        {getPlayerName(player, players.length)}
+                                    </span>
+                                    <span className="text-xs text-[var(--color-text-secondary)]">
+                                        {player.is_active ? 'Active' : 'Folded'}
+                                    </span>
+                                </div>
+                                <div className="text-xs text-[var(--color-text-secondary)] mt-1">
+                                    Stack: <span className="text-[var(--color-text-primary)] font-semibold">{player.stack}</span> | Bet: <span className="text-[var(--color-text-primary)] font-semibold">{player.bet}</span>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    {!showdownMode && (
+                        <div className="mt-3">
+                            <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold mb-2">
+                                {currentPlayerIdx === -1 ? 'Betting Round Complete' : (isBotTurn ? 'Bot Turn' : `Acting: ${currentPlayer ? getPlayerName(currentPlayer, players.length) : ''}`)}
+                            </p>
+
+                            {currentPlayerIdx !== -1 && (isBotTurn ? (
+                                <button
+                                    onClick={onQueryBot}
+                                    disabled={isLoading}
+                                    className="w-full py-3 rounded-xl font-bold text-sm uppercase tracking-wider bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {isLoading ? 'Thinking...' : 'Get Bot Action'}
+                                </button>
+                            ) : (
+                                <div className="flex flex-col gap-2">
+                                    <div className="grid grid-cols-3 gap-2">
+                                        <button
+                                            onClick={() => onRecordAction('fold')}
+                                            disabled={!legalActions.canFold}
+                                            className="py-3 rounded-xl font-semibold text-sm uppercase bg-red-500/10 text-[var(--color-danger)] border border-red-500/30 hover:bg-[var(--color-danger)] hover:text-white active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                                        >
+                                            Fold
+                                        </button>
+                                        <button
+                                            onClick={() => onRecordAction('check_call')}
+                                            disabled={!(legalActions.canCheck || legalActions.canCall)}
+                                            className="py-3 rounded-xl font-semibold text-sm uppercase bg-blue-500/10 text-[var(--color-info)] border border-blue-500/30 hover:bg-[var(--color-info)] hover:text-white active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                                        >
+                                            {legalActions.canCall ? 'Call' : 'Check'}
+                                        </button>
+                                        <button
+                                            onClick={() => setShowRaiseInput(!showRaiseInput)}
+                                            disabled={!legalActions.canRaise}
+                                            className="py-3 rounded-xl font-semibold text-sm uppercase bg-emerald-500/10 text-[var(--color-accent)] border border-emerald-500/30 hover:bg-[var(--color-accent)] hover:text-slate-950 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                                        >
+                                            Raise
+                                        </button>
+                                    </div>
+                                    {showRaiseInput && legalActions.canRaise && (
+                                        <div className="flex flex-col gap-2 animate-fade-in">
+                                            <p className="text-xs text-[var(--color-text-secondary)]">
+                                                Raise-to range: {raiseMin} to {raiseMax} chips ({(raiseMin / bigBlind).toFixed(1)}-{(raiseMax / bigBlind).toFixed(1)} BB)
+                                            </p>
+                                            <div className="flex gap-2">
+                                                <input
+                                                    type="number"
+                                                    value={raiseInput}
+                                                    onChange={(e) => setRaiseInput(e.target.value)}
+                                                    min={raiseMin}
+                                                    max={raiseMax}
+                                                    placeholder="Total bet amount"
+                                                    className="flex-1 bg-slate-800 border border-slate-600 rounded-xl px-3 py-2 text-sm text-white font-semibold"
+                                                />
+                                                <button
+                                                    onClick={() => { if (raiseIsLegal) onRecordAction('raise', Math.trunc(raiseValue)); }}
+                                                    disabled={!raiseIsLegal}
+                                                    className="px-4 py-2 rounded-xl font-bold text-sm bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 active:scale-95 transition-all disabled:opacity-40"
+                                                >
+                                                    Confirm
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </section>
+
                 {isLoading && (
                     <section className="bg-[var(--color-surface)] border border-[var(--color-accent)]/30 rounded-2xl p-6 flex items-center justify-center gap-3">
                         <div className="w-5 h-5 border-2 border-[var(--color-accent)] border-t-transparent rounded-full animate-spin" />
@@ -151,133 +324,123 @@ export default function PlayPhase({
                 {botResponse && !isLoading && (
                     <section className="bg-[var(--color-surface)] border border-[var(--color-accent)]/30 rounded-2xl p-5 animate-recommend">
                         <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold mb-3">Agent Recommendation</p>
-                        <div className={`text-3xl font-bold uppercase tracking-wide mb-2 ${ACTION_COLORS[botResponse.action] ?? 'text-white'}`}
-                            style={{ textShadow: '0 0 20px rgba(16,185,129,0.3)' }}>
-                            {botResponse.action.replace('_', ' ')}
+                        <div className={`text-3xl font-bold uppercase tracking-wide mb-2 ${ACTION_COLORS[botResponse.action] ?? ACTION_COLORS[normalizeAction(botResponse.action)] ?? 'text-white'}`}>
+                            {displayAction(botResponse.action)}
                         </div>
-                        {botResponse.amount && (
+                        {botResponse.amount !== null && botResponse.amount !== undefined && (
                             <p className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">Amount: {botResponse.amount} chips</p>
-                        )}
-                        <div className="flex gap-4 text-sm">
-                            <div>
-                                <span className="text-[var(--color-text-secondary)]">Equity: </span>
-                                <span className="font-semibold text-[var(--color-accent)]">{(botResponse.equity * 100).toFixed(1)}%</span>
-                            </div>
-                            <div>
-                                <span className="text-[var(--color-text-secondary)]">Strength: </span>
-                                <span className="font-semibold text-[var(--color-text-primary)]">{botResponse.hand_strength_category}</span>
-                            </div>
-                        </div>
-                        {/* Equity bar */}
-                        <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden mt-3">
-                            <div className="h-full bg-[var(--color-accent)] shadow-[0_0_10px_var(--color-accent-glow)] rounded-full transition-all duration-500"
-                                style={{ width: `${botResponse.equity * 100}%` }} />
-                        </div>
-                        {/* Q-values */}
-                        {botResponse.q_values && (
-                            <div className="mt-3">
-                                <button onClick={() => setShowQValues(!showQValues)}
-                                    className="text-xs text-[var(--color-text-secondary)] hover:text-white transition-colors">
-                                    {showQValues ? '▼' : '▶'} Q-Values
-                                </button>
-                                {showQValues && (
-                                    <div className="mt-2 grid grid-cols-2 gap-1 text-xs">
-                                        {Object.entries(botResponse.q_values).sort(([, a], [, b]) => b - a).map(([action, val]) => (
-                                            <div key={action} className={`flex justify-between px-2 py-1 rounded ${action === botResponse!.action ? 'bg-[var(--color-accent)]/15 text-[var(--color-accent)]' : 'text-[var(--color-text-secondary)]'}`}>
-                                                <span>{action}</span>
-                                                <span className="font-mono">{val.toFixed(1)}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
                         )}
                     </section>
                 )}
 
-                {/* Active Player Indicator + Opponent Actions */}
-                {!pickingFor && (
+                {showdownMode && (
                     <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
-                        <div className="flex justify-between items-center mb-5">
-                            <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold">
-                                {currentPlayerIdx === -1 ? 'Betting Round Complete' : (isBotTurn ? 'Bot\'s Turn' : `Acting: ${relativeLabel(currentPlayer?.position ?? 0, botPosition, players.length)}`)}
-                            </p>
-                            <div className="flex gap-2">
-                                {players.map((p, i) => {
-                                    const badge = getPlayerBadge(p.position, players.length);
-                                    return (
-                                        <div key={i} className="flex flex-col items-center gap-1">
-                                            {badge && (
-                                                <span className="text-[8px] font-bold text-[var(--color-text-secondary)] tracking-tighter uppercase">{badge}</span>
-                                            )}
-                                            {!badge && <span className="h-3" />} {/* Spacer to align items vertically */}
-                                            <div className={`w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold border transition-all
-                                              ${!p.is_active ? 'bg-slate-900 border-slate-700 text-slate-600 line-through'
-                                                    : i === currentPlayerIdx ? 'bg-[var(--color-accent)]/20 border-[var(--color-accent)] text-[var(--color-accent)] shadow-[0_0_8px_var(--color-accent-glow)]'
-                                                        : p.is_bot ? 'bg-blue-500/15 border-blue-500/40 text-blue-400'
-                                                            : 'bg-slate-800 border-slate-600 text-slate-300'}`}>
-                                                {p.is_bot ? 'B' : p.position}
-                                            </div>
+                        <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold mb-2">Opponent Reveal Order</p>
+                        <div className="flex flex-col gap-2">
+                            {showdownEntries.length === 0 && (
+                                <p className="text-sm text-[var(--color-text-secondary)]">No active opponents to reveal.</p>
+                            )}
+                            {showdownEntries.map((entry, idx) => {
+                                const player = players[entry.playerIndex];
+                                const name = player ? getPlayerName(player, players.length) : `Player ${entry.position + 1}`;
+                                const isCurrent = entry.playerIndex === currentShowdownPlayerIndex;
+                                return (
+                                    <div
+                                        key={entry.playerIndex}
+                                        className={`rounded-xl border px-3 py-2 ${isCurrent ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'}`}
+                                    >
+                                        <div className="flex justify-between items-center">
+                                            <span className="text-sm font-semibold text-[var(--color-text-primary)]">{idx + 1}. {name}</span>
+                                            <span className="text-xs text-[var(--color-text-secondary)]">
+                                                {entry.mucked ? 'Mucked' : (entry.cards.length === 2 ? entry.cards.map((c) => `${c.rank}${suitSym(c.suit)}`).join(' ') : 'Pending')}
+                                            </span>
                                         </div>
-                                    );
-                                })}
-                            </div>
+
+                                        {isCurrent && !entry.mucked && !showdownResult && (
+                                            <div className="mt-2">
+                                                {children}
+                                                <div className="mt-2 grid grid-cols-2 gap-2">
+                                                    <button
+                                                        onClick={onMuckShowdown}
+                                                        className="py-2 rounded-xl text-xs font-bold uppercase border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
+                                                    >
+                                                        Muck
+                                                    </button>
+                                                    <button
+                                                        onClick={onClearShowdown}
+                                                        className="py-2 rounded-xl text-xs font-bold uppercase border border-slate-600 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                                                    >
+                                                        Clear
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
                         </div>
 
-                        {currentPlayerIdx !== -1 && (isBotTurn ? (
-                            <button onClick={onQueryBot}
-                                disabled={isLoading}
-                                className="w-full py-3 rounded-xl font-bold text-sm uppercase tracking-wider transition-all duration-200 bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_4px_16px_rgba(16,185,129,0.3)]">
-                                {isLoading ? 'Thinking...' : 'Get Bot Action'}
-                            </button>
-                        ) : (
-                            <div className="flex flex-col gap-2">
-                                <div className="grid grid-cols-3 gap-2">
-                                    <button onClick={() => onRecordAction('fold')}
-                                        className="py-3 rounded-xl font-semibold text-sm uppercase bg-red-500/10 text-[var(--color-danger)] border border-red-500/30 hover:bg-[var(--color-danger)] hover:text-white active:scale-95 transition-all">
-                                        Fold
-                                    </button>
-                                    <button onClick={() => onRecordAction('check_call')}
-                                        className="py-3 rounded-xl font-semibold text-sm uppercase bg-blue-500/10 text-[var(--color-info)] border border-blue-500/30 hover:bg-[var(--color-info)] hover:text-white active:scale-95 transition-all">
-                                        {currentBet > (currentPlayer?.bet ?? 0) ? 'Call' : 'Check'}
-                                    </button>
-                                    <button onClick={() => setShowRaiseInput(!showRaiseInput)}
-                                        className="py-3 rounded-xl font-semibold text-sm uppercase bg-emerald-500/10 text-[var(--color-accent)] border border-emerald-500/30 hover:bg-[var(--color-accent)] hover:text-slate-950 active:scale-95 transition-all">
-                                        Raise
-                                    </button>
-                                </div>
-                                {showRaiseInput && (
-                                    <div className="flex gap-2 animate-fade-in">
-                                        <input type="number" value={raiseInput} onChange={e => setRaiseInput(e.target.value)}
-                                            placeholder="Total bet amount"
-                                            className="flex-1 bg-slate-800 border border-slate-600 rounded-xl px-3 py-2 text-sm text-white font-semibold" />
-                                        <button onClick={() => { if (raiseInput) onRecordAction('raise', Number(raiseInput)); }}
-                                            disabled={!raiseInput}
-                                            className="px-4 py-2 rounded-xl font-bold text-sm bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 active:scale-95 transition-all disabled:opacity-40">
-                                            Confirm
-                                        </button>
-                                    </div>
-                                )}
+                        {showdownError && (
+                            <p className="mt-3 text-sm text-red-300">{showdownError}</p>
+                        )}
+
+                        {showdownResult && (
+                            <div className="mt-3 rounded-xl border border-[var(--color-border-color)] bg-slate-900/40 px-3 py-2">
+                                <p className="text-sm font-bold text-[var(--color-text-primary)]">
+                                    {showdownResult.result.toUpperCase()} {showdownResult.amount}
+                                </p>
+                                <p className="text-xs text-[var(--color-text-secondary)]">
+                                    Delta: {showdownResult.delta >= 0 ? '+' : ''}{showdownResult.delta}
+                                </p>
                             </div>
-                        ))}
+                        )}
+
+                        <div className="mt-3">
+                            {!showdownResult ? (
+                                <button
+                                    onClick={onResolveShowdown}
+                                    disabled={!showdownCanResolve || isResolvingShowdown}
+                                    className="w-full py-3 rounded-xl font-bold text-sm uppercase tracking-wider bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    {isResolvingShowdown ? 'Resolving...' : 'Resolve Showdown'}
+                                </button>
+                            ) : (
+                                <p className="text-xs text-[var(--color-text-secondary)] font-semibold uppercase tracking-wider text-center py-2">
+                                    Starting next hand...
+                                </p>
+                            )}
+                        </div>
                     </section>
                 )}
             </main>
 
-            {/* Bottom bar: Undo + End Hand */}
-            <nav className="fixed bottom-0 w-full max-w-[480px] p-4 bg-gradient-to-t from-slate-950 from-60% to-transparent flex gap-3 z-20">
-                {canUndo && (
-                    <button onClick={onUndo}
-                        className="flex-1 py-3 rounded-xl font-semibold text-sm bg-slate-800 text-slate-300 border border-slate-600 hover:bg-slate-700 active:scale-95 transition-all flex items-center justify-center gap-2">
-                        ↩ Undo
+            {canUndo && (
+                <nav className="fixed bottom-0 w-full max-w-[480px] p-4 bg-gradient-to-t from-slate-950 from-60% to-transparent z-20">
+                    <button
+                        onClick={onUndo}
+                        className="w-full py-3 rounded-xl font-semibold text-sm bg-slate-800 text-slate-300 border border-slate-600 hover:bg-slate-700 active:scale-95 transition-all flex items-center justify-center gap-2"
+                    >
+                        Undo
                         {undoLabel && <span className="text-[10px] text-slate-500">({undoLabel})</span>}
                     </button>
-                )}
-                <button onClick={onEndHand}
-                    className="flex-1 py-3 rounded-xl font-semibold text-sm uppercase bg-amber-500/15 text-amber-400 border border-amber-500/30 hover:bg-amber-500 hover:text-slate-950 active:scale-95 transition-all">
-                    End Hand
-                </button>
-            </nav>
+                </nav>
+            )}
+
+            {resultFlash && (
+                <div
+                    className={`fixed top-5 left-1/2 -translate-x-1/2 z-30 px-5 py-2 rounded-xl border shadow-lg ${
+                        resultFlash.result === 'won'
+                            ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                            : resultFlash.result === 'lost'
+                                ? 'border-red-400/60 bg-red-500/20 text-red-200'
+                                : 'border-slate-400/60 bg-slate-700/30 text-slate-100'
+                    }`}
+                >
+                    <p className="text-base font-bold">
+                        {resultFlash.delta >= 0 ? '+' : ''}{resultFlash.delta}
+                    </p>
+                </div>
+            )}
         </div>
     );
 }

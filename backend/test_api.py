@@ -11,6 +11,8 @@ import os
 # Ensure we can import from the project
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.poker_versions import get_action_names, get_version_spec
+
 def test_card_conversion():
     """Test Card conversion from schema to pokerkit."""
     print("Testing card conversion...")
@@ -58,13 +60,14 @@ def test_game_service():
         ],
         bot_position=0,
         current_bet=10,
-        big_blind=10
+        big_blind=10,
+        model_version="v24"
     )
     
-    observation, equity = game_service.build_observation(game_state)
+    observation, equity = game_service.build_observation(game_state, version=game_state.model_version)
     print(f"  ✅ Built observation: shape={observation.shape}, equity={equity:.2f}")
     
-    legal_actions = game_service.get_legal_actions(game_state)
+    legal_actions = game_service.get_legal_actions(game_state, version=game_state.model_version)
     print(f"  ✅ Legal actions: {legal_actions}")
 
 
@@ -93,8 +96,9 @@ def test_model_service():
         assert False, f"Failed to load model: {e}"
     
     # Test inference
-    observation = np.zeros(520, dtype=np.float32)
-    legal_actions = [0, 1, 2, 3, 4, 5]
+    spec = get_version_spec(version)
+    observation = np.zeros(spec.state_dim, dtype=np.float32)
+    legal_actions = list(range(spec.action_dim))
     
     action, q_values = model_service.get_action(observation, legal_actions, version)
     print(f"  ✅ Inference: action={action}, q_values={list(q_values.values())[:3]}...")
@@ -107,7 +111,7 @@ def test_full_pipeline():
     from backend.services.model_service import get_model_service
     from backend.models.schemas import (
         GameStateRequest, PlayerState, CardSchema, 
-        ACTION_NAMES, HAND_STRENGTH_CATEGORIES
+        HAND_STRENGTH_CATEGORIES
     )
     from backend.services.game_service import compute_hand_strength_category
     
@@ -143,23 +147,26 @@ def test_full_pipeline():
         ],
         bot_position=0,
         current_bet=10,
-        big_blind=10
+        big_blind=10,
+        model_version="v24"
     )
     
     # Build observation
-    observation, equity = game_service.build_observation(game_state)
-    legal_actions = game_service.get_legal_actions(game_state)
+    version = game_state.model_version
+    observation, equity = game_service.build_observation(game_state, version=version)
+    legal_actions = game_service.get_legal_actions(game_state, version=version)
     
     # Get action
-    action_id, q_values = model_service.get_action(observation, legal_actions)
+    action_id, q_values = model_service.get_action(observation, legal_actions, version=version)
     
     # Calculate amount
-    amount = game_service.calculate_raise_amount(action_id, game_state)
+    amount = game_service.calculate_raise_amount(action_id, game_state, version=version)
     
     # Get hand strength
     strength_cat = compute_hand_strength_category(equity)
     
-    print(f"  ✅ Action: {ACTION_NAMES[action_id]} (id={action_id})")
+    action_names = get_action_names(version)
+    print(f"  âœ… Action: {action_names[action_id]} (id={action_id})")
     print(f"  ✅ Amount: {amount}")
     print(f"  ✅ Equity: {equity:.2%}")
     print(f"  ✅ Hand Strength: {HAND_STRENGTH_CATEGORIES[strength_cat]}")
@@ -195,3 +202,5 @@ if __name__ == "__main__":
     
     all_passed = all(r[1] for r in results)
     print("\n" + ("All tests passed! 🎉" if all_passed else "Some tests failed."))
+
+

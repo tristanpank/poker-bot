@@ -1,61 +1,195 @@
 import React from 'react';
 
-type HandResultProps = {
-    resultType: 'won' | 'lost' | null;
-    setResultType: (type: 'won' | 'lost' | null) => void;
-    resultAmt: string;
-    setResultAmt: (amt: string) => void;
-    onConfirm: (won: boolean, amount: number) => void;
-    onUndo: () => void;
+type Card = { rank: string; suit: string };
+type OpponentReveal = {
+    playerIndex: number;
+    position: number;
+    cards: Card[];
+    mucked: boolean;
+};
+type ResolveResult = {
+    result: 'won' | 'lost' | 'push';
+    amount: number;
+    delta: number;
 };
 
+type HandResultProps = {
+    opponents: OpponentReveal[];
+    currentOpponent: OpponentReveal | null;
+    usedCards: Set<string>;
+    pendingRank: string | null;
+    setPendingRank: (rank: string | null) => void;
+    onSelectCard: (rank: string, suit: string) => void;
+    onMuckCurrent: () => void;
+    onClearCurrent: () => void;
+    canResolve: boolean;
+    isResolving: boolean;
+    resolveError: string | null;
+    resolveResult: ResolveResult | null;
+    onResolve: () => void;
+    onContinue: () => void;
+    onBack: () => void;
+};
+
+const RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'] as const;
+const SUITS = [
+    { key: 's', sym: 'S' },
+    { key: 'h', sym: 'H' },
+    { key: 'd', sym: 'D' },
+    { key: 'c', sym: 'C' },
+] as const;
+
+const suitSym = (s: string) => ({ s: 'S', h: 'H', d: 'D', c: 'C' }[s] ?? s);
+
 export default function HandResult({
-    resultType, setResultType, resultAmt, setResultAmt, onConfirm, onUndo
+    opponents,
+    currentOpponent,
+    usedCards,
+    pendingRank,
+    setPendingRank,
+    onSelectCard,
+    onMuckCurrent,
+    onClearCurrent,
+    canResolve,
+    isResolving,
+    resolveError,
+    resolveResult,
+    onResolve,
+    onContinue,
+    onBack,
 }: HandResultProps) {
     return (
-        <div className="flex-1 flex flex-col items-center justify-center gap-8 p-6 min-h-[100dvh]">
-            <div className="text-center animate-slide-up" style={{ animationDelay: '100ms', animationFillMode: 'forwards' }}>
-                <h1 className="text-3xl font-bold text-[var(--color-text-primary)] mb-2">Hand Result</h1>
-                <p className="text-[var(--color-text-secondary)] text-xs">How did the bot do?</p>
+        <div className="flex-1 flex flex-col p-6 min-h-[100dvh] gap-5">
+            <div className="text-center">
+                <h1 className="text-3xl font-bold text-[var(--color-text-primary)] mb-2">Showdown</h1>
+                <p className="text-[var(--color-text-secondary)] text-xs">Enter opponent hole cards in table order, or mark muck.</p>
             </div>
 
-            <div className="w-full max-w-sm flex gap-3">
-                <button onClick={() => setResultType('won')}
-                    className={`flex-1 py-5 rounded-2xl font-bold text-lg uppercase transition-all duration-200 active:scale-95
-          ${resultType === 'won' ? 'bg-[var(--color-accent)] text-slate-950 shadow-[0_0_20px_var(--color-accent-glow)]'
-                            : 'bg-emerald-500/10 border border-emerald-500/30 text-[var(--color-accent)] hover:bg-emerald-500/20'}`}>
-                    Won
-                </button>
-                <button onClick={() => setResultType('lost')}
-                    className={`flex-1 py-5 rounded-2xl font-bold text-lg uppercase transition-all duration-200 active:scale-95
-          ${resultType === 'lost' ? 'bg-[var(--color-danger)] text-white shadow-[0_0_20px_var(--color-danger-glow)]'
-                            : 'bg-red-500/10 border border-red-500/30 text-[var(--color-danger)] hover:bg-red-500/20'}`}>
-                    Lost
-                </button>
-            </div>
-
-            {resultType && (
-                <div className="w-full max-w-sm flex flex-col gap-4 animate-fade-in">
-                    <div className="flex items-center gap-3">
-                        <label className="text-sm text-[var(--color-text-secondary)] font-semibold whitespace-nowrap">
-                            Amount {resultType === 'won' ? 'won' : 'lost'}:
-                        </label>
-                        <input type="number" value={resultAmt} onChange={e => setResultAmt(e.target.value)}
-                            placeholder="Chips" autoFocus
-                            className="flex-1 bg-slate-800 border border-slate-600 rounded-xl px-3 py-3 text-lg text-white font-bold text-center" />
-                    </div>
-                    <button onClick={() => { if (resultAmt) onConfirm(resultType === 'won', Number(resultAmt)); }}
-                        disabled={!resultAmt}
-                        className="w-full py-4 rounded-2xl font-bold text-sm uppercase tracking-wider transition-all duration-200 bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shadow-[0_4px_16px_rgba(16,185,129,0.3)]">
-                        Confirm & Next Hand
-                    </button>
+            <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
+                <p className="text-xs uppercase tracking-wider text-[var(--color-text-secondary)] mb-3">Opponents</p>
+                <div className="flex flex-col gap-2">
+                    {opponents.length === 0 && (
+                        <p className="text-sm text-[var(--color-text-secondary)]">No active opponents. Resolve to collect the pot.</p>
+                    )}
+                    {opponents.map((opp) => (
+                        <div key={opp.playerIndex} className={`rounded-xl border px-3 py-2 flex items-center justify-between ${currentOpponent?.playerIndex === opp.playerIndex ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'}`}>
+                            <span className="text-sm font-semibold text-[var(--color-text-primary)]">Seat {opp.position}</span>
+                            {opp.mucked ? (
+                                <span className="text-xs font-bold uppercase text-amber-300">Mucked</span>
+                            ) : (
+                                <span className="text-xs text-[var(--color-text-secondary)]">
+                                    {opp.cards.length === 0 ? 'Pending' : opp.cards.map((c) => `${c.rank}${suitSym(c.suit)}`).join(' ')}
+                                </span>
+                            )}
+                        </div>
+                    ))}
                 </div>
+            </section>
+
+            {currentOpponent && !resolveResult && (
+                <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
+                    <p className="text-xs uppercase tracking-wider text-[var(--color-text-secondary)] mb-3">
+                        Enter cards for Seat {currentOpponent.position}
+                    </p>
+                    {pendingRank ? (
+                        <div className="flex flex-col gap-3">
+                            <div className="grid grid-cols-4 gap-2">
+                                {SUITS.map((s) => {
+                                    const isUsed = usedCards.has(`${pendingRank}${s.key}`);
+                                    return (
+                                        <button
+                                            key={s.key}
+                                            disabled={isUsed}
+                                            onClick={() => onSelectCard(pendingRank, s.key)}
+                                            className="py-3 rounded-xl border border-slate-600 bg-slate-800 text-sm font-bold text-white hover:bg-slate-700 disabled:opacity-25 disabled:cursor-not-allowed"
+                                        >
+                                            {s.sym}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                            <button
+                                onClick={() => setPendingRank(null)}
+                                className="text-xs text-[var(--color-text-secondary)] hover:text-white"
+                            >
+                                Back To Ranks
+                            </button>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-7 gap-2">
+                            {RANKS.map((rank) => {
+                                const allUsed = SUITS.every((s) => usedCards.has(`${rank}${s.key}`));
+                                return (
+                                    <button
+                                        key={rank}
+                                        disabled={allUsed}
+                                        onClick={() => setPendingRank(rank)}
+                                        className="py-2 rounded-lg border border-slate-600 bg-slate-800 text-xs font-bold text-white hover:bg-slate-700 disabled:opacity-25 disabled:cursor-not-allowed"
+                                    >
+                                        {rank}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    )}
+
+                    <div className="mt-3 flex gap-2">
+                        <button
+                            onClick={onMuckCurrent}
+                            className="flex-1 py-2 rounded-xl text-xs font-bold uppercase border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
+                        >
+                            Muck
+                        </button>
+                        <button
+                            onClick={onClearCurrent}
+                            className="flex-1 py-2 rounded-xl text-xs font-bold uppercase border border-slate-600 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                        >
+                            Clear
+                        </button>
+                    </div>
+                </section>
             )}
 
-            <button onClick={onUndo}
-                className="text-sm text-[var(--color-text-secondary)] hover:text-white transition-colors">
-                ↩ Back to hand
-            </button>
+            {resolveError && (
+                <p className="text-sm text-red-300">{resolveError}</p>
+            )}
+
+            {resolveResult && (
+                <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
+                    <p className="text-xs uppercase tracking-wider text-[var(--color-text-secondary)] mb-2">Result</p>
+                    <p className="text-2xl font-bold text-[var(--color-text-primary)]">
+                        {resolveResult.result.toUpperCase()} {resolveResult.amount}
+                    </p>
+                    <p className="text-xs text-[var(--color-text-secondary)] mt-1">
+                        Delta: {resolveResult.delta >= 0 ? '+' : ''}{resolveResult.delta}
+                    </p>
+                </section>
+            )}
+
+            <div className="mt-auto flex gap-3">
+                <button
+                    onClick={onBack}
+                    className="flex-1 py-3 rounded-xl border border-slate-600 bg-slate-800 text-slate-200 text-sm font-semibold hover:bg-slate-700"
+                >
+                    Back To Hand
+                </button>
+                {!resolveResult ? (
+                    <button
+                        onClick={onResolve}
+                        disabled={!canResolve || isResolving}
+                        className="flex-1 py-3 rounded-xl bg-[var(--color-accent)] text-slate-950 text-sm font-bold hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                        {isResolving ? 'Resolving...' : 'Resolve Hand'}
+                    </button>
+                ) : (
+                    <button
+                        onClick={onContinue}
+                        className="flex-1 py-3 rounded-xl bg-[var(--color-accent)] text-slate-950 text-sm font-bold hover:bg-emerald-400"
+                    >
+                        Next Hand
+                    </button>
+                )}
+            </div>
         </div>
     );
 }

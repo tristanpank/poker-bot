@@ -15,25 +15,37 @@ def pytest_configure(config):
 @pytest.fixture(scope="session")
 def models_available():
     """Check if model checkpoint files are available."""
-    checkpoint_dir = Path(__file__).parent.parent.parent / "training" / "checkpoints"
-    
-    if not checkpoint_dir.exists():
-        return False
-    
-    # Check if any model files exist
-    model_files = list(checkpoint_dir.glob("poker_agent_v*.pt*"))
-    return len(model_files) > 0
+    project_root = Path(__file__).parent.parent.parent
+    candidate_dirs = [
+        project_root / "training" / "models",
+        project_root / "training" / "checkpoints",
+    ]
+
+    for checkpoint_dir in candidate_dirs:
+        if not checkpoint_dir.exists():
+            continue
+        model_files = list(checkpoint_dir.glob("poker_agent_v*.pt*"))
+        if model_files:
+            return True
+    return False
 
 
 def pytest_collection_modifyitems(config, items):
     """Skip tests that require models if models aren't available."""
-    checkpoint_dir = Path(__file__).parent.parent.parent / "training" / "checkpoints"
-    
+    project_root = Path(__file__).parent.parent.parent
+    candidate_dirs = [
+        project_root / "training" / "models",
+        project_root / "training" / "checkpoints",
+    ]
+
     models_available = False
-    if checkpoint_dir.exists():
-        model_files = list(checkpoint_dir.glob("poker_agent_v*.pt*"))
-        models_available = len(model_files) > 0
-    
+    for checkpoint_dir in candidate_dirs:
+        if not checkpoint_dir.exists():
+            continue
+        if list(checkpoint_dir.glob("poker_agent_v*.pt*")):
+            models_available = True
+            break
+
     if not models_available:
         skip_models = pytest.mark.skip(reason="Model checkpoint files not available")
         for item in items:
