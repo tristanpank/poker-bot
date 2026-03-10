@@ -16,7 +16,29 @@ services:
       - ./training/models:/app/training/models:ro
     environment:
       - ENABLE_POKER_ROUTER=1
-      - ENABLE_POKER_PRELOAD=1
+      - ENABLE_POKER_PRELOAD=0
+      - REDIS_URL=redis://redis:6379
     # --reload watches for file changes and auto-restarts uvicorn
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     restart: unless-stopped
+    depends_on:
+      - redis
+    networks:
+      - poker-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - poker-net
+
+networks:
+  poker-net:
+    driver: bridge
+
+volumes:
+  redis-data:

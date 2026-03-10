@@ -4,6 +4,7 @@ uvicorn[standard]
 pydantic-settings
 pokerkit
 numpy
+redis[hiredis]
 aiortc
 
 # PyTorch CPU-only (keeps image small; inference doesn't need CUDA)
