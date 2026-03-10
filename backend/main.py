@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import get_settings
 from backend.routers.cv import router as cv_router
+from backend.routers.session import router as session_router
 
 _poker_router = None
 _get_model_service: Callable[[], Any] | None = None
@@ -67,10 +68,24 @@ async def lifespan(app: FastAPI):
             print(f"Poker model preload skipped: {str(e)}")
     elif _poker_import_error is not None:
         print(f"Poker router disabled: {str(_poker_import_error)}")
+
+    # Initialize Redis connection
+    try:
+        from backend.services.session_service import get_redis
+        await get_redis()
+        print("Redis connection established")
+    except Exception as e:
+        print(f"Redis connection failed (sessions disabled): {e}")
     
     yield
     
-    # Cleanup (if needed)
+    # Cleanup Redis connection
+    try:
+        from backend.services.session_service import close_redis
+        await close_redis()
+        print("Redis connection closed")
+    except Exception:
+        pass
     print("Shutting down Poker Bot API")
 
 
@@ -99,6 +114,7 @@ def create_app() -> FastAPI:
     if _poker_router is not None:
         app.include_router(_poker_router)
     app.include_router(cv_router)
+    app.include_router(session_router)
     
     # Root endpoint
     @app.get("/")

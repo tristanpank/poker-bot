@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     default_starting_stack: int = 1000
     equity_iterations: int = 30  # Monte Carlo iterations for equity calculation
     
+    # Redis Settings (for session persistence)
+    redis_url: str = "redis://localhost:6379"
+    session_ttl_seconds: int = 86400  # 24 hours
+    
     # CORS Settings (for frontend integration)
     cors_origins: list[str] = ["*"]
 
