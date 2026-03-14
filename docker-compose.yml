@@ -12,9 +12,11 @@ services:
       - ./backend:/app/backend
       # Mount model class definitions so new models are available without rebuild
       - ./training/src/models:/app/training/src/models:ro
+      - ./training/src/features:/app/training/src/features:ro
+      - ./training/src/workers:/app/training/src/workers:ro
     environment:
       - ENABLE_POKER_ROUTER=1
-      - ENABLE_POKER_PRELOAD=0
+      - ENABLE_POKER_PRELOAD=1
     # --reload watches for file changes and auto-restarts uvicorn
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     restart: unless-stopped

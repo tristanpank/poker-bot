@@ -20,8 +20,15 @@ const ACTION_COLORS: Record<string, string> = {
     FOLD: 'text-red-400',
     CHECK: 'text-blue-300',
     CALL: 'text-blue-400',
-    RAISE_HALF_POT: 'text-emerald-300',
-    RAISE_POT_OR_ALL_IN: 'text-amber-300',
+    RAISE_SMALL: 'text-emerald-300',
+    RAISE_LARGE: 'text-amber-300',
+    AGGRO_SMALL: 'text-emerald-300',
+    AGGRO_LARGE: 'text-amber-300',
+    RAISE_33_POT: 'text-emerald-300',
+    RAISE_66_POT: 'text-emerald-300',
+    RAISE_POT: 'text-emerald-300',
+    RAISE_133_POT: 'text-amber-300',
+    ALL_IN: 'text-amber-300',
     fold: 'text-red-400',
     check: 'text-blue-300',
     call: 'text-blue-400',
@@ -29,11 +36,11 @@ const ACTION_COLORS: Record<string, string> = {
 };
 
 const seatRoleByPlayers: Record<number, string[]> = {
-    2: ['BTN/SB', 'BB'],
-    3: ['BTN', 'SB', 'BB'],
-    4: ['BTN', 'SB', 'BB', 'UTG'],
-    5: ['BTN', 'SB', 'BB', 'UTG', 'CO'],
-    6: ['BTN', 'SB', 'BB', 'UTG', 'HJ', 'CO'],
+    2: ['SB/BTN', 'BB'],
+    3: ['SB', 'BB', 'BTN'],
+    4: ['SB', 'BB', 'UTG', 'BTN'],
+    5: ['SB', 'BB', 'UTG', 'CO', 'BTN'],
+    6: ['SB', 'BB', 'UTG', 'MP', 'CO', 'BTN'],
 };
 
 const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
@@ -50,7 +57,7 @@ function getPlayerName(player: PlayerState, numPlayers: number): string {
 }
 
 function normalizeAction(action: string): string {
-    if (action === 'RAISE_HALF_POT' || action === 'RAISE_POT_OR_ALL_IN') return 'raise_amt';
+    if (action.startsWith('RAISE_') || action.startsWith('AGGRO_')) return 'raise_amt';
     return action.toLowerCase();
 }
 

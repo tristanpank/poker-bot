@@ -1,12 +1,13 @@
+from __future__ import annotations
+
 import copy
-import math
 import os
 import sys
-import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import deque
-from dataclasses import asdict, dataclass, field, replace
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -14,33 +15,47 @@ import torch
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.dirname(CURRENT_DIR)
-TRAINING_ROOT = os.path.dirname(SRC_ROOT)
 FEATURES_DIR = os.path.join(SRC_ROOT, "features")
 MODELS_DIR = os.path.join(SRC_ROOT, "models")
 WORKERS_DIR = os.path.join(SRC_ROOT, "workers")
-DEFAULT_V21_CHECKPOINT_PATH = os.path.join(TRAINING_ROOT, "models", "poker_agent_v21_deepcfr.pt")
-DEFAULT_V23_CHECKPOINT_PATH = os.path.join(TRAINING_ROOT, "models", "poker_agent_v23_deepcfr.pt")
-for path in (FEATURES_DIR, MODELS_DIR, WORKERS_DIR):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+for _path in (FEATURES_DIR, MODELS_DIR, WORKERS_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
-from poker_model_v23 import PokerDeepCFRNet as PokerDeepCFRNetV23
-from poker_model_v23 import load_compatible_state_dict as load_compatible_state_dict_v23
-from poker_model_v24 import AdvantageBuffer, PokerDeepCFRNet, StrategyBuffer, load_compatible_state_dict
-from poker_state_v24 import (
-    ACTION_COUNT_V21,
-    ACTION_NAMES_V21,
-    OPPONENT_PROFILE_DEFAULT_V24,
-    OPPONENT_PROFILE_DEFAULT_SLOT_V24,
-    OPPONENT_PROFILE_FEATURE_NAMES_V24,
-    OPPONENT_PROFILE_PER_SLOT_DIM_V24,
-    POSITION_NAMES_V21,
-    STATE_DIM_V21,
+from poker_state_v24 import ACTION_COUNT_V21, POSITION_NAMES_V21, STATE_DIM_V21
+from poker_worker_v24 import (
+    SYNTHETIC_OPPONENT_STYLES,
+    build_runtime_policy_config,
+    freeze_policy_snapshot,
+    run_policy_hand,
+    run_traversal,
+    run_traversal_batch_mp,
 )
-from poker_worker_v24 import SYNTHETIC_OPPONENT_STYLES, run_policy_hand, run_traversal, run_traversal_batch_mp
-from gpu_rollout_inference_v24 import GPURolloutInferenceService
+from tabular_policy_v24 import TabularNode, TabularPolicySnapshot, deserialize_node_store, serialize_node_store
 
 RANK_ORDER_HIGH_TO_LOW = "AKQJT98765432"
+POSTFLOP_RATE_KEYS = ("flop_seen", "turn_seen", "river_seen", "showdown_seen", "showdown_won", "cbet_flop", "fold_vs_cbet_flop", "cbet_turn", "fold_vs_cbet_turn")
+POSTFLOP_COUNT_KEYS = ("hands", "flop_seen", "turn_seen", "river_seen", "showdown_seen", "showdown_won", "cbet_flop_opportunity", "cbet_flop_taken", "fold_vs_cbet_flop_opportunity", "fold_vs_cbet_flop", "cbet_turn_opportunity", "cbet_turn_taken", "fold_vs_cbet_turn_opportunity", "fold_vs_cbet_turn")
+POSTFLOP_RATE_COUNT_KEYS = {
+    "flop_seen": ("flop_seen", "hands"),
+    "turn_seen": ("turn_seen", "hands"),
+    "river_seen": ("river_seen", "hands"),
+    "showdown_seen": ("showdown_seen", "hands"),
+    "showdown_won": ("showdown_won", "showdown_seen"),
+    "cbet_flop": ("cbet_flop_taken", "cbet_flop_opportunity"),
+    "fold_vs_cbet_flop": ("fold_vs_cbet_flop", "fold_vs_cbet_flop_opportunity"),
+    "cbet_turn": ("cbet_turn_taken", "cbet_turn_opportunity"),
+    "fold_vs_cbet_turn": ("fold_vs_cbet_turn", "fold_vs_cbet_turn_opportunity"),
+}
+POSTFLOP_CONDITION_STREET_KEYS = ("flop", "turn", "river")
+POSTFLOP_CONDITION_RATE_COUNT_KEYS = {
+    "check_when_legal": ("check_when_legal_hits", "check_when_legal_opportunities"),
+    "bet_raise_when_checked_to": ("bet_raise_when_checked_to_hits", "bet_raise_when_checked_to_opportunities"),
+    "aggressive_when_checked_to": ("aggressive_when_checked_to_hits", "aggressive_when_checked_to_opportunities"),
+    "fold_when_facing_bet": ("fold_when_facing_bet_hits", "fold_when_facing_bet_opportunities"),
+    "call_when_facing_bet": ("call_when_facing_bet_hits", "call_when_facing_bet_opportunities"),
+    "raise_when_facing_bet": ("raise_when_facing_bet_hits", "raise_when_facing_bet_opportunities"),
+}
 
 
 @dataclass
@@ -50,65 +65,54 @@ class DeepCFRConfig:
     big_blind: int = 10
     state_dim: int = STATE_DIM_V21
     action_count: int = ACTION_COUNT_V21
-    hidden_dim: int = 1024
-    full_branch_depth: int = 1
-    max_branch_actions: int = 0
-    learning_rate: float = 1e-4
-    regret_batch_size: int = 1024
-    strategy_batch_size: int = 2048
-    exploit_batch_size: int = 2048
-    advantage_capacity: int = 500_000
-    strategy_capacity: int = 1_000_000
-    exploit_capacity: int = 1_000_000
-    warmup_advantage_samples: int = 32768
-    regret_update_interval: int = 1024
-    strategy_update_interval: int = 2048
-    exploit_update_interval: int = 2048
-    publish_snapshot_interval: int = 8 #change to 4 or 8
-    checkpoint_interval: int = 2_000
-    max_checkpoint_pool: int = 64
-    pool_growth_warmup_multiplier: float = 2.0
-    averaging_window_traversals: int = 2048 * 8 # probably at least traversals_per_chunk so we don't lie
-    clip_grad_norm: float = 0.6
-    traversals_per_chunk: int = 2048 # increase for throughput 
-    use_training_pool: bool = True
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    action_abstraction_name: str = "conservative_5a"
+    algorithm_name: str = "tabular_mccfr_6max"
+    traversals_per_player_per_iteration: int = 2048
+    traversals_per_chunk: int = 2048
+    strategy_interval_traversals: int = 1000
+    training_monitor_interval_traversals: int = 32
+    prune_after_iteration: int = 128
+    lcfr_after_iteration: int = 128
+    discount_interval_iterations: int = 2
+    negative_regret_floor: float = -300_000_000.0
+    checkpoint_interval: int = 2000
+    max_checkpoint_pool: int = 32
+    averaging_window_traversals: int = 8192
     evaluation_mode: str = "heuristics"
+    training_monitor_mode: str = "self_play"
     eval_hero_seat: int = 0
     checkpoint_pool: tuple = field(default_factory=tuple)
-    seed_v21_count: int = 5
-    seed_v21_checkpoint_path: str = DEFAULT_V21_CHECKPOINT_PATH
-    seed_v23_count: int = 5
-    seed_v23_checkpoint_path: str = DEFAULT_V23_CHECKPOINT_PATH
-    rollout_workers: int = 10 
-    rollout_worker_chunk_size: int = 32
-    parallel_rollouts: bool = True
-    rollout_auto_scale_workers: bool = True
-    rollout_worker_reserve_cores: int = 2
-    rollout_worker_auto_cap: int = 0
-    opponent_hold_traversals: int = 256
-    opponent_policy_mode: str = "snapshot"
     synthetic_opponent_style: str = ""
-    synthetic_opponent_probability: float = 0.35
-    synthetic_opponent_styles: tuple = SYNTHETIC_OPPONENT_STYLES
-    exploit_prior_enabled: bool = True
-    exploit_prior_strength: float = 0.55
-    exploit_min_confidence: float = 0.10
-    exploit_only_preflop_unopened: bool = False
-    exploit_teacher_mix: float = 0.65
-    exploit_safety_weight: float = 0.20
-    opponent_profile_decay: float = 0.997
-    opponent_profile_short_alpha: float = 0.25
-    opponent_profile_long_alpha: float = 0.05
-    opponent_profile_confidence_scale: float = 256.0
-    opponent_profile: tuple = OPPONENT_PROFILE_DEFAULT_V24
-    opponent_profiles_by_seat: dict = field(default_factory=dict)
-    gpu_rollout_inference: bool = torch.cuda.is_available()
-    gpu_inference_max_batch_size: int = 1024
-    gpu_inference_max_wait_ms: float = 2.5
-    gpu_inference_model_cache_size: int = 6
-    gpu_rollout_remote_opponents: bool = False
-    quantize_local_opponent_models: bool = True
+    current_iteration: int = 0
+    parallel_rollouts: bool = True
+
+    # Legacy v24 fields are tolerated but unused in the tabular reset.
+    hidden_dim: int = 160
+    device: str = os.getenv("POKER_V24_DEVICE", "cpu").strip().lower() or "cpu"
+    learning_rate: float = 2e-4
+    policy_learning_rate: float = 2e-4
+    advantage_batch_size: int = 768
+    policy_batch_size: int = 768
+    advantage_capacity: int = 131_072
+    strategy_capacity: int = 1_000_000
+    advantage_train_steps: int = 0
+    policy_train_steps: int = 0
+    full_branch_depth: int = 1
+    warm_start_iterations: int = 0
+    training_guardrail_phaseout_traversals: int = 0
+    training_teacher_guidance_start_mix: float = 0.0
+    teacher_guidance_mix_current: float = 0.0
+    training_prior_fallback_start_mix: float = 0.0
+    prior_fallback_mix_current: float = 0.0
+    training_action_epsilon_start: float = 0.0
+    training_action_epsilon_current: float = 0.0
+    safe_fallback_enabled: bool = False
+    live_policy_stabilization_enabled: bool = False
+    rollout_workers: int = max(1, max(1, (os.cpu_count() or 2) - 1))
+    rollout_worker_chunk_size: int = 64
+    quantize_local_actor_model: bool = False
+    quantize_local_opponent_models: bool = False
+    preflop_blueprint_name: str = ""
 
 
 @dataclass
@@ -116,14 +120,25 @@ class TrainingSnapshot:
     status: str
     traversals_completed: int
     traverser_decisions: int
+    exploration_epsilon: float
     advantage_buffer_size: int
     strategy_buffer_size: int
+    postflop_value_buffer_size: int
     regret_loss: float
     strategy_loss: float
+    postflop_value_loss: float
+    ema_regret_loss: float
+    ema_strategy_loss: float
+    ema_postflop_value_loss: float
     avg_utility_bb: float
     vpip: float
     pfr: float
     three_bet: float
+    preflop_jam_rate: float
+    flop_seen_rate: float
+    avg_actions_per_hand: float
+    avg_preflop_actions_per_hand: float
+    blueprint_coverage_pct: float
     utility_window_count: int
     style_window_count: int
     position_window_size: int
@@ -132,10 +147,28 @@ class TrainingSnapshot:
     invalid_action_count: int
     hands_per_second: float
     learner_steps: int
+    chunk_learner_steps: int
+    chunk_regret_steps: int
+    chunk_strategy_steps: int
+    chunk_postflop_value_steps: int
+    chunk_advantage_samples: int
+    chunk_strategy_samples: int
+    chunk_postflop_value_samples: int
+    postflop_samples_per_traversal: float
     checkpoint_pool_size: int
     action_histogram: List[int]
+    preflop_action_histogram: List[int]
+    postflop_action_histogram: List[int]
+    postflop_conditioned_rates_by_street: Dict[str, Dict[str, float]]
+    postflop_conditioned_counts_by_street: Dict[str, Dict[str, Dict[str, int]]]
     position_avg_utility_bb: Dict[str, float]
     perf_breakdown_ms: Dict[str, float]
+    infoset_count: int
+    pruning_active: bool
+    discount_active: bool
+    last_discount_factor: float
+    algorithm_name: str
+    monitor_mode: str
     timestamp: float
 
     def as_dict(self) -> Dict[str, object]:
@@ -149,21 +182,41 @@ class EvaluationReport:
     avg_profit_bb: float
     win_rate: float
     vpip: float
+    rfi: float
     pfr: float
     three_bet: float
+    preflop_jam_rate: float
+    flop_seen_rate: float
+    avg_actions_per_hand: float
+    avg_preflop_actions_per_hand: float
+    blueprint_coverage_pct: float
     illegal_action_count: int
     runtime_seconds: float
     action_histogram: List[int]
+    preflop_action_histogram: List[int]
+    postflop_action_histogram: List[int]
+    postflop_conditioned_rates_by_street: Dict[str, Dict[str, float]]
+    postflop_conditioned_counts_by_street: Dict[str, Dict[str, Dict[str, int]]]
     position_avg_profit_bb: Dict[str, float]
     vpip_by_position: Dict[str, float]
+    rfi_by_position: Dict[str, float]
     pfr_by_position: Dict[str, float]
     three_bet_by_position: Dict[str, float]
     vpip_hand_grid: List[List[float]]
+    rfi_hand_grid: List[List[float]]
     pfr_hand_grid: List[List[float]]
     three_bet_hand_grid: List[List[float]]
     vpip_hand_grid_by_position: Dict[str, List[List[float]]]
+    rfi_hand_grid_by_position: Dict[str, List[List[float]]]
     pfr_hand_grid_by_position: Dict[str, List[List[float]]]
     three_bet_hand_grid_by_position: Dict[str, List[List[float]]]
+    postflop_rates: Dict[str, float]
+    postflop_counts: Dict[str, int]
+    postflop_rates_by_position: Dict[str, Dict[str, float]]
+    postflop_counts_by_position: Dict[str, Dict[str, int]]
+    postflop_hand_grids: Dict[str, List[List[float]]]
+    postflop_hand_grids_by_position: Dict[str, Dict[str, List[List[float]]]]
+    postflop_profit_by_stage: Dict[str, float]
 
     def as_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -178,1308 +231,916 @@ class ExploitSuiteReport:
     avg_robust_profit_bb: float
     avg_leak_win_rate: float
     avg_robust_win_rate: float
+    suite_name: str = "exploit_suite"
 
     def as_dict(self) -> Dict[str, object]:
         return asdict(self)
 
 
+def _new_postflop_counts() -> Dict[str, int]:
+    return {key: 0 for key in POSTFLOP_COUNT_KEYS}
+
+
+def _new_postflop_conditioned_counts() -> Dict[str, Dict[str, int]]:
+    return {
+        street: {
+            count_key: 0
+            for hit, opp in POSTFLOP_CONDITION_RATE_COUNT_KEYS.values()
+            for count_key in (hit, opp)
+        }
+        for street in POSTFLOP_CONDITION_STREET_KEYS
+    }
+
+
+def _merge_conditioned_counts(total: Dict[str, Dict[str, int]], update: Optional[Dict[str, Dict[str, int]]]) -> None:
+    if not isinstance(update, dict):
+        return
+    for street in POSTFLOP_CONDITION_STREET_KEYS:
+        for hit, opp in POSTFLOP_CONDITION_RATE_COUNT_KEYS.values():
+            total[street][hit] += int(update.get(street, {}).get(hit, 0))
+            total[street][opp] += int(update.get(street, {}).get(opp, 0))
+
+
+def _format_conditioned_counts(counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    return {
+        street: {
+            metric: {"hits": int(counts.get(street, {}).get(hit, 0)), "opportunities": int(counts.get(street, {}).get(opp, 0))}
+            for metric, (hit, opp) in POSTFLOP_CONDITION_RATE_COUNT_KEYS.items()
+        }
+        for street in POSTFLOP_CONDITION_STREET_KEYS
+    }
+
+
+def _conditioned_rates(counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, float]]:
+    return {
+        street: {
+            metric: float(counts.get(street, {}).get(hit, 0) / int(counts.get(street, {}).get(opp, 0)))
+            if int(counts.get(street, {}).get(opp, 0)) > 0
+            else 0.0
+            for metric, (hit, opp) in POSTFLOP_CONDITION_RATE_COUNT_KEYS.items()
+        }
+        for street in POSTFLOP_CONDITION_STREET_KEYS
+    }
+
+
+def _postflop_rates(counts: Dict[str, int]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for key, (hit, opp) in POSTFLOP_RATE_COUNT_KEYS.items():
+        denom = int(counts.get(opp, 0))
+        out[key] = float(counts.get(hit, 0) / denom) if denom > 0 else 0.0
+    return out
+
+
+def _hand_key_to_grid_indices(hand_key: Optional[str]) -> Optional[tuple[int, int]]:
+    key = str(hand_key or "").strip()
+    if len(key) < 2:
+        return None
+    rank_a = key[0]
+    rank_b = key[1]
+    if rank_a not in RANK_ORDER_HIGH_TO_LOW or rank_b not in RANK_ORDER_HIGH_TO_LOW:
+        return None
+    idx_a = RANK_ORDER_HIGH_TO_LOW.index(rank_a)
+    idx_b = RANK_ORDER_HIGH_TO_LOW.index(rank_b)
+    if len(key) == 2:
+        return idx_a, idx_b
+    if key.endswith("s"):
+        return min(idx_a, idx_b), max(idx_a, idx_b)
+    return max(idx_a, idx_b), min(idx_a, idx_b)
+
+
+def _rate_grid_from_counts(hit_counts: np.ndarray, total_counts: np.ndarray) -> List[List[float]]:
+    grid = np.zeros((13, 13), dtype=np.float32)
+    nonzero = total_counts > 0
+    grid[nonzero] = hit_counts[nonzero] / total_counts[nonzero]
+    return grid.tolist()
+
+
 class DeepCFRTrainerV24:
     def __init__(self, config: Optional[DeepCFRConfig] = None):
         self.config = config or DeepCFRConfig()
-        self.config.opponent_profile = tuple(OPPONENT_PROFILE_DEFAULT_V24)
-        self.config.opponent_profiles_by_seat = {}
-        self.config.opponent_policy_mode = "snapshot"
-        self.config.synthetic_opponent_style = ""
-        self.device = torch.device(self.config.device)
-        self.model = PokerDeepCFRNet(
-            state_dim=self.config.state_dim,
-            hidden_dim=self.config.hidden_dim,
-            action_dim=self.config.action_count,
-        ).to(self.device)
-
-        regret_params = (
-            list(self.model.input_layer.parameters())
-            + list(self.model.block1.parameters())
-            + list(self.model.block2.parameters())
-            + list(self.model.block3.parameters())
-            + list(self.model.regret_head.parameters())
-        )
-        strategy_params = (
-            list(self.model.input_layer.parameters())
-            + list(self.model.block1.parameters())
-            + list(self.model.block2.parameters())
-            + list(self.model.block3.parameters())
-            + list(self.model.strategy_head.parameters())
-        )
-        exploit_params = (
-            list(self.model.input_layer.parameters())
-            + list(self.model.block1.parameters())
-            + list(self.model.block2.parameters())
-            + list(self.model.block3.parameters())
-            + list(self.model.exploit_head.parameters())
-        )
-        self.regret_optimizer = torch.optim.Adam(regret_params, lr=self.config.learning_rate)
-        self.strategy_optimizer = torch.optim.Adam(strategy_params, lr=self.config.learning_rate)
-        self.exploit_optimizer = torch.optim.Adam(exploit_params, lr=self.config.learning_rate)
-
-        self.advantage_buffer = AdvantageBuffer(
-            capacity=self.config.advantage_capacity,
-            state_dim=self.config.state_dim,
-            action_dim=self.config.action_count,
-        )
-        self.strategy_buffer = StrategyBuffer(
-            capacity=self.config.strategy_capacity,
-            state_dim=self.config.state_dim,
-            action_dim=self.config.action_count,
-        )
-        self.exploit_buffer = StrategyBuffer(
-            capacity=self.config.exploit_capacity,
-            state_dim=self.config.state_dim,
-            action_dim=self.config.action_count,
-        )
-
-        self.actor_snapshot = self.model.clone_cpu()
-        self._v21_seed_template = self._load_seed_template(
-            getattr(self.config, "seed_v21_checkpoint_path", ""),
-            label="v21",
-        )
-        self._v23_seed_template = self._load_seed_template(
-            getattr(self.config, "seed_v23_checkpoint_path", ""),
-            label="v23",
-        )
-        self.checkpoint_pool: List[object] = []
-        self._reset_checkpoint_pool()
-
-        self._lock = threading.Lock()
-        self._seed_rng = np.random.default_rng(int(time.time()))
-        self._start_time = time.time()
-
+        self.node_store: Dict[str, TabularNode] = {}
+        self.actor_snapshot: TabularPolicySnapshot = freeze_policy_snapshot(self.node_store, {"traversals_completed": 0, "iteration": 0})
+        self._actor_snapshot_dirty = False
+        self._node_store_version = 0
+        self._worker_update_payload: Optional[Dict[str, object]] = None
+        self.checkpoint_pool: List[TabularPolicySnapshot] = [copy.deepcopy(self.actor_snapshot)]
         self.traversals_completed = 0
         self.traverser_decisions = 0
         self.learner_steps = 0
-        self.regret_steps = 0
-        self.strategy_steps = 0
-        self.exploit_steps = 0
         self.invalid_state_count = 0
         self.invalid_action_count = 0
-
-        self._adv_pending = 0
-        self._strat_pending = 0
-        self._exploit_pending = 0
-        self._last_regret_loss = 0.0
-        self._last_strategy_loss = 0.0
-        self._last_exploit_loss = 0.0
-
-        self._stats_window_size = max(1, int(getattr(self.config, "averaging_window_traversals", 16_384)))
+        self._stats_window_size = max(1, int(self.config.averaging_window_traversals))
         self._recent_utilities = deque(maxlen=self._stats_window_size)
         self._recent_actions = deque(maxlen=self._stats_window_size)
+        self._recent_preflop_actions = deque(maxlen=self._stats_window_size)
+        self._recent_postflop_actions = deque(maxlen=self._stats_window_size)
         self._recent_vpip = deque(maxlen=self._stats_window_size)
         self._recent_pfr = deque(maxlen=self._stats_window_size)
         self._recent_three_bet = deque(maxlen=self._stats_window_size)
-        self._position_profit_windows = {
-            seat: deque(maxlen=self._stats_window_size) for seat in range(self.config.num_players)
-        }
-        self._recent_traversal_times = deque(maxlen=256)
-        self._cumulative_work_time = 0.0
-        self._cumulative_rollout_time = 0.0
-        self._cumulative_regret_time = 0.0
-        self._cumulative_strategy_time = 0.0
-        self._cumulative_snapshot_time = 0.0
-        self._cumulative_rollout_detail = {
-            "state_init_time": 0.0,
-            "chance_time": 0.0,
-            "traverser_state_time": 0.0,
-            "opponent_state_time": 0.0,
-            "regret_infer_time": 0.0,
-            "strategy_infer_time": 0.0,
-            "branch_clone_time": 0.0,
-            "apply_time": 0.0,
-        }
-        self._snapshot = self._make_snapshot(status="Idle")
+        self._recent_prejam = deque(maxlen=self._stats_window_size)
+        self._recent_flop_seen = deque(maxlen=self._stats_window_size)
+        self._recent_actions_per_hand = deque(maxlen=self._stats_window_size)
+        self._recent_preflop_actions_per_hand = deque(maxlen=self._stats_window_size)
+        self._position_profit_windows = {seat: deque(maxlen=self._stats_window_size) for seat in range(self.config.num_players)}
+        self._conditioned_counts = _new_postflop_conditioned_counts()
+        self._cumulative_perf = {key: 0.0 for key in ("state_init_time", "chance_time", "traverser_state_time", "opponent_state_time", "regret_infer_time", "strategy_infer_time", "branch_clone_time", "apply_time")}
+        self._chunk_learner_steps = 0
+        self._chunk_regret_steps = 0
+        self._chunk_strategy_steps = 0
+        self._chunk_advantage_samples = 0
+        self._chunk_strategy_samples = 0
+        self._outer_iteration = 0
+        self._next_seat = 0
+        self._start_time = time.time()
+        self._last_discount_factor = 1.0
         self._rollout_executor: Optional[ProcessPoolExecutor] = None
-        self._snapshot_version: int = 0
-        self._opponent_profiles: Dict[str, Dict[str, float]] = {}
-        self._held_opponent_snapshot: Optional[object] = None
-        self._held_opponent_policy_mode: str = "snapshot"
-        self._held_synthetic_opponent_style: str = ""
-        self._held_opponent_profile_key: str = ""
-        self._held_opponent_block_start: int = -1
-        self._held_opponent_block_end: int = -1
-        checkpoint_interval = max(0, int(getattr(self.config, "checkpoint_interval", 0)))
-        self._next_checkpoint_traverser_decisions = checkpoint_interval if checkpoint_interval > 0 else 0
-        self._gpu_rollout_service: Optional[GPURolloutInferenceService] = None
-        self._gpu_registered_model_keys: set[str] = set()
-        self._maybe_start_gpu_rollout_service()
-        self._sync_gpu_rollout_registry()
+        self._snapshot = self._make_snapshot("Idle")
 
-    @staticmethod
-    def _state_dict_from_payload(payload: object) -> Dict[str, torch.Tensor]:
-        if not isinstance(payload, dict):
-            raise ValueError("Checkpoint payload is not a dictionary.")
-        if "model_state_dict" in payload and isinstance(payload["model_state_dict"], dict):
-            return payload["model_state_dict"]
-        if "state_dict" in payload and isinstance(payload["state_dict"], dict):
-            return payload["state_dict"]
-        if any(str(key).endswith("input_layer.weight") for key in payload.keys()):
-            return payload
-        raise ValueError("Could not find model state dict in checkpoint payload.")
-
-    @staticmethod
-    def _infer_model_dims(
-        state_dict: Dict[str, torch.Tensor],
-        fallback_state_dim: int,
-        fallback_hidden_dim: int,
-        fallback_action_dim: int,
-    ) -> tuple[int, int, int]:
-        state_dim = int(fallback_state_dim)
-        hidden_dim = int(fallback_hidden_dim)
-        action_dim = int(fallback_action_dim)
-
-        input_weight = None
-        regret_out_weight = None
-        for key, tensor in state_dict.items():
-            name = str(key)
-            if input_weight is None and name.endswith("input_layer.weight"):
-                input_weight = tensor
-            if regret_out_weight is None and name.endswith("regret_head.2.weight"):
-                regret_out_weight = tensor
-
-        if input_weight is not None and getattr(input_weight, "ndim", 0) == 2:
-            hidden_dim = int(input_weight.shape[0])
-            state_dim = int(input_weight.shape[1])
-        if regret_out_weight is not None and getattr(regret_out_weight, "ndim", 0) == 2:
-            action_dim = int(regret_out_weight.shape[0])
-
-        return state_dim, hidden_dim, action_dim
-
-    def _load_seed_template(self, path_value: object, label: str) -> Optional[object]:
-        path = str(path_value or "").strip()
-        checkpoint_label = str(label or "seed")
-        if not path:
-            return None
-        if not os.path.isfile(path):
-            print(f"[v24] {checkpoint_label} seed checkpoint not found: {path}")
-            return None
-
-        try:
-            payload = torch.load(path, map_location="cpu")
-            state_dict = self._state_dict_from_payload(payload)
-            state_dim, hidden_dim, action_dim = self._infer_model_dims(
-                state_dict,
-                fallback_state_dim=self.config.state_dim,
-                fallback_hidden_dim=self.config.hidden_dim,
-                fallback_action_dim=self.config.action_count,
-            )
-            if int(action_dim) == 5:
-                seed_model = PokerDeepCFRNetV23(
-                    state_dim=state_dim,
-                    hidden_dim=hidden_dim,
-                    action_dim=action_dim,
-                    init_weights=False,
-                )
-                load_compatible_state_dict_v23(seed_model, state_dict)
-                setattr(seed_model, "_policy_family", "legacy_v23")
-            else:
-                seed_model = PokerDeepCFRNet(
-                    state_dim=self.config.state_dim,
-                    hidden_dim=hidden_dim,
-                    action_dim=self.config.action_count,
-                    init_weights=False,
-                )
-                load_compatible_state_dict(seed_model, state_dict)
-                setattr(seed_model, "_policy_family", "v24")
-            seed_model.eval()
-            seed_model.to("cpu")
-            for param in seed_model.parameters():
-                param.requires_grad_(False)
-            return seed_model
-        except Exception as exc:
-            print(f"[v24] Failed to load {checkpoint_label} seed checkpoint from '{path}': {exc}")
-            return None
-
-    def _reset_checkpoint_pool(self) -> None:
-        self.checkpoint_pool = []
-        v21_seed_count = max(0, int(getattr(self.config, "seed_v21_count", 0)))
-        v23_seed_count = max(0, int(getattr(self.config, "seed_v23_count", 0)))
-        if self._v21_seed_template is not None and v21_seed_count > 0:
-            for _ in range(v21_seed_count):
-                self.checkpoint_pool.append(self._v21_seed_template.clone_cpu())
-        if self._v23_seed_template is not None and v23_seed_count > 0:
-            for _ in range(v23_seed_count):
-                self.checkpoint_pool.append(self._v23_seed_template.clone_cpu())
-        self.checkpoint_pool.append(self.actor_snapshot)
-        if len(self.checkpoint_pool) > self.config.max_checkpoint_pool:
-            self.checkpoint_pool = self.checkpoint_pool[-self.config.max_checkpoint_pool :]
-        self._held_opponent_snapshot = None
-        self._held_opponent_policy_mode = "snapshot"
-        self._held_synthetic_opponent_style = ""
-        self._held_opponent_profile_key = ""
-        self._held_opponent_block_start = -1
-        self._held_opponent_block_end = -1
-
-    def _make_snapshot(self, status: str) -> TrainingSnapshot:
-        action_hist = [0] * self.config.action_count
-        if self._recent_actions:
-            counts = np.bincount(np.array(self._recent_actions, dtype=np.int64), minlength=self.config.action_count)
-            action_hist = counts.astype(int).tolist()
-            probs = counts.astype(np.float64) / max(1.0, float(counts.sum()))
-            nonzero = probs > 0
-            action_entropy = float(-np.sum(probs[nonzero] * np.log2(probs[nonzero])))
-        else:
-            action_entropy = 0.0
-
-        pos_stats = {}
-        for seat, window in self._position_profit_windows.items():
-            if window:
-                pos_stats[POSITION_NAMES_V21[seat]] = float(np.mean(window))
-            else:
-                pos_stats[POSITION_NAMES_V21[seat]] = 0.0
-
-        if self._recent_traversal_times:
-            avg_traversal_time = float(np.mean(self._recent_traversal_times))
-            hands_per_second = 1.0 / max(avg_traversal_time, 1e-6)
-        else:
-            elapsed = max(time.time() - self._start_time, 1e-6)
-            hands_per_second = float(self.traversals_completed / elapsed)
-
-        traversals = max(1, self.traversals_completed)
-        tracked_time = (
-            self._cumulative_rollout_time
-            + self._cumulative_regret_time
-            + self._cumulative_strategy_time
-            + self._cumulative_snapshot_time
-        )
-        other_time = max(0.0, self._cumulative_work_time - tracked_time)
-        perf_breakdown_ms = {
-            "total_time": float(self._cumulative_work_time / traversals * 1000.0),
-            "rollout_total_time": float(self._cumulative_rollout_time / traversals * 1000.0),
-            "state_init_time": float(self._cumulative_rollout_detail["state_init_time"] / traversals * 1000.0),
-            "chance_time": float(self._cumulative_rollout_detail["chance_time"] / traversals * 1000.0),
-            "traverser_state_time": float(self._cumulative_rollout_detail["traverser_state_time"] / traversals * 1000.0),
-            "opponent_state_time": float(self._cumulative_rollout_detail["opponent_state_time"] / traversals * 1000.0),
-            "regret_infer_time": float(self._cumulative_rollout_detail["regret_infer_time"] / traversals * 1000.0),
-            "strategy_infer_time": float(self._cumulative_rollout_detail["strategy_infer_time"] / traversals * 1000.0),
-            "branch_clone_time": float(self._cumulative_rollout_detail["branch_clone_time"] / traversals * 1000.0),
-            "apply_time": float(self._cumulative_rollout_detail["apply_time"] / traversals * 1000.0),
-            "regret_train_time": float(self._cumulative_regret_time / traversals * 1000.0),
-            "strategy_train_time": float(self._cumulative_strategy_time / traversals * 1000.0),
-            "snapshot_time": float(self._cumulative_snapshot_time / traversals * 1000.0),
-            "other_time": float(other_time / traversals * 1000.0),
-        }
-        return TrainingSnapshot(
-            status=status,
-            traversals_completed=self.traversals_completed,
-            traverser_decisions=self.traverser_decisions,
-            advantage_buffer_size=len(self.advantage_buffer),
-            strategy_buffer_size=len(self.strategy_buffer),
-            regret_loss=self._last_regret_loss,
-            strategy_loss=self._last_strategy_loss,
-            avg_utility_bb=float(np.mean(self._recent_utilities)) if self._recent_utilities else 0.0,
-            vpip=float(np.mean(self._recent_vpip)) if self._recent_vpip else 0.0,
-            pfr=float(np.mean(self._recent_pfr)) if self._recent_pfr else 0.0,
-            three_bet=float(np.mean(self._recent_three_bet)) if self._recent_three_bet else 0.0,
-            utility_window_count=len(self._recent_utilities),
-            style_window_count=len(self._recent_vpip),
-            position_window_size=self._stats_window_size,
-            action_entropy=action_entropy,
-            invalid_state_count=self.invalid_state_count,
-            invalid_action_count=self.invalid_action_count,
-            hands_per_second=hands_per_second,
-            learner_steps=self.learner_steps,
-            checkpoint_pool_size=len(self.checkpoint_pool),
-            action_histogram=action_hist,
-            position_avg_utility_bb=pos_stats,
-            perf_breakdown_ms=perf_breakdown_ms,
-            timestamp=time.time(),
-        )
-
-    def _refresh_snapshot(self, status: str) -> None:
-        with self._lock:
-            self._snapshot = self._make_snapshot(status=status)
-
-    def _publish_actor_snapshot(self) -> None:
-        start = time.perf_counter()
-        self.actor_snapshot = self.model.clone_cpu()
-        self._snapshot_version += 1
-        if self._allow_pool_growth():
-            self.checkpoint_pool.append(self.actor_snapshot)
-            if len(self.checkpoint_pool) > self.config.max_checkpoint_pool:
-                self.checkpoint_pool.pop(0)
-        elif self.checkpoint_pool:
-            # Keep the newest actor available without increasing pool size during freeze.
-            self.checkpoint_pool[-1] = self.actor_snapshot
-        else:
-            self.checkpoint_pool = [self.actor_snapshot]
-        self._sync_gpu_rollout_registry()
-        self._cumulative_snapshot_time += time.perf_counter() - start
-
-    def _allow_pool_growth(self) -> bool:
-        freeze_target = int(
-            max(0.0, float(getattr(self.config, "pool_growth_warmup_multiplier", 0.0)))
-            * int(self.config.warmup_advantage_samples)
-        )
-        return len(self.advantage_buffer) >= freeze_target
-
-    def _ensure_rollout_executor(self) -> Optional[ProcessPoolExecutor]:
-        workers = self._effective_rollout_workers()
-        if not self.config.parallel_rollouts or workers <= 1:
-            return None
-        current_workers = int(getattr(self._rollout_executor, "_max_workers", 0) or 0) if self._rollout_executor is not None else 0
-        if self._rollout_executor is None or current_workers != workers:
-            if self._rollout_executor is not None:
-                self._rollout_executor.shutdown(wait=False, cancel_futures=False)
-            self._rollout_executor = ProcessPoolExecutor(max_workers=workers)
-        return self._rollout_executor
-
-    def _effective_rollout_workers(self) -> int:
-        configured = max(1, int(getattr(self.config, "rollout_workers", 1)))
-        if not bool(getattr(self.config, "rollout_auto_scale_workers", False)):
-            return configured
-        cpu_count = int(os.cpu_count() or configured)
-        reserve = max(0, int(getattr(self.config, "rollout_worker_reserve_cores", 0)))
-        auto_target = max(1, cpu_count - reserve)
-        auto_cap = max(0, int(getattr(self.config, "rollout_worker_auto_cap", 0)))
-        if auto_cap > 0:
-            auto_target = min(auto_target, auto_cap)
-        return max(configured, auto_target)
-
-    def _linear_cfr_weight(self) -> float:
-        traversal_idx = self.traversals_completed + 1
-        # Linear CFR weighting: w_t = t.
-        # This gives early iterations influence that decays ~2 / (T * (T + 1)).
-        return float(traversal_idx)
-
-    def _sample_training_opponent_snapshot(self) -> object:
-        if not self.config.use_training_pool or not self.checkpoint_pool:
-            return self.actor_snapshot
-        if len(self.checkpoint_pool) == 1:
-            return self.checkpoint_pool[0]
-        weights = np.arange(1, len(self.checkpoint_pool) + 1, dtype=np.float64)
-        probs = weights / weights.sum()
-        idx = int(self._seed_rng.choice(len(self.checkpoint_pool), p=probs))
-        return self.checkpoint_pool[idx]
-
-    def _synthetic_style_candidates(self) -> List[str]:
-        configured = getattr(self.config, "synthetic_opponent_styles", SYNTHETIC_OPPONENT_STYLES)
-        if not isinstance(configured, (list, tuple)):
-            return list(SYNTHETIC_OPPONENT_STYLES)
-        styles = [str(style).strip().lower() for style in configured if str(style).strip()]
-        valid = [style for style in styles if style in SYNTHETIC_OPPONENT_STYLES]
-        return valid or list(SYNTHETIC_OPPONENT_STYLES)
-
-    def _sample_training_opponent_assignment(self) -> tuple[Optional[PokerDeepCFRNet], str, str, str]:
-        styles = self._synthetic_style_candidates()
-        synthetic_prob = float(max(0.0, min(1.0, getattr(self.config, "synthetic_opponent_probability", 0.0))))
-        if styles and synthetic_prob > 1e-6 and float(self._seed_rng.random()) < synthetic_prob:
-            style = str(self._seed_rng.choice(styles))
-            return None, f"synthetic_{style}", "synthetic", style
-
-        snapshot = self._sample_training_opponent_snapshot()
-        return snapshot, self._opponent_profile_key_for_snapshot(snapshot), "snapshot", ""
-
-    def _opponent_hold_span(self) -> int:
-        return max(1, int(getattr(self.config, "opponent_hold_traversals", 1)))
-
-    def _opponent_block_bounds(self, traversal_index: int) -> tuple[int, int]:
-        hold = self._opponent_hold_span()
-        start = int(traversal_index // hold) * hold
-        end = start + hold
-        return start, end
-
-    def _opponent_assignment_for_traversal(
-        self, traversal_index: int
-    ) -> tuple[Optional[object], str, Dict[int, tuple], int, int, str, str]:
-        block_start, block_end = self._opponent_block_bounds(traversal_index)
-        keep_current = (
-            bool(self._held_opponent_profile_key)
-            and self._held_opponent_block_start == block_start
-            and int(traversal_index) < int(self._held_opponent_block_end)
-        )
-        if not keep_current:
-            snapshot, profile_key, policy_mode, synthetic_style = self._sample_training_opponent_assignment()
-            self._held_opponent_snapshot = snapshot
-            self._held_opponent_policy_mode = policy_mode
-            self._held_synthetic_opponent_style = synthetic_style
-            self._held_opponent_profile_key = profile_key
-            self._held_opponent_block_start = block_start
-            self._held_opponent_block_end = block_end
-
-        snapshot = self._held_opponent_snapshot
-        policy_mode = str(self._held_opponent_policy_mode or "snapshot")
-        synthetic_style = str(self._held_synthetic_opponent_style or "")
-        if snapshot is None and policy_mode != "synthetic":
-            snapshot = self.actor_snapshot
-        profile_key = str(
-            self._held_opponent_profile_key
-            or (self._opponent_profile_key_for_snapshot(snapshot) if snapshot is not None else "synthetic_nit")
-        )
-        opponent_profiles_by_seat = self._opponent_profiles_by_seat(profile_key)
-        return snapshot, profile_key, opponent_profiles_by_seat, block_start, block_end, policy_mode, synthetic_style
-
-    def _new_opponent_profile_record(self) -> Dict[str, float]:
-        record: Dict[str, float] = {"hands_played_total": 0.0}
-        for metric_name, _, _ in self._opponent_metric_specs():
-            record[f"{metric_name}_hits_total"] = 0.0
-            record[f"{metric_name}_opp_total"] = 0.0
-            record[f"{metric_name}_short"] = 0.0
-            record[f"{metric_name}_long"] = 0.0
-        return record
-
-    @staticmethod
-    def _opponent_metric_specs() -> tuple:
-        return (
-            ("vpip", "vpip_counts", "preflop_opportunities"),
-            ("pfr", "pfr_counts", "preflop_opportunities"),
-            ("three_bet", "three_bet_counts", "faced_open_opportunities"),
-            ("fold_to_open", "fold_vs_open_counts", "faced_open_opportunities"),
-            ("fold_to_three_bet", "fold_vs_three_bet_counts", "faced_three_bet_opportunities"),
-            ("call_open", "call_vs_open_counts", "faced_open_opportunities"),
-            ("squeeze", "squeeze_counts", "squeeze_opportunities"),
-            ("fold_to_cbet_flop", "fold_vs_cbet_flop_counts", "faced_cbet_flop_opportunities"),
-            ("fold_to_cbet_turn", "fold_vs_cbet_turn_counts", "faced_cbet_turn_opportunities"),
-            ("aggression", "aggression_counts", "aggression_opportunities"),
-        )
-
-    def _opponent_profile_key_for_snapshot(self, snapshot: object) -> str:
-        if snapshot is self.actor_snapshot:
-            return "actor_snapshot"
-        return f"checkpoint_{id(snapshot)}"
-
-    @staticmethod
-    def _opponent_profile_key_for_seat(opponent_key: str, seat: int) -> str:
-        return f"{str(opponent_key)}:seat_{int(seat)}"
-
-    def _opponent_profile_record_from_store(self, store: Dict[str, Dict[str, float]], key: str) -> Dict[str, float]:
-        record = store.get(key)
-        if record is None:
-            record = self._new_opponent_profile_record()
-            store[key] = record
-        else:
-            defaults = self._new_opponent_profile_record()
-            for metric_key, metric_default in defaults.items():
-                if metric_key not in record:
-                    record[metric_key] = float(metric_default)
-        return record
-
-    def _opponent_profile_record(self, key: str) -> Dict[str, float]:
-        return self._opponent_profile_record_from_store(self._opponent_profiles, key)
-
-    def _opponent_profile_tuple_for_record(self, record: Dict[str, float]) -> tuple:
-        confidence_scale = float(max(1.0, getattr(self.config, "opponent_profile_confidence_scale", 256.0)))
-        hands_played_total = float(max(0.0, record.get("hands_played_total", 0.0)))
-        confidence = float(max(0.0, min(1.0, hands_played_total / confidence_scale)))
-        trend_mix = float(max(0.0, min(1.0, confidence * 1.5)))
-
-        values: List[float] = []
-        for metric_name, _, _ in self._opponent_metric_specs():
-            short_rate = float(max(0.0, min(1.0, record.get(f"{metric_name}_short", 0.0))))
-            long_rate = float(max(0.0, min(1.0, record.get(f"{metric_name}_long", 0.0))))
-            stat_mean = (trend_mix * short_rate) + ((1.0 - trend_mix) * long_rate)
-            values.append(float(max(0.0, min(1.0, stat_mean))))
-        values.append(confidence)
-        if len(values) != OPPONENT_PROFILE_PER_SLOT_DIM_V24:
-            return tuple(OPPONENT_PROFILE_DEFAULT_SLOT_V24)
-        return tuple(values)
-
-    def _opponent_profile_tuple_for_seat_from_store(
-        self, store: Dict[str, Dict[str, float]], opponent_key: str, seat: int
-    ) -> tuple:
-        seat_key = self._opponent_profile_key_for_seat(opponent_key, seat)
-        record = self._opponent_profile_record_from_store(store, seat_key)
-        return self._opponent_profile_tuple_for_record(record)
-
-    def _opponent_profile_tuple_for_seat(self, opponent_key: str, seat: int) -> tuple:
-        return self._opponent_profile_tuple_for_seat_from_store(self._opponent_profiles, opponent_key, seat)
-
-    def _opponent_profiles_by_seat_from_store(
-        self, store: Dict[str, Dict[str, float]], opponent_key: str
-    ) -> Dict[int, tuple]:
-        profiles: Dict[int, tuple] = {}
-        for seat in range(max(1, int(self.config.num_players))):
-            profiles[seat] = self._opponent_profile_tuple_for_seat_from_store(store, opponent_key, seat)
-        return profiles
-
-    def _opponent_profiles_by_seat(self, opponent_key: str) -> Dict[int, tuple]:
-        return self._opponent_profiles_by_seat_from_store(self._opponent_profiles, opponent_key)
-
-    def _update_opponent_profile_from_result_store(
-        self, store: Dict[str, Dict[str, float]], key: str, result
-    ) -> None:
-        preflop_stats = getattr(result, "preflop_stats", None)
-        if not isinstance(preflop_stats, dict) or not preflop_stats:
-            return
-
-        seats = range(max(0, int(self.config.num_players)))
-        traverser = int(getattr(result, "traverser_seat", getattr(result, "hero_seat", 0)))
-
-        hands_played = preflop_stats.get("hands_played", [])
-        short_alpha = float(max(0.0, min(1.0, getattr(self.config, "opponent_profile_short_alpha", 0.25))))
-        long_alpha = float(max(0.0, min(1.0, getattr(self.config, "opponent_profile_long_alpha", 0.05))))
-
-        for seat in seats:
-            if seat == traverser:
-                continue
-            seat_key = self._opponent_profile_key_for_seat(key, seat)
-            record = self._opponent_profile_record_from_store(store, seat_key)
-            if seat < len(hands_played):
-                record["hands_played_total"] += float(hands_played[seat])
-
-            for metric_name, hit_stat_key, opp_stat_key in self._opponent_metric_specs():
-                hit_values = preflop_stats.get(hit_stat_key, [])
-                opp_values = preflop_stats.get(opp_stat_key, [])
-                hits = float(hit_values[seat]) if seat < len(hit_values) else 0.0
-                opportunities = float(opp_values[seat]) if seat < len(opp_values) else 0.0
-                record[f"{metric_name}_hits_total"] += hits
-                record[f"{metric_name}_opp_total"] += opportunities
-                if opportunities > 1e-9:
-                    observed_rate = float(max(0.0, min(1.0, hits / opportunities)))
-                    prev_short = float(record.get(f"{metric_name}_short", 0.0))
-                    prev_long = float(record.get(f"{metric_name}_long", 0.0))
-                    record[f"{metric_name}_short"] = ((1.0 - short_alpha) * prev_short) + (short_alpha * observed_rate)
-                    record[f"{metric_name}_long"] = ((1.0 - long_alpha) * prev_long) + (long_alpha * observed_rate)
-
-    def _update_opponent_profile_from_result(self, key: str, result) -> None:
-        self._update_opponent_profile_from_result_store(self._opponent_profiles, key, result)
-
-    def _should_save_checkpoint(self) -> bool:
-        checkpoint_interval = max(0, int(getattr(self.config, "checkpoint_interval", 0)))
-        if checkpoint_interval <= 0:
-            return False
-        if self._next_checkpoint_traverser_decisions <= 0:
-            self._next_checkpoint_traverser_decisions = checkpoint_interval
-        return self.traverser_decisions >= self._next_checkpoint_traverser_decisions
-
-    def _mark_checkpoint_published(self) -> None:
-        checkpoint_interval = max(0, int(getattr(self.config, "checkpoint_interval", 0)))
-        if checkpoint_interval <= 0:
-            self._next_checkpoint_traverser_decisions = 0
-            return
-        if self._next_checkpoint_traverser_decisions <= 0:
-            self._next_checkpoint_traverser_decisions = checkpoint_interval
-        while self.traverser_decisions >= self._next_checkpoint_traverser_decisions:
-            self._next_checkpoint_traverser_decisions += checkpoint_interval
-
-    def _gpu_rollout_enabled(self) -> bool:
-        return bool(
-            getattr(self.config, "gpu_rollout_inference", False)
-            and self.device.type == "cuda"
-            and self.config.parallel_rollouts
-            and int(self.config.rollout_workers) > 1
-        )
-
-    def _maybe_start_gpu_rollout_service(self) -> None:
-        if not self._gpu_rollout_enabled():
-            return
-        if self._gpu_rollout_service is not None:
-            return
-        service = GPURolloutInferenceService(
-            device=str(self.device),
-            max_batch_size=int(getattr(self.config, "gpu_inference_max_batch_size", 512)),
-            max_wait_ms=float(getattr(self.config, "gpu_inference_max_wait_ms", 1.5)),
-            model_cache_size=int(getattr(self.config, "gpu_inference_model_cache_size", 6)),
-        )
-        service.start()
-        self._gpu_rollout_service = service
-
-    @staticmethod
-    def _snapshot_policy_family(snapshot: Optional[object]) -> str:
-        return str(getattr(snapshot, "_policy_family", "v24") or "v24")
-
-    @staticmethod
-    def _gpu_model_key_for_snapshot(snapshot: Optional[object], actor_snapshot: Optional[object]) -> str:
-        if snapshot is None or snapshot is actor_snapshot:
-            return "actor_snapshot"
-        return f"checkpoint_{id(snapshot)}"
-
-    def _register_gpu_snapshot(self, snapshot: Optional[object]) -> str:
-        model_key = self._gpu_model_key_for_snapshot(snapshot, self.actor_snapshot)
-        if self._gpu_rollout_service is None:
-            return model_key
-        if self._snapshot_policy_family(snapshot) != "v24":
-            return model_key
-        if model_key != "actor_snapshot" and model_key in self._gpu_registered_model_keys:
-            return model_key
-        source = self.actor_snapshot if snapshot is None else snapshot
-        self._gpu_rollout_service.register_snapshot(model_key, source)
-        self._gpu_registered_model_keys.add(model_key)
-        return model_key
-
-    def _sync_gpu_rollout_registry(self) -> None:
-        service = self._gpu_rollout_service
-        if service is None:
-            return
-        active_keys = {"actor_snapshot"}
-        service.register_snapshot("actor_snapshot", self.actor_snapshot)
-        self._gpu_registered_model_keys.add("actor_snapshot")
-        if bool(getattr(self.config, "gpu_rollout_remote_opponents", False)):
-            for snapshot in self.checkpoint_pool:
-                if snapshot is self.actor_snapshot or self._snapshot_policy_family(snapshot) != "v24":
-                    continue
-                active_keys.add(self._register_gpu_snapshot(snapshot))
-        service.retain_model_keys(active_keys)
-        self._gpu_registered_model_keys.intersection_update(active_keys)
-
-    def _gpu_runtime_config(self, actor_key: str, opponent_key: str) -> Dict[str, object]:
-        service = self._gpu_rollout_service
-        if service is None:
-            return {}
-        return {
-            "gpu_rollout_inference_enabled": True,
-            "gpu_inference_endpoint": service.address,
-            "gpu_inference_authkey": service.authkey,
-            "gpu_actor_model_key": str(actor_key),
-            "gpu_opponent_model_key": str(opponent_key),
-            "gpu_remote_opponents": bool(getattr(self.config, "gpu_rollout_remote_opponents", False)),
-        }
-
-    def _masked_mse_loss(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        weight = weight / torch.clamp(weight.mean(), min=1e-6)
-        masked_sq = ((pred - target) ** 2) * mask
-        denom = torch.clamp(mask.sum(dim=1), min=1.0)
-        per_row = masked_sq.sum(dim=1) / denom
-        return (per_row * weight).mean()
-
-    def _masked_policy_loss(self, logits: torch.Tensor, target_policy: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        weight = weight / torch.clamp(weight.mean(), min=1e-6)
-        masked_logits = logits.masked_fill(mask <= 0.5, -1e9)
-        log_probs = torch.log_softmax(masked_logits, dim=1)
-        per_row = -(target_policy * log_probs).sum(dim=1)
-        return (per_row * weight).mean()
-
-    def _train_regret_step(self) -> None:
-        start = time.perf_counter()
-        batch = self.advantage_buffer.sample(self.config.regret_batch_size)
-        states = torch.as_tensor(batch["states"], dtype=torch.float32, device=self.device)
-        legal_masks = torch.as_tensor(batch["legal_masks"], dtype=torch.float32, device=self.device)
-        targets = torch.as_tensor(batch["targets"], dtype=torch.float32, device=self.device)
-        weights = torch.as_tensor(batch["weights"], dtype=torch.float32, device=self.device)
-
-        self.regret_optimizer.zero_grad(set_to_none=True)
-        pred = self.model.forward_regret(states)
-        loss = self._masked_mse_loss(pred, targets, legal_masks, weights)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.clip_grad_norm)
-        self.regret_optimizer.step()
-
-        self._last_regret_loss = float(loss.item())
-        self.regret_steps += 1
-        self.learner_steps += 1
-        self._cumulative_regret_time += time.perf_counter() - start
-
-    def _train_strategy_step(self) -> None:
-        start = time.perf_counter()
-        batch = self.strategy_buffer.sample(self.config.strategy_batch_size)
-        states = torch.as_tensor(batch["states"], dtype=torch.float32, device=self.device)
-        legal_masks = torch.as_tensor(batch["legal_masks"], dtype=torch.float32, device=self.device)
-        targets = torch.as_tensor(batch["targets"], dtype=torch.float32, device=self.device)
-        weights = torch.as_tensor(batch["weights"], dtype=torch.float32, device=self.device)
-
-        self.strategy_optimizer.zero_grad(set_to_none=True)
-        logits = self.model.forward_strategy(states)
-        loss = self._masked_policy_loss(logits, targets, legal_masks, weights)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.clip_grad_norm)
-        self.strategy_optimizer.step()
-
-        self._last_strategy_loss = float(loss.item())
-        self.strategy_steps += 1
-        self.learner_steps += 1
-        self._cumulative_strategy_time += time.perf_counter() - start
-
-    def _train_exploit_step(self) -> None:
-        start = time.perf_counter()
-        batch = self.exploit_buffer.sample(self.config.exploit_batch_size)
-        states = torch.as_tensor(batch["states"], dtype=torch.float32, device=self.device)
-        legal_masks = torch.as_tensor(batch["legal_masks"], dtype=torch.float32, device=self.device)
-        targets = torch.as_tensor(batch["targets"], dtype=torch.float32, device=self.device)
-        weights = torch.as_tensor(batch["weights"], dtype=torch.float32, device=self.device)
-
-        self.exploit_optimizer.zero_grad(set_to_none=True)
-        logits = self.model.forward_exploit(states)
-        loss = self._masked_policy_loss(logits, targets, legal_masks, weights)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.clip_grad_norm)
-        self.exploit_optimizer.step()
-
-        self._last_exploit_loss = float(loss.item())
-        self.exploit_steps += 1
-        self.learner_steps += 1
-        self._cumulative_strategy_time += time.perf_counter() - start
-
-    def _maybe_train(self) -> None:
-        if len(self.advantage_buffer) < self.config.warmup_advantage_samples:
-            return
-
-        while self._adv_pending >= self.config.regret_update_interval:
-            self._train_regret_step()
-            self._adv_pending -= self.config.regret_update_interval
-            if self.learner_steps % self.config.publish_snapshot_interval == 0:
-                self._publish_actor_snapshot()
-        while len(self.strategy_buffer) > 0 and self._strat_pending >= self.config.strategy_update_interval:
-            self._train_strategy_step()
-            self._strat_pending -= self.config.strategy_update_interval
-            if self.learner_steps % self.config.publish_snapshot_interval == 0:
-                self._publish_actor_snapshot()
-        while len(self.exploit_buffer) > 0 and self._exploit_pending >= self.config.exploit_update_interval:
-            self._train_exploit_step()
-            self._exploit_pending -= self.config.exploit_update_interval
-            if self.learner_steps % self.config.publish_snapshot_interval == 0:
-                self._publish_actor_snapshot()
-
-    def _consume_traversal_result(
-        self,
-        result,
-        iter_elapsed: float,
-        opponent_profile_key: Optional[str] = None,
-        allow_training: bool = True,
-    ) -> None:
-        if opponent_profile_key:
-            self._update_opponent_profile_from_result(opponent_profile_key, result)
-
-        for key, value in result.perf_breakdown.items():
-            if key in self._cumulative_rollout_detail:
-                self._cumulative_rollout_detail[key] += float(value)
-        self._cumulative_rollout_time += float(sum(result.perf_breakdown.values()))
-
-        sample_weight = self._linear_cfr_weight()
-        weighted_adv_samples = [
-            (state, legal_mask, target, sample_weight) for state, legal_mask, target, _ in result.advantage_samples
-        ]
-        weighted_strategy_samples = [
-            (state, legal_mask, target, sample_weight) for state, legal_mask, target, _ in result.strategy_samples
-        ]
-        weighted_exploit_samples = [
-            (state, legal_mask, target, sample_weight * float(max(1e-3, weight)))
-            for state, legal_mask, target, weight in getattr(result, "exploit_samples", [])
-        ]
-
-        self.advantage_buffer.extend(weighted_adv_samples)
-        self.strategy_buffer.extend(weighted_strategy_samples)
-        self.exploit_buffer.extend(weighted_exploit_samples)
-        self._adv_pending += len(result.advantage_samples)
-        self._strat_pending += len(result.strategy_samples)
-        self._exploit_pending += len(getattr(result, "exploit_samples", []))
-
+    def _consume_result(self, result) -> None:
         self.traversals_completed += 1
         self.traverser_decisions += int(result.traverser_decisions)
         self.invalid_state_count += int(result.invalid_state_count)
         self.invalid_action_count += int(result.invalid_action_count)
-        self._recent_utilities.append(float(result.unclipped_utility_bb))
-        self._recent_vpip.append(1.0 if result.vpip else 0.0)
-        self._recent_pfr.append(1.0 if result.pfr else 0.0)
-        self._recent_three_bet.append(1.0 if result.three_bet else 0.0)
-        self._position_profit_windows[result.traverser_seat].append(float(result.unclipped_utility_bb))
-        for action_id, count in enumerate(result.action_counts.tolist()):
-            if count > 0:
+        if bool(getattr(result, "monitor_sampled", False)):
+            self._recent_utilities.append(float(result.utility_bb))
+            self._recent_vpip.append(1.0 if result.vpip else 0.0)
+            self._recent_pfr.append(1.0 if result.pfr else 0.0)
+            self._recent_three_bet.append(1.0 if result.three_bet else 0.0)
+            self._recent_prejam.append(1.0 if result.preflop_jam else 0.0)
+            self._recent_flop_seen.append(1.0 if result.flop_seen else 0.0)
+            self._recent_actions_per_hand.append(float(result.total_actions))
+            self._recent_preflop_actions_per_hand.append(float(result.preflop_actions))
+            self._position_profit_windows[int(result.traverser_seat)].append(float(result.utility_bb))
+            for action_id, count in enumerate(np.asarray(result.action_counts).reshape(-1)):
                 self._recent_actions.extend([action_id] * int(count))
+            for action_id, count in enumerate(np.asarray(result.preflop_action_counts).reshape(-1)):
+                self._recent_preflop_actions.extend([action_id] * int(count))
+            for action_id, count in enumerate(np.asarray(result.postflop_action_counts).reshape(-1)):
+                self._recent_postflop_actions.extend([action_id] * int(count))
+            _merge_conditioned_counts(self._conditioned_counts, getattr(result, "postflop_conditioned_counts", None))
+        for key, value in (result.perf_breakdown or {}).items():
+            if key in self._cumulative_perf:
+                self._cumulative_perf[key] += float(value)
+        self._chunk_learner_steps += 1
+        self._chunk_regret_steps += int(result.traverser_decisions)
 
-        if allow_training:
-            self._maybe_train()
-            if self._should_save_checkpoint():
-                self._publish_actor_snapshot()
-                self._mark_checkpoint_published()
-        self._cumulative_work_time += float(iter_elapsed)
-        self._recent_traversal_times.append(float(iter_elapsed))
+    def _refresh_actor_snapshot(self, append_checkpoint: bool = False) -> None:
+        self.actor_snapshot = freeze_policy_snapshot(
+            self.node_store,
+            {
+                "traversals_completed": int(self.traversals_completed),
+                "iteration": int(self._outer_iteration),
+                "infosets": int(len(self.node_store)),
+            },
+        )
+        self._actor_snapshot_dirty = False
+        if append_checkpoint:
+            self.checkpoint_pool.append(copy.deepcopy(self.actor_snapshot))
+            if len(self.checkpoint_pool) > int(self.config.max_checkpoint_pool):
+                self.checkpoint_pool = self.checkpoint_pool[-int(self.config.max_checkpoint_pool) :]
 
-    def _flush_pending_updates_after_rollouts(self) -> None:
-        self._maybe_train()
-        if self._should_save_checkpoint():
-            self._publish_actor_snapshot()
-            self._mark_checkpoint_published()
+    def _ensure_actor_snapshot_current(self, append_checkpoint: bool = False) -> None:
+        if bool(self._actor_snapshot_dirty) or append_checkpoint:
+            self._refresh_actor_snapshot(append_checkpoint=append_checkpoint)
 
-    def _run_sequential_traversals(self, num_traversals: int) -> None:
-        for _ in range(max(1, int(num_traversals))):
-            iter_start = time.perf_counter()
-            traversal_index = int(self.traversals_completed)
-            traverser_seat = traversal_index % self.config.num_players
-            seed = int(self._seed_rng.integers(0, 2**31 - 1))
-            (
-                opponent_snapshot,
-                opponent_profile_key,
-                opponent_profiles_by_seat,
-                _,
-                _,
-                opponent_policy_mode,
-                synthetic_opponent_style,
-            ) = self._opponent_assignment_for_traversal(traversal_index)
-            self.config.opponent_profile = tuple(OPPONENT_PROFILE_DEFAULT_V24)
-            self.config.opponent_profiles_by_seat = {
-                int(seat): tuple(profile_values) for seat, profile_values in opponent_profiles_by_seat.items()
-            }
-            self.config.opponent_policy_mode = str(opponent_policy_mode or "snapshot")
-            self.config.synthetic_opponent_style = str(synthetic_opponent_style or "")
-            result = run_traversal(seed, traverser_seat, self.actor_snapshot, opponent_snapshot, self.config)
-            iter_elapsed = time.perf_counter() - iter_start
-            self._consume_traversal_result(result, iter_elapsed, opponent_profile_key=opponent_profile_key)
+    def _effective_rollout_workers(self) -> int:
+        configured = max(1, int(getattr(self.config, "rollout_workers", 1)))
+        return min(configured, max(1, int(os.cpu_count() or configured)))
 
-    def _run_parallel_traversals(self, num_traversals: int) -> None:
-        executor = self._ensure_rollout_executor()
-        if executor is None:
-            self._run_sequential_traversals(num_traversals)
+    @staticmethod
+    def _default_rollout_workers() -> int:
+        return max(1, max(1, (os.cpu_count() or 2) - 1))
+
+    def _current_worker_snapshot_signature(self) -> str:
+        return f"table_v{int(self._node_store_version)}"
+
+    def _invalidate_worker_snapshot_sync(self) -> None:
+        self._worker_update_payload = None
+
+    def _build_full_worker_snapshot_payload(self) -> Dict[str, object]:
+        return {
+            "__snapshot_mode__": "full",
+            "node_store": serialize_node_store(self.node_store),
+        }
+
+    def _accumulate_node_delta_payload(self, total: Dict[str, Dict[str, object]], update: Dict[str, Dict[str, object]]) -> None:
+        if not isinstance(update, dict):
             return
-
-        count = max(1, int(num_traversals))
-        workers = max(1, int(self._effective_rollout_workers()))
-        base_chunk = max(1, int(self.config.rollout_worker_chunk_size))
-        target_tasks = max(1, workers)
-        adaptive_chunk = int(math.ceil(count / float(target_tasks)))
-        chunk_size = max(1, min(base_chunk, adaptive_chunk))
-        use_gpu_rollout = self._gpu_rollout_enabled()
-        if use_gpu_rollout:
-            self._maybe_start_gpu_rollout_service()
-            self._sync_gpu_rollout_registry()
-        actor_state = {k: v.detach().cpu() for k, v in self.actor_snapshot.state_dict().items()}
-        start_traversal = self.traversals_completed
-        future_meta = {}
-        chunk_start = 0
-        chunk_idx = 0
-        while chunk_start < count:
-            traversal_index = int(start_traversal + chunk_start)
-            (
-                opponent_snapshot,
-                opponent_profile_key,
-                opponent_profiles_by_seat,
-                _,
-                block_end,
-                opponent_policy_mode,
-                synthetic_opponent_style,
-            ) = self._opponent_assignment_for_traversal(traversal_index)
-            hold_remaining = max(1, int(block_end - traversal_index))
-            chunk_len = min(chunk_size, count - chunk_start, hold_remaining)
-            seeds = [int(self._seed_rng.integers(0, 2**31 - 1)) for _ in range(chunk_len)]
-            traverser_seats = [
-                int((start_traversal + chunk_start + offset) % self.config.num_players) for offset in range(chunk_len)
-            ]
-            config_dict = asdict(self.config)
-            config_dict["opponent_profile"] = tuple(OPPONENT_PROFILE_DEFAULT_V24)
-            config_dict["opponent_profiles_by_seat"] = {
-                int(seat): tuple(profile_values) for seat, profile_values in opponent_profiles_by_seat.items()
-            }
-            config_dict["opponent_policy_mode"] = str(opponent_policy_mode or "snapshot")
-            config_dict["synthetic_opponent_style"] = str(synthetic_opponent_style or "")
-            actor_model_key = self._gpu_model_key_for_snapshot(self.actor_snapshot, self.actor_snapshot)
-            if use_gpu_rollout:
-                self._register_gpu_snapshot(self.actor_snapshot)
-            opponent_family = self._snapshot_policy_family(opponent_snapshot)
-            config_dict["opponent_snapshot_family"] = opponent_family
-            remote_opponents = bool(
-                use_gpu_rollout
-                and getattr(self.config, "gpu_rollout_remote_opponents", False)
-                and opponent_family == "v24"
-            )
-            if opponent_snapshot is None or opponent_snapshot is self.actor_snapshot:
-                opponent_state = None if remote_opponents else actor_state
-                opponent_model_key = actor_model_key
-            else:
-                opponent_model_key = (
-                    self._register_gpu_snapshot(opponent_snapshot) if use_gpu_rollout else self._gpu_model_key_for_snapshot(opponent_snapshot, self.actor_snapshot)
-                )
-                opponent_state = (
-                    None if remote_opponents else {k: v.detach().cpu() for k, v in opponent_snapshot.state_dict().items()}
-                )
-            if use_gpu_rollout:
-                config_dict.update(self._gpu_runtime_config(actor_model_key, opponent_model_key))
-            config_dict["gpu_remote_opponents"] = remote_opponents
-            opponent_signature = "self" if opponent_snapshot is self.actor_snapshot else str(id(opponent_snapshot))
-            actor_cache_signature = (
-                f"remote_actor:{actor_model_key}:{config_dict.get('gpu_inference_endpoint')}"
-                if use_gpu_rollout
-                else f"cpu_actor:{self._snapshot_version}:{self.config.state_dim}:{self.config.hidden_dim}:{self.config.action_count}"
-            )
-            if str(opponent_policy_mode or "snapshot") != "snapshot":
-                opponent_cache_signature = (
-                    f"opponent_mode:{opponent_policy_mode}:{synthetic_opponent_style}:"
-                    f"{int(bool(config_dict.get('quantize_local_opponent_models', False)))}"
-                )
-            elif opponent_snapshot is None or opponent_snapshot is self.actor_snapshot:
-                opponent_cache_signature = (
-                    f"opponent_self:{self._snapshot_version}:{self.config.state_dim}:{self.config.hidden_dim}:"
-                    f"{self.config.action_count}:{int(bool(config_dict.get('quantize_local_opponent_models', False)))}"
-                )
-            else:
-                opponent_cache_signature = (
-                    f"opponent_checkpoint:{opponent_signature}:{int(bool(config_dict.get('quantize_local_opponent_models', False)))}"
-                )
-            config_dict["actor_cache_signature"] = actor_cache_signature
-            config_dict["opponent_cache_signature"] = opponent_cache_signature
-            signature = (
-                f"{self._snapshot_version}:"
-                f"{self.config.state_dim}:{self.config.hidden_dim}:{self.config.action_count}:"
-                f"{opponent_signature}:"
-                f"{config_dict['opponent_policy_mode']}:{config_dict['synthetic_opponent_style']}"
-            )
-            future = executor.submit(
-                run_traversal_batch_mp,
-                seeds,
-                traverser_seats,
-                actor_state,
-                opponent_state,
-                config_dict,
-                signature,
-            )
-            future_meta[future] = {
-                "chunk_len": chunk_len,
-                "opponent_profile_key": opponent_profile_key,
-            }
-            chunk_start += chunk_len
-            chunk_idx += 1
-
-        for future in as_completed(list(future_meta.keys())):
-            meta = future_meta[future]
-            chunk_len = int(meta.get("chunk_len", 0))
-            opponent_profile_key = str(meta.get("opponent_profile_key", "") or "")
-            results = future.result()
-            if not results:
+        for infoset_key, payload in update.items():
+            if not isinstance(payload, dict):
                 continue
-            for result in results:
-                iter_elapsed = max(1e-6, float(sum(result.perf_breakdown.values())))
-                self._consume_traversal_result(
-                    result,
-                    iter_elapsed,
-                    opponent_profile_key=opponent_profile_key,
-                    allow_training=not use_gpu_rollout,
-                )
-        if use_gpu_rollout:
-            self._flush_pending_updates_after_rollouts()
+            key = str(infoset_key)
+            if key not in total:
+                total[key] = {
+                    "legal_mask": np.asarray(payload.get("legal_mask", np.zeros(self.config.action_count, dtype=np.float32)), dtype=np.float32).copy(),
+                    "regret_sum_delta": np.asarray(payload.get("regret_sum_delta", np.zeros(self.config.action_count, dtype=np.float32)), dtype=np.float32).copy(),
+                    "strategy_sum_delta": np.asarray(payload.get("strategy_sum_delta", np.zeros(self.config.action_count, dtype=np.float32)), dtype=np.float32).copy(),
+                    "visit_delta": int(payload.get("visit_delta", 0)),
+                }
+                continue
+            total[key]["legal_mask"] = np.maximum(
+                np.asarray(total[key]["legal_mask"], dtype=np.float32),
+                np.asarray(payload.get("legal_mask", total[key]["legal_mask"]), dtype=np.float32),
+            )
+            total[key]["regret_sum_delta"] = (
+                np.asarray(total[key]["regret_sum_delta"], dtype=np.float32)
+                + np.asarray(payload.get("regret_sum_delta", np.zeros_like(total[key]["regret_sum_delta"])), dtype=np.float32)
+            )
+            total[key]["strategy_sum_delta"] = (
+                np.asarray(total[key]["strategy_sum_delta"], dtype=np.float32)
+                + np.asarray(payload.get("strategy_sum_delta", np.zeros_like(total[key]["strategy_sum_delta"])), dtype=np.float32)
+            )
+            total[key]["visit_delta"] = int(total[key]["visit_delta"]) + int(payload.get("visit_delta", 0))
+
+    def _advance_worker_snapshot_version(self, batch_deltas: Optional[Dict[str, Dict[str, object]]], *, force_full_resync: bool) -> None:
+        previous_signature = self._current_worker_snapshot_signature()
+        self._node_store_version += 1
+        if force_full_resync or not isinstance(batch_deltas, dict):
+            self._worker_update_payload = None
+            return
+        self._worker_update_payload = {
+            "__snapshot_mode__": "delta",
+            "base_signature": previous_signature,
+            "delta_payload": batch_deltas,
+        }
+
+    def _ensure_rollout_executor(self) -> Optional[ProcessPoolExecutor]:
+        workers = self._effective_rollout_workers()
+        if not bool(getattr(self.config, "parallel_rollouts", False)) or workers <= 1:
+            return None
+        current_workers = int(getattr(self._rollout_executor, "_max_workers", 0) or 0) if self._rollout_executor is not None else 0
+        executor_shutdown = bool(getattr(self._rollout_executor, "_shutdown_thread", False)) if self._rollout_executor is not None else False
+        executor_broken = bool(getattr(self._rollout_executor, "_broken", False)) if self._rollout_executor is not None else False
+        if self._rollout_executor is None or current_workers != workers or executor_shutdown or executor_broken:
+            if self._rollout_executor is not None:
+                self._rollout_executor.shutdown(wait=False, cancel_futures=True)
+            self._invalidate_worker_snapshot_sync()
+            self._rollout_executor = ProcessPoolExecutor(max_workers=workers)
+        return self._rollout_executor
+
+    def _recreate_rollout_executor(self) -> Optional[ProcessPoolExecutor]:
+        if self._rollout_executor is not None:
+            self._rollout_executor.shutdown(wait=False, cancel_futures=True)
+            self._rollout_executor = None
+        self._invalidate_worker_snapshot_sync()
+        return self._ensure_rollout_executor()
+
+    def _submit_rollout_batch_task(
+        self,
+        executor: ProcessPoolExecutor,
+        *,
+        hand_seeds: List[int],
+        traverser_seats: List[int],
+        actor_state_payload,
+        config_payload: Dict[str, object],
+        snapshot_signature: str,
+    ):
+        try:
+            return executor.submit(
+                run_traversal_batch_mp,
+                hand_seeds,
+                traverser_seats,
+                actor_state_payload,
+                None,
+                config_payload,
+                snapshot_signature,
+            )
+        except BrokenProcessPool:
+            executor = self._recreate_rollout_executor()
+            if executor is None:
+                raise
+            return executor.submit(
+                run_traversal_batch_mp,
+                hand_seeds,
+                traverser_seats,
+                actor_state_payload,
+                None,
+                config_payload,
+                snapshot_signature,
+            )
+        except RuntimeError as exc:
+            if "cannot schedule new futures after shutdown" not in str(exc).lower():
+                raise
+            executor = self._recreate_rollout_executor()
+            if executor is None:
+                raise
+            return executor.submit(
+                run_traversal_batch_mp,
+                hand_seeds,
+                traverser_seats,
+                actor_state_payload,
+                None,
+                config_payload,
+                snapshot_signature,
+            )
+
+    def _run_serial_traversals(self, hand_seeds: List[int], traverser_seats: List[int]) -> None:
+        for hand_seed, traverser_seat in zip(hand_seeds, traverser_seats):
+            result = run_traversal(int(hand_seed), int(traverser_seat), self.actor_snapshot, self.actor_snapshot, self.config)
+            self._consume_result(result)
+
+    def _degrade_parallel_rollouts(self) -> None:
+        if self._rollout_executor is not None:
+            self._rollout_executor.shutdown(wait=False, cancel_futures=True)
+            self._rollout_executor = None
+        self._invalidate_worker_snapshot_sync()
+        self.config.parallel_rollouts = False
+
+    def _merge_node_deltas(self, node_deltas: Dict[str, Dict[str, object]]) -> None:
+        if not isinstance(node_deltas, dict):
+            return
+        for infoset_key, payload in node_deltas.items():
+            if not isinstance(payload, dict):
+                continue
+            legal_mask = np.asarray(payload.get("legal_mask", np.zeros(self.config.action_count, dtype=np.float32)), dtype=np.float32).reshape(-1)
+            node = self.node_store.get(str(infoset_key))
+            if node is None:
+                node = TabularNode.new(legal_mask)
+                self.node_store[str(infoset_key)] = node
+            else:
+                node.merge_legal_mask(legal_mask)
+            regret_delta = np.asarray(payload.get("regret_sum_delta", np.zeros_like(node.regret_sum)), dtype=np.float32).reshape(-1)
+            strategy_delta = np.asarray(payload.get("strategy_sum_delta", np.zeros_like(node.strategy_sum)), dtype=np.float32).reshape(-1)
+            if regret_delta.shape == node.regret_sum.shape:
+                node.regret_sum += regret_delta
+            if strategy_delta.shape == node.strategy_sum.shape:
+                node.strategy_sum += strategy_delta
+            node.visits += int(payload.get("visit_delta", 0))
+
+    def _maybe_discount_tables(self) -> bool:
+        interval = max(1, int(getattr(self.config, "discount_interval_iterations", 2)))
+        if int(self._outer_iteration) < int(getattr(self.config, "lcfr_after_iteration", 400)):
+            self._last_discount_factor = 1.0
+            return False
+        if int(self._outer_iteration) <= 0 or int(self._outer_iteration) % interval != 0:
+            self._last_discount_factor = 1.0
+            return False
+        scale_index = max(1, int(self._outer_iteration // interval))
+        factor = float(scale_index / float(scale_index + 1))
+        for node in self.node_store.values():
+            node.regret_sum *= factor
+            node.strategy_sum *= factor
+        self._last_discount_factor = factor
+        return True
+
+    def _make_snapshot(self, status: str) -> TrainingSnapshot:
+        action_hist = np.bincount(np.array(self._recent_actions, dtype=np.int64), minlength=self.config.action_count) if self._recent_actions else np.zeros(self.config.action_count, dtype=np.int64)
+        pre_hist = np.bincount(np.array(self._recent_preflop_actions, dtype=np.int64), minlength=self.config.action_count) if self._recent_preflop_actions else np.zeros(self.config.action_count, dtype=np.int64)
+        post_hist = np.bincount(np.array(self._recent_postflop_actions, dtype=np.int64), minlength=self.config.action_count) if self._recent_postflop_actions else np.zeros(self.config.action_count, dtype=np.int64)
+        probs = action_hist.astype(np.float64) / max(1.0, float(action_hist.sum()))
+        entropy = float(-np.sum(probs[probs > 0] * np.log2(probs[probs > 0]))) if np.any(probs > 0) else 0.0
+        elapsed = max(time.time() - self._start_time, 1e-6)
+        return TrainingSnapshot(
+            status=status,
+            traversals_completed=self.traversals_completed,
+            traverser_decisions=self.traverser_decisions,
+            exploration_epsilon=0.0,
+            advantage_buffer_size=0,
+            strategy_buffer_size=0,
+            postflop_value_buffer_size=0,
+            regret_loss=0.0,
+            strategy_loss=0.0,
+            postflop_value_loss=0.0,
+            ema_regret_loss=0.0,
+            ema_strategy_loss=0.0,
+            ema_postflop_value_loss=0.0,
+            avg_utility_bb=float(np.mean(self._recent_utilities)) if self._recent_utilities else 0.0,
+            vpip=float(np.mean(self._recent_vpip)) if self._recent_vpip else 0.0,
+            pfr=float(np.mean(self._recent_pfr)) if self._recent_pfr else 0.0,
+            three_bet=float(np.mean(self._recent_three_bet)) if self._recent_three_bet else 0.0,
+            preflop_jam_rate=float(np.mean(self._recent_prejam)) if self._recent_prejam else 0.0,
+            flop_seen_rate=float(np.mean(self._recent_flop_seen)) if self._recent_flop_seen else 0.0,
+            avg_actions_per_hand=float(np.mean(self._recent_actions_per_hand)) if self._recent_actions_per_hand else 0.0,
+            avg_preflop_actions_per_hand=float(np.mean(self._recent_preflop_actions_per_hand)) if self._recent_preflop_actions_per_hand else 0.0,
+            blueprint_coverage_pct=0.0,
+            utility_window_count=len(self._recent_utilities),
+            style_window_count=len(self._recent_vpip),
+            position_window_size=max(len(window) for window in self._position_profit_windows.values()),
+            action_entropy=entropy,
+            invalid_state_count=self.invalid_state_count,
+            invalid_action_count=self.invalid_action_count,
+            hands_per_second=float(self.traversals_completed / elapsed),
+            learner_steps=self.learner_steps,
+            chunk_learner_steps=self._chunk_learner_steps,
+            chunk_regret_steps=self._chunk_regret_steps,
+            chunk_strategy_steps=self._chunk_strategy_steps,
+            chunk_postflop_value_steps=0,
+            chunk_advantage_samples=self._chunk_advantage_samples,
+            chunk_strategy_samples=self._chunk_strategy_samples,
+            chunk_postflop_value_samples=0,
+            postflop_samples_per_traversal=0.0,
+            checkpoint_pool_size=len(self.checkpoint_pool),
+            action_histogram=action_hist.astype(int).tolist(),
+            preflop_action_histogram=pre_hist.astype(int).tolist(),
+            postflop_action_histogram=post_hist.astype(int).tolist(),
+            postflop_conditioned_rates_by_street=_conditioned_rates(self._conditioned_counts),
+            postflop_conditioned_counts_by_street=_format_conditioned_counts(self._conditioned_counts),
+            position_avg_utility_bb={POSITION_NAMES_V21[seat]: (float(np.mean(window)) if window else 0.0) for seat, window in self._position_profit_windows.items()},
+            perf_breakdown_ms={key: float(value / max(1, self.traversals_completed) * 1000.0) for key, value in self._cumulative_perf.items()},
+            infoset_count=len(self.node_store),
+            pruning_active=bool(self._outer_iteration >= int(self.config.prune_after_iteration)),
+            discount_active=bool(self._outer_iteration >= int(self.config.lcfr_after_iteration)),
+            last_discount_factor=float(self._last_discount_factor),
+            algorithm_name=str(self.config.algorithm_name),
+            monitor_mode="self_play",
+            timestamp=time.time(),
+        )
+
+    def _refresh_snapshot(self, status: str) -> None:
+        self._snapshot = self._make_snapshot(status)
+
+    def _run_parallel_seat_batch(self, seat: int, seat_target: int) -> Optional[Dict[str, Dict[str, object]]]:
+        executor = self._ensure_rollout_executor()
+        workers = self._effective_rollout_workers()
+        starting_seed = self.traversals_completed + 1
+        if executor is None or workers <= 1 or seat_target < 2:
+            self._run_serial_traversals(
+                [starting_seed + offset for offset in range(seat_target)],
+                [int(seat)] * seat_target,
+            )
+            return None
+
+        base_chunk = max(1, int(getattr(self.config, "rollout_worker_chunk_size", 8)))
+        snapshot_signature = self._current_worker_snapshot_signature()
+        config_payload = asdict(self.config)
+        config_payload.pop("checkpoint_pool", None)
+        hand_seeds = [starting_seed + offset for offset in range(seat_target)]
+        traverser_seats = [int(seat)] * seat_target
+        task_ranges = [(start_idx, min(seat_target, start_idx + base_chunk)) for start_idx in range(0, seat_target, base_chunk)]
+        prime_count = min(workers, len(task_ranges))
+        cached_update_payload = self._worker_update_payload
+        full_snapshot_payload: Optional[Dict[str, object]] = None
+
+        def get_full_snapshot_payload() -> Dict[str, object]:
+            nonlocal full_snapshot_payload
+            if full_snapshot_payload is None:
+                full_snapshot_payload = self._build_full_worker_snapshot_payload()
+            return full_snapshot_payload
+
+        task_specs = []
+        future_map = {}
+        for task_idx, (start_idx, end_idx) in enumerate(task_ranges):
+            actor_state_payload = None
+            if task_idx < prime_count:
+                actor_state_payload = cached_update_payload if cached_update_payload is not None else get_full_snapshot_payload()
+            spec = {
+                "hand_seeds": hand_seeds[start_idx:end_idx],
+                "traverser_seats": traverser_seats[start_idx:end_idx],
+                "actor_state_payload": actor_state_payload,
+            }
+            task_specs.append(spec)
+            future = self._submit_rollout_batch_task(
+                executor,
+                hand_seeds=spec["hand_seeds"],
+                traverser_seats=spec["traverser_seats"],
+                actor_state_payload=spec["actor_state_payload"],
+                config_payload=config_payload,
+                snapshot_signature=snapshot_signature,
+            )
+            future_map[future] = spec
+        accumulated_deltas: Dict[str, Dict[str, object]] = {}
+        completed_specs: set[tuple[int, ...]] = set()
+        while future_map:
+            for future in as_completed(list(future_map.keys())):
+                spec = future_map.pop(future)
+                spec_key = tuple(int(seed) for seed in spec["hand_seeds"])
+                try:
+                    batch_result = future.result()
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "Worker snapshot cache miss" in message:
+                        spec["actor_state_payload"] = get_full_snapshot_payload()
+                        executor = self._ensure_rollout_executor()
+                        if executor is None:
+                            raise
+                        retry_future = self._submit_rollout_batch_task(
+                            executor,
+                            hand_seeds=spec["hand_seeds"],
+                            traverser_seats=spec["traverser_seats"],
+                            actor_state_payload=spec["actor_state_payload"],
+                            config_payload=config_payload,
+                            snapshot_signature=snapshot_signature,
+                        )
+                        future_map[retry_future] = spec
+                        continue
+                    if "process pool was terminated abruptly" in message.lower():
+                        remaining_specs = [pending for pending in task_specs if tuple(int(seed) for seed in pending["hand_seeds"]) not in completed_specs]
+                        self._degrade_parallel_rollouts()
+                        for pending in remaining_specs:
+                            self._run_serial_traversals(pending["hand_seeds"], pending["traverser_seats"])
+                        return None
+                    if "cannot schedule new futures after shutdown" in message.lower():
+                        executor = self._recreate_rollout_executor()
+                        if executor is None:
+                            raise
+                        spec["actor_state_payload"] = get_full_snapshot_payload()
+                        retry_future = self._submit_rollout_batch_task(
+                            executor,
+                            hand_seeds=spec["hand_seeds"],
+                            traverser_seats=spec["traverser_seats"],
+                            actor_state_payload=spec["actor_state_payload"],
+                            config_payload=config_payload,
+                            snapshot_signature=snapshot_signature,
+                        )
+                        future_map[retry_future] = spec
+                        continue
+                    raise
+                except BrokenProcessPool:
+                    remaining_specs = [pending for pending in task_specs if tuple(int(seed) for seed in pending["hand_seeds"]) not in completed_specs]
+                    self._degrade_parallel_rollouts()
+                    for pending in remaining_specs:
+                        self._run_serial_traversals(pending["hand_seeds"], pending["traverser_seats"])
+                    return None
+                self._accumulate_node_delta_payload(accumulated_deltas, getattr(batch_result, "node_deltas", {}))
+                self._merge_node_deltas(getattr(batch_result, "node_deltas", {}))
+                for result in getattr(batch_result, "results", ()):
+                    self._consume_result(result)
+                completed_specs.add(spec_key)
+                break
+        return accumulated_deltas
+
+    @staticmethod
+    def _is_process_pool_runtime_error(exc: RuntimeError) -> bool:
+        message = str(exc).lower()
+        return "process pool was terminated abruptly" in message or "cannot schedule new futures after shutdown" in message
+
+    def _build_eval_config(self, mode: str):
+        eval_config = build_runtime_policy_config(copy.copy(self.config))
+        eval_config.evaluation_mode = "synthetic" if mode in SYNTHETIC_OPPONENT_STYLES else mode
+        eval_config.current_iteration = self._outer_iteration
+        eval_config.checkpoint_pool = tuple(self.checkpoint_pool)
+        eval_config.synthetic_opponent_style = mode if mode in SYNTHETIC_OPPONENT_STYLES else ""
+        return eval_config
+
+    def _collect_evaluation_hands_serial(self, num_hands: int, eval_config) -> List[object]:
+        results = []
+        for hand_idx in range(max(1, int(num_hands))):
+            eval_config.eval_hero_seat = hand_idx % self.config.num_players
+            results.append(run_policy_hand(hand_idx + 1, self.actor_snapshot, eval_config))
+        return results
+
+    def _collect_evaluation_hands(self, num_hands: int, eval_config) -> List[object]:
+        return self._collect_evaluation_hands_serial(num_hands, eval_config)
+
+    def _build_evaluation_report(self, mode: str, hand_results: List[object], runtime_seconds: float) -> EvaluationReport:
+        hands_played = max(1, int(len(hand_results)))
+        action_hist = np.zeros(self.config.action_count, dtype=np.int64)
+        pre_hist = np.zeros(self.config.action_count, dtype=np.int64)
+        post_hist = np.zeros(self.config.action_count, dtype=np.int64)
+        position_profit = {seat: [] for seat in range(self.config.num_players)}
+        vpip_attempts = {seat: 0 for seat in range(self.config.num_players)}
+        pfr_attempts = {seat: 0 for seat in range(self.config.num_players)}
+        three_attempts = {seat: 0 for seat in range(self.config.num_players)}
+        vpip_opp = {seat: 0 for seat in range(self.config.num_players)}
+        rfi_attempts = {seat: 0 for seat in range(self.config.num_players)}
+        rfi_opp = {seat: 0 for seat in range(self.config.num_players)}
+        hand_counts = np.zeros((13, 13), dtype=np.int64)
+        hand_vpip_hits = np.zeros((13, 13), dtype=np.int64)
+        hand_rfi_counts = np.zeros((13, 13), dtype=np.int64)
+        hand_rfi_hits = np.zeros((13, 13), dtype=np.int64)
+        hand_pfr_hits = np.zeros((13, 13), dtype=np.int64)
+        hand_three_bet_hits = np.zeros((13, 13), dtype=np.int64)
+        position_hand_counts = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
+        position_hand_vpip_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
+        position_hand_rfi_counts = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
+        position_hand_rfi_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
+        position_hand_pfr_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
+        position_hand_three_bet_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
+        total_profit = wins = illegal = vpip = pfr = three = prejam = flop_seen = 0
+        total_actions = total_preflop_actions = 0
+        counts = _new_postflop_counts()
+        counts_by_pos = {name: _new_postflop_counts() for name in POSITION_NAMES_V21}
+        conditioned = _new_postflop_conditioned_counts()
+
+        for hand in hand_results:
+            total_profit += float(hand.hero_profit_bb)
+            wins += 1 if hand.win else 0
+            illegal += int(hand.illegal_action_count)
+            vpip += 1 if hand.vpip else 0
+            pfr += 1 if hand.pfr else 0
+            three += 1 if hand.three_bet else 0
+            prejam += 1 if hand.preflop_jam else 0
+            flop_seen += 1 if hand.flop_seen else 0
+            total_actions += int(hand.total_actions)
+            total_preflop_actions += int(hand.preflop_actions)
+            action_hist += np.asarray(hand.action_counts, dtype=np.int64)
+            pre_hist += np.asarray(hand.preflop_action_counts, dtype=np.int64)
+            post_hist += np.asarray(hand.postflop_action_counts, dtype=np.int64)
+            seat = int(hand.hero_seat)
+            name = POSITION_NAMES_V21[seat]
+            position_profit[seat].append(float(hand.hero_profit_bb))
+            vpip_attempts[seat] += 1 if hand.vpip else 0
+            pfr_attempts[seat] += 1 if hand.pfr else 0
+            three_attempts[seat] += 1 if hand.three_bet else 0
+            vpip_opp[seat] += 1
+            if hand.rfi_opportunity:
+                rfi_opp[seat] += 1
+            if hand.rfi_attempt:
+                rfi_attempts[seat] += 1
+            hand_grid_indices = _hand_key_to_grid_indices(getattr(hand, "hero_hand_key", None))
+            if hand_grid_indices is not None:
+                row, col = hand_grid_indices
+                hand_counts[row, col] += 1
+                position_hand_counts[seat][row, col] += 1
+                if hand.vpip:
+                    hand_vpip_hits[row, col] += 1
+                    position_hand_vpip_hits[seat][row, col] += 1
+                if hand.rfi_opportunity:
+                    hand_rfi_counts[row, col] += 1
+                    position_hand_rfi_counts[seat][row, col] += 1
+                    if hand.rfi_attempt:
+                        hand_rfi_hits[row, col] += 1
+                        position_hand_rfi_hits[seat][row, col] += 1
+                if hand.pfr:
+                    hand_pfr_hits[row, col] += 1
+                    position_hand_pfr_hits[seat][row, col] += 1
+                if hand.three_bet:
+                    hand_three_bet_hits[row, col] += 1
+                    position_hand_three_bet_hits[seat][row, col] += 1
+            hand_postflop_counts = {
+                "hands": 1,
+                "flop_seen": 1 if hand.flop_seen else 0,
+                "turn_seen": 1 if hand.turn_seen else 0,
+                "river_seen": 1 if hand.river_seen else 0,
+                "showdown_seen": 1 if hand.showdown_seen else 0,
+                "showdown_won": 1 if hand.showdown_won else 0,
+                "cbet_flop_opportunity": 1 if hand.cbet_flop_opportunity else 0,
+                "cbet_flop_taken": 1 if hand.cbet_flop_taken else 0,
+                "fold_vs_cbet_flop_opportunity": 1 if hand.fold_vs_cbet_flop_opportunity else 0,
+                "fold_vs_cbet_flop": 1 if hand.fold_vs_cbet_flop else 0,
+                "cbet_turn_opportunity": 1 if hand.cbet_turn_opportunity else 0,
+                "cbet_turn_taken": 1 if hand.cbet_turn_taken else 0,
+                "fold_vs_cbet_turn_opportunity": 1 if hand.fold_vs_cbet_turn_opportunity else 0,
+                "fold_vs_cbet_turn": 1 if hand.fold_vs_cbet_turn else 0,
+            }
+            for key, value in hand_postflop_counts.items():
+                counts[key] += int(value)
+                counts_by_pos[name][key] += int(value)
+            _merge_conditioned_counts(conditioned, hand.postflop_conditioned_counts)
+
+        vpip_hand_grid = _rate_grid_from_counts(hand_vpip_hits, hand_counts)
+        rfi_hand_grid = _rate_grid_from_counts(hand_rfi_hits, hand_rfi_counts)
+        pfr_hand_grid = _rate_grid_from_counts(hand_pfr_hits, hand_counts)
+        three_bet_hand_grid = _rate_grid_from_counts(hand_three_bet_hits, hand_counts)
+        vpip_hand_grid_by_position = {
+            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_vpip_hits[seat], position_hand_counts[seat])
+            for seat in range(self.config.num_players)
+        }
+        rfi_hand_grid_by_position = {
+            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_rfi_hits[seat], position_hand_rfi_counts[seat])
+            for seat in range(self.config.num_players)
+        }
+        pfr_hand_grid_by_position = {
+            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_pfr_hits[seat], position_hand_counts[seat])
+            for seat in range(self.config.num_players)
+        }
+        three_bet_hand_grid_by_position = {
+            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_three_bet_hits[seat], position_hand_counts[seat])
+            for seat in range(self.config.num_players)
+        }
+        zero_grid = np.zeros((13, 13), dtype=np.float32).tolist()
+        return EvaluationReport(
+            mode=mode,
+            hands=hands_played,
+            avg_profit_bb=float(total_profit / hands_played),
+            win_rate=float(wins / hands_played),
+            vpip=float(vpip / hands_played),
+            rfi=float(sum(rfi_attempts.values()) / max(1, sum(rfi_opp.values()))) if sum(rfi_opp.values()) > 0 else 0.0,
+            pfr=float(pfr / hands_played),
+            three_bet=float(three / hands_played),
+            preflop_jam_rate=float(prejam / hands_played),
+            flop_seen_rate=float(flop_seen / hands_played),
+            avg_actions_per_hand=float(total_actions / hands_played),
+            avg_preflop_actions_per_hand=float(total_preflop_actions / hands_played),
+            blueprint_coverage_pct=0.0,
+            illegal_action_count=illegal,
+            runtime_seconds=float(runtime_seconds),
+            action_histogram=action_hist.astype(int).tolist(),
+            preflop_action_histogram=pre_hist.astype(int).tolist(),
+            postflop_action_histogram=post_hist.astype(int).tolist(),
+            postflop_conditioned_rates_by_street=_conditioned_rates(conditioned),
+            postflop_conditioned_counts_by_street=_format_conditioned_counts(conditioned),
+            position_avg_profit_bb={POSITION_NAMES_V21[seat]: (float(np.mean(values)) if values else 0.0) for seat, values in position_profit.items()},
+            vpip_by_position={POSITION_NAMES_V21[seat]: float(vpip_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
+            rfi_by_position={POSITION_NAMES_V21[seat]: float(rfi_attempts[seat] / max(1, rfi_opp[seat])) if rfi_opp[seat] > 0 else 0.0 for seat in range(self.config.num_players)},
+            pfr_by_position={POSITION_NAMES_V21[seat]: float(pfr_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
+            three_bet_by_position={POSITION_NAMES_V21[seat]: float(three_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
+            vpip_hand_grid=vpip_hand_grid,
+            rfi_hand_grid=rfi_hand_grid,
+            pfr_hand_grid=pfr_hand_grid,
+            three_bet_hand_grid=three_bet_hand_grid,
+            vpip_hand_grid_by_position=vpip_hand_grid_by_position,
+            rfi_hand_grid_by_position=rfi_hand_grid_by_position,
+            pfr_hand_grid_by_position=pfr_hand_grid_by_position,
+            three_bet_hand_grid_by_position=three_bet_hand_grid_by_position,
+            postflop_rates=_postflop_rates(counts),
+            postflop_counts={key: int(value) for key, value in counts.items()},
+            postflop_rates_by_position={name: _postflop_rates(pos_counts) for name, pos_counts in counts_by_pos.items()},
+            postflop_counts_by_position={name: {key: int(value) for key, value in pos_counts.items()} for name, pos_counts in counts_by_pos.items()},
+            postflop_hand_grids={metric: zero_grid for metric in POSTFLOP_RATE_KEYS},
+            postflop_hand_grids_by_position={name: {metric: zero_grid for metric in POSTFLOP_RATE_KEYS} for name in POSITION_NAMES_V21},
+            postflop_profit_by_stage={stage: 0.0 for stage in ("all_hands", "flop_seen", "turn_seen", "river_seen", "showdown_seen")},
+        )
 
     def train_for_traversals(self, num_traversals: int) -> TrainingSnapshot:
-        status = "Training"
         requested = max(1, int(num_traversals))
-        workers = self._effective_rollout_workers()
-        min_parallel = max(2, workers * 2)
-        if self.config.parallel_rollouts and workers > 1 and requested >= min_parallel:
-            self._run_parallel_traversals(requested)
-        else:
-            self._run_sequential_traversals(requested)
-
-        self._refresh_snapshot(status=status)
+        self._chunk_learner_steps = 0
+        self._chunk_regret_steps = 0
+        self._chunk_strategy_steps = 0
+        self._chunk_advantage_samples = 0
+        self._chunk_strategy_samples = 0
+        remaining = requested
+        self.config.live_node_store = self.node_store
+        self.config.current_iteration = self._outer_iteration
+        while remaining > 0:
+            seat = self._next_seat % self.config.num_players
+            self._next_seat += 1
+            seat_target = min(int(self.config.traversals_per_player_per_iteration), remaining)
+            self.config.current_iteration = self._outer_iteration
+            batch_deltas = self._run_parallel_seat_batch(seat, seat_target)
+            remaining -= seat_target
+            self._outer_iteration += 1
+            self.learner_steps = self._outer_iteration
+            discount_applied = self._maybe_discount_tables()
+            self._advance_worker_snapshot_version(batch_deltas, force_full_resync=bool(discount_applied or batch_deltas is None))
+            self._chunk_strategy_steps += 1
+            if seat_target > 0:
+                self._actor_snapshot_dirty = True
+        append_checkpoint = bool(self.traversals_completed > 0 and self.traversals_completed % max(1, int(self.config.checkpoint_interval)) == 0)
+        self._ensure_actor_snapshot_current(append_checkpoint=append_checkpoint)
+        self._refresh_snapshot("Training")
         return self.get_snapshot()
 
     def train_forever(self, stop_event, pause_event, snapshot_callback=None) -> None:
-        self._refresh_snapshot(status="Training")
+        self._refresh_snapshot("Training")
         while not stop_event.is_set():
             if pause_event.is_set():
-                self._refresh_snapshot(status="Paused")
+                self._refresh_snapshot("Paused")
                 time.sleep(0.1)
                 continue
             snapshot = self.train_for_traversals(self.config.traversals_per_chunk)
             if snapshot_callback is not None:
                 snapshot_callback(snapshot)
-        self._refresh_snapshot(status="Stopped")
-
-    def _synthetic_style_for_eval_hand(self, mode: str, hand_idx: int, total_hands: int) -> str:
-        normalized = str(mode or "").strip().lower()
-        if normalized in SYNTHETIC_OPPONENT_STYLES:
-            return normalized
-        if normalized != "leak_pool":
-            return ""
-
-        styles = self._synthetic_style_candidates()
-        if not styles:
-            return ""
-        hands_per_style = max(1, int(math.ceil(max(1, int(total_hands)) / float(len(styles)))))
-        style_idx = min(len(styles) - 1, int(hand_idx // hands_per_style))
-        return str(styles[style_idx])
+        self._refresh_snapshot("Stopped")
 
     def _evaluate(self, mode: str, num_hands: int) -> EvaluationReport:
         start = time.time()
-        action_hist = np.zeros(self.config.action_count, dtype=np.int64)
-        total_profit = 0.0
-        wins = 0
-        illegal_action_count = 0
-        position_profit = {seat: [] for seat in range(self.config.num_players)}
-        vpip_count = 0
-        pfr_count = 0
-        three_bet_count = 0
-        vpip_attempts = {seat: 0 for seat in range(self.config.num_players)}
-        pfr_attempts = {seat: 0 for seat in range(self.config.num_players)}
-        three_bet_attempts = {seat: 0 for seat in range(self.config.num_players)}
-        vpip_opportunities = {seat: 0 for seat in range(self.config.num_players)}
-        hand_counts = np.zeros((13, 13), dtype=np.int64)
-        hand_vpip_hits = np.zeros((13, 13), dtype=np.int64)
-        hand_pfr_hits = np.zeros((13, 13), dtype=np.int64)
-        hand_three_bet_hits = np.zeros((13, 13), dtype=np.int64)
-        position_hand_counts = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
-        position_hand_vpip_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
-        position_hand_pfr_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
-        position_hand_three_bet_hits = {seat: np.zeros((13, 13), dtype=np.int64) for seat in range(self.config.num_players)}
-
-        eval_config = replace(self.config)
-        eval_config.opponent_profile = OPPONENT_PROFILE_DEFAULT_V24
-        eval_config.opponent_profiles_by_seat = {}
-        eval_config.opponent_policy_mode = "snapshot"
-        eval_config.synthetic_opponent_style = ""
-        eval_mode = "heuristics"
-        checkpoint_pool: tuple = tuple()
-        if mode == "checkpoints":
-            eval_mode = "checkpoints"
-            checkpoint_pool = tuple(self.checkpoint_pool[:-1] or [self.actor_snapshot])
-        elif mode == "v21_table":
-            if self._v21_seed_template is None:
-                raise RuntimeError(
-                    "v21 evaluation checkpoint could not be loaded. "
-                    "Check DeepCFRConfig.seed_v21_checkpoint_path."
-                )
-            eval_mode = "checkpoints"
-            checkpoint_pool = (self._v21_seed_template.clone_cpu(),)
-        elif str(mode).strip().lower() in SYNTHETIC_OPPONENT_STYLES or str(mode).strip().lower() == "leak_pool":
-            eval_mode = "synthetic"
-
-        eval_config.evaluation_mode = eval_mode
-        eval_config.checkpoint_pool = checkpoint_pool
-        total_eval_hands = max(1, int(num_hands))
-        eval_opponent_profiles: Dict[str, Dict[str, float]] = {}
-
-        for hand_idx in range(total_eval_hands):
-            eval_config.eval_hero_seat = hand_idx % self.config.num_players
-            synthetic_style = self._synthetic_style_for_eval_hand(mode, hand_idx, total_eval_hands)
-            if synthetic_style:
-                eval_key = f"synthetic_{synthetic_style}"
-                eval_config.evaluation_mode = "synthetic"
-                eval_config.synthetic_opponent_style = synthetic_style
-                eval_config.opponent_profiles_by_seat = self._opponent_profiles_by_seat_from_store(
-                    eval_opponent_profiles,
-                    eval_key,
-                )
-            else:
-                eval_key = ""
-                eval_config.evaluation_mode = eval_mode
-                eval_config.synthetic_opponent_style = ""
-                eval_config.opponent_profiles_by_seat = {}
-            seed = int(self._seed_rng.integers(0, 2**31 - 1))
-            hand = run_policy_hand(seed, self.actor_snapshot, eval_config)
-            if eval_key:
-                self._update_opponent_profile_from_result_store(eval_opponent_profiles, eval_key, hand)
-            total_profit += float(hand.hero_profit_bb)
-            action_hist += hand.action_counts
-            illegal_action_count += int(hand.illegal_action_count)
-            wins += 1 if hand.win else 0
-            position_profit[hand.hero_seat].append(float(hand.hero_profit_bb))
-            vpip_count += 1 if hand.vpip else 0
-            pfr_count += 1 if hand.pfr else 0
-            three_bet_count += 1 if hand.three_bet else 0
-            vpip_attempts[hand.hero_seat] += 1 if hand.vpip else 0
-            pfr_attempts[hand.hero_seat] += 1 if hand.pfr else 0
-            three_bet_attempts[hand.hero_seat] += 1 if hand.three_bet else 0
-            vpip_opportunities[hand.hero_seat] += 1
-            if hand.hero_hand_key:
-                key = hand.hero_hand_key
-                if len(key) >= 2:
-                    rank_a = key[0]
-                    rank_b = key[1]
-                    if rank_a in RANK_ORDER_HIGH_TO_LOW and rank_b in RANK_ORDER_HIGH_TO_LOW:
-                        idx_a = RANK_ORDER_HIGH_TO_LOW.index(rank_a)
-                        idx_b = RANK_ORDER_HIGH_TO_LOW.index(rank_b)
-                        if len(key) == 2:
-                            row, col = idx_a, idx_b
-                        elif key.endswith("s"):
-                            row, col = min(idx_a, idx_b), max(idx_a, idx_b)
-                        else:
-                            row, col = max(idx_a, idx_b), min(idx_a, idx_b)
-                        seat = int(hand.hero_seat)
-                        hand_counts[row, col] += 1
-                        position_hand_counts[seat][row, col] += 1
-                        if hand.vpip:
-                            hand_vpip_hits[row, col] += 1
-                            position_hand_vpip_hits[seat][row, col] += 1
-                        if hand.pfr:
-                            hand_pfr_hits[row, col] += 1
-                            position_hand_pfr_hits[seat][row, col] += 1
-                        if hand.three_bet:
-                            hand_three_bet_hits[row, col] += 1
-                            position_hand_three_bet_hits[seat][row, col] += 1
-
-        position_stats = {}
-        for seat, values in position_profit.items():
-            position_stats[POSITION_NAMES_V21[seat]] = float(np.mean(values)) if values else 0.0
-
-        vpip_pos_stats = {}
-        pfr_pos_stats = {}
-        three_bet_pos_stats = {}
-        for seat in range(self.config.num_players):
-            denom = max(1, vpip_opportunities[seat])
-            vpip_pos_stats[POSITION_NAMES_V21[seat]] = float(vpip_attempts[seat] / denom)
-            pfr_pos_stats[POSITION_NAMES_V21[seat]] = float(pfr_attempts[seat] / denom)
-            three_bet_pos_stats[POSITION_NAMES_V21[seat]] = float(three_bet_attempts[seat] / denom)
-
-        vpip_hand_grid = np.zeros((13, 13), dtype=np.float32)
-        pfr_hand_grid = np.zeros((13, 13), dtype=np.float32)
-        three_bet_hand_grid = np.zeros((13, 13), dtype=np.float32)
-        nonzero = hand_counts > 0
-        vpip_hand_grid[nonzero] = hand_vpip_hits[nonzero] / hand_counts[nonzero]
-        pfr_hand_grid[nonzero] = hand_pfr_hits[nonzero] / hand_counts[nonzero]
-        three_bet_hand_grid[nonzero] = hand_three_bet_hits[nonzero] / hand_counts[nonzero]
-
-        vpip_hand_grid_by_position: Dict[str, List[List[float]]] = {}
-        pfr_hand_grid_by_position: Dict[str, List[List[float]]] = {}
-        three_bet_hand_grid_by_position: Dict[str, List[List[float]]] = {}
-        for seat in range(self.config.num_players):
-            seat_name = POSITION_NAMES_V21[seat]
-            seat_counts = position_hand_counts[seat]
-            seat_nonzero = seat_counts > 0
-
-            seat_vpip = np.zeros((13, 13), dtype=np.float32)
-            seat_pfr = np.zeros((13, 13), dtype=np.float32)
-            seat_three_bet = np.zeros((13, 13), dtype=np.float32)
-            seat_vpip[seat_nonzero] = position_hand_vpip_hits[seat][seat_nonzero] / seat_counts[seat_nonzero]
-            seat_pfr[seat_nonzero] = position_hand_pfr_hits[seat][seat_nonzero] / seat_counts[seat_nonzero]
-            seat_three_bet[seat_nonzero] = position_hand_three_bet_hits[seat][seat_nonzero] / seat_counts[seat_nonzero]
-
-            vpip_hand_grid_by_position[seat_name] = seat_vpip.tolist()
-            pfr_hand_grid_by_position[seat_name] = seat_pfr.tolist()
-            three_bet_hand_grid_by_position[seat_name] = seat_three_bet.tolist()
-
-        return EvaluationReport(
-            mode=mode,
-            hands=max(1, int(num_hands)),
-            avg_profit_bb=float(total_profit / max(1, int(num_hands))),
-            win_rate=float(wins / max(1, int(num_hands))),
-            vpip=float(vpip_count / max(1, int(num_hands))),
-            pfr=float(pfr_count / max(1, int(num_hands))),
-            three_bet=float(three_bet_count / max(1, int(num_hands))),
-            illegal_action_count=illegal_action_count,
-            runtime_seconds=float(time.time() - start),
-            action_histogram=action_hist.astype(int).tolist(),
-            position_avg_profit_bb=position_stats,
-            vpip_by_position=vpip_pos_stats,
-            pfr_by_position=pfr_pos_stats,
-            three_bet_by_position=three_bet_pos_stats,
-            vpip_hand_grid=vpip_hand_grid.tolist(),
-            pfr_hand_grid=pfr_hand_grid.tolist(),
-            three_bet_hand_grid=three_bet_hand_grid.tolist(),
-            vpip_hand_grid_by_position=vpip_hand_grid_by_position,
-            pfr_hand_grid_by_position=pfr_hand_grid_by_position,
-            three_bet_hand_grid_by_position=three_bet_hand_grid_by_position,
-        )
+        self._ensure_actor_snapshot_current()
+        eval_config = self._build_eval_config(mode)
+        hand_results = self._collect_evaluation_hands(num_hands, eval_config)
+        return self._build_evaluation_report(mode, hand_results, time.time() - start)
 
     def evaluate_vs_heuristics(self, num_hands: int) -> EvaluationReport:
         return self._evaluate("heuristics", num_hands)
+
+    def evaluate_self_play(self, num_hands: int) -> EvaluationReport:
+        return self._evaluate("self_play", num_hands)
+
+    def evaluate_network_only(self, num_hands: int) -> EvaluationReport:
+        return self._evaluate("self_play", num_hands)
 
     def evaluate_vs_checkpoint_pool(self, num_hands: int) -> EvaluationReport:
         return self._evaluate("checkpoints", num_hands)
 
     def evaluate_vs_v21_table(self, num_hands: int) -> EvaluationReport:
-        return self._evaluate("v21_table", num_hands)
+        raise RuntimeError("Legacy v21 table evaluation was removed from v24.")
 
     def evaluate_vs_leak_pool(self, num_hands: int) -> EvaluationReport:
-        return self._evaluate("leak_pool", num_hands)
+        return self._evaluate("synthetic", num_hands)
 
     def evaluate_vs_synthetic_style(self, style: str, num_hands: int) -> EvaluationReport:
-        normalized = str(style or "").strip().lower()
-        if normalized not in SYNTHETIC_OPPONENT_STYLES:
-            raise ValueError(f"Unknown synthetic opponent style: {style}")
-        return self._evaluate(normalized, num_hands)
+        return self._evaluate(str(style or "").strip().lower(), num_hands)
 
-    def evaluate_exploit_suite(self, num_hands: int) -> ExploitSuiteReport:
+    def evaluate_eval_suite(self, num_hands: int) -> ExploitSuiteReport:
         hands = max(1, int(num_hands))
-        leak_reports: Dict[str, EvaluationReport] = {}
-        for style in self._synthetic_style_candidates():
-            leak_reports[str(style)] = self.evaluate_vs_synthetic_style(style, hands)
-
-        robust_reports: Dict[str, EvaluationReport] = {
+        leak_reports = {style: self.evaluate_vs_synthetic_style(style, hands) for style in SYNTHETIC_OPPONENT_STYLES}
+        robust_reports = {
             "heuristics": self.evaluate_vs_heuristics(hands),
             "checkpoints": self.evaluate_vs_checkpoint_pool(hands),
         }
-        if self._v21_seed_template is not None:
-            robust_reports["v21_table"] = self.evaluate_vs_v21_table(hands)
-
-        leak_profit = [report.avg_profit_bb for report in leak_reports.values()]
-        robust_profit = [report.avg_profit_bb for report in robust_reports.values()]
-        leak_win_rates = [report.win_rate for report in leak_reports.values()]
-        robust_win_rates = [report.win_rate for report in robust_reports.values()]
-
         return ExploitSuiteReport(
             hands_per_mode=hands,
             leak_reports=leak_reports,
             robust_reports=robust_reports,
-            avg_leak_profit_bb=float(np.mean(leak_profit)) if leak_profit else 0.0,
-            avg_robust_profit_bb=float(np.mean(robust_profit)) if robust_profit else 0.0,
-            avg_leak_win_rate=float(np.mean(leak_win_rates)) if leak_win_rates else 0.0,
-            avg_robust_win_rate=float(np.mean(robust_win_rates)) if robust_win_rates else 0.0,
+            avg_leak_profit_bb=float(np.mean([report.avg_profit_bb for report in leak_reports.values()])) if leak_reports else 0.0,
+            avg_robust_profit_bb=float(np.mean([report.avg_profit_bb for report in robust_reports.values()])) if robust_reports else 0.0,
+            avg_leak_win_rate=float(np.mean([report.win_rate for report in leak_reports.values()])) if leak_reports else 0.0,
+            avg_robust_win_rate=float(np.mean([report.win_rate for report in robust_reports.values()])) if robust_reports else 0.0,
+            suite_name="eval_suite",
+        )
+
+    def evaluate_exploit_suite(self, num_hands: int) -> ExploitSuiteReport:
+        hands = max(1, int(num_hands))
+        leak_reports = {style: self.evaluate_vs_synthetic_style(style, hands) for style in SYNTHETIC_OPPONENT_STYLES}
+        robust_reports = {
+            "heuristics": self.evaluate_vs_heuristics(hands),
+            "self_play": self.evaluate_self_play(hands),
+            "checkpoints": self.evaluate_vs_checkpoint_pool(hands),
+        }
+        return ExploitSuiteReport(
+            hands_per_mode=hands,
+            leak_reports=leak_reports,
+            robust_reports=robust_reports,
+            avg_leak_profit_bb=float(np.mean([report.avg_profit_bb for report in leak_reports.values()])) if leak_reports else 0.0,
+            avg_robust_profit_bb=float(np.mean([report.avg_profit_bb for report in robust_reports.values()])) if robust_reports else 0.0,
+            avg_leak_win_rate=float(np.mean([report.win_rate for report in leak_reports.values()])) if leak_reports else 0.0,
+            avg_robust_win_rate=float(np.mean([report.win_rate for report in robust_reports.values()])) if robust_reports else 0.0,
+            suite_name="exploit_suite",
         )
 
     def save_checkpoint(self, path: str) -> None:
+        self._ensure_actor_snapshot_current()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
-            "model_state_dict": self.model.state_dict(),
-            "regret_optimizer": self.regret_optimizer.state_dict(),
-            "strategy_optimizer": self.strategy_optimizer.state_dict(),
-            "exploit_optimizer": self.exploit_optimizer.state_dict(),
+            "format_version": "tabular_mccfr_v24",
             "config": asdict(self.config),
-            "opponent_profiles": copy.deepcopy(self._opponent_profiles),
+            "node_store": serialize_node_store(self.node_store),
+            "actor_snapshot": self.actor_snapshot.to_payload(),
+            "checkpoint_pool": [snapshot.to_payload() for snapshot in self.checkpoint_pool],
             "metrics": {
                 "traversals_completed": self.traversals_completed,
                 "traverser_decisions": self.traverser_decisions,
                 "learner_steps": self.learner_steps,
-                "regret_steps": self.regret_steps,
-                "strategy_steps": self.strategy_steps,
-                "exploit_steps": self.exploit_steps,
                 "invalid_state_count": self.invalid_state_count,
                 "invalid_action_count": self.invalid_action_count,
-                "last_regret_loss": self._last_regret_loss,
-                "last_strategy_loss": self._last_strategy_loss,
-                "last_exploit_loss": self._last_exploit_loss,
+                "outer_iteration": self._outer_iteration,
+                "next_seat": self._next_seat,
+                "last_discount_factor": self._last_discount_factor,
             },
         }
         torch.save(payload, path)
 
     def load_checkpoint(self, path: str) -> None:
-        payload = torch.load(path, map_location=self.device)
-        load_compatible_state_dict(self.model, payload["model_state_dict"])
-        self.regret_optimizer.load_state_dict(payload["regret_optimizer"])
-        if "strategy_optimizer" in payload:
-            self.strategy_optimizer.load_state_dict(payload["strategy_optimizer"])
-        if "exploit_optimizer" in payload:
-            self.exploit_optimizer.load_state_dict(payload["exploit_optimizer"])
-
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or str(payload.get("format_version", "")) != "tabular_mccfr_v24":
+            raise RuntimeError("Checkpoint is incompatible with the tabular MCCFR v24 format.")
+        config_payload = payload.get("config", {})
+        if isinstance(config_payload, dict):
+            for key, value in config_payload.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+        if str(getattr(self.config, "algorithm_name", "")) == "tabular_mccfr_6max":
+            self.config.parallel_rollouts = True
+            self.config.rollout_workers = max(int(getattr(self.config, "rollout_workers", 1)), self._default_rollout_workers())
+            self.config.rollout_worker_chunk_size = max(8, int(getattr(self.config, "rollout_worker_chunk_size", 1)))
+        self.node_store = deserialize_node_store(payload.get("node_store", {}))
+        actor_snapshot_payload = payload.get("actor_snapshot")
+        self.actor_snapshot = (
+            TabularPolicySnapshot.from_payload(actor_snapshot_payload)
+            if isinstance(actor_snapshot_payload, dict)
+            else freeze_policy_snapshot(self.node_store, {"traversals_completed": 0, "iteration": 0})
+        )
+        self._actor_snapshot_dirty = False
+        pool_payload = payload.get("checkpoint_pool", [])
+        self.checkpoint_pool = [
+            TabularPolicySnapshot.from_payload(snapshot_payload)
+            for snapshot_payload in pool_payload
+            if isinstance(snapshot_payload, dict)
+        ]
+        if not self.checkpoint_pool:
+            self.checkpoint_pool = [copy.deepcopy(self.actor_snapshot)]
         metrics = payload.get("metrics", {})
-        self.traversals_completed = int(metrics.get("traversals_completed", self.traversals_completed))
-        self.traverser_decisions = int(metrics.get("traverser_decisions", self.traverser_decisions))
-        self.learner_steps = int(metrics.get("learner_steps", self.learner_steps))
-        self.regret_steps = int(metrics.get("regret_steps", self.regret_steps))
-        self.strategy_steps = int(metrics.get("strategy_steps", self.strategy_steps))
-        self.exploit_steps = int(metrics.get("exploit_steps", self.exploit_steps))
-        self.invalid_state_count = int(metrics.get("invalid_state_count", self.invalid_state_count))
-        self.invalid_action_count = int(metrics.get("invalid_action_count", self.invalid_action_count))
-        self._last_regret_loss = float(metrics.get("last_regret_loss", self._last_regret_loss))
-        self._last_strategy_loss = float(metrics.get("last_strategy_loss", self._last_strategy_loss))
-        self._last_exploit_loss = float(metrics.get("last_exploit_loss", self._last_exploit_loss))
-        loaded_profiles = payload.get("opponent_profiles", {})
-        if isinstance(loaded_profiles, dict):
-            cleaned_profiles: Dict[str, Dict[str, float]] = {}
-            for key, value in loaded_profiles.items():
-                if not isinstance(value, dict):
-                    continue
-                cleaned_profiles[str(key)] = {
-                    str(metric): float(metric_value) for metric, metric_value in value.items()
-                }
-            self._opponent_profiles = cleaned_profiles
-
-        self.actor_snapshot = self.model.clone_cpu()
-        checkpoint_interval = max(0, int(getattr(self.config, "checkpoint_interval", 0)))
-        self._next_checkpoint_traverser_decisions = checkpoint_interval if checkpoint_interval > 0 else 0
-        while checkpoint_interval > 0 and self._next_checkpoint_traverser_decisions <= self.traverser_decisions:
-            self._next_checkpoint_traverser_decisions += checkpoint_interval
-        self._reset_checkpoint_pool()
-        self._sync_gpu_rollout_registry()
-        self._refresh_snapshot(status="Loaded")
+        self.traversals_completed = int(metrics.get("traversals_completed", 0))
+        self.traverser_decisions = int(metrics.get("traverser_decisions", 0))
+        self.learner_steps = int(metrics.get("learner_steps", 0))
+        self.invalid_state_count = int(metrics.get("invalid_state_count", 0))
+        self.invalid_action_count = int(metrics.get("invalid_action_count", 0))
+        self._outer_iteration = int(metrics.get("outer_iteration", 0))
+        self._next_seat = int(metrics.get("next_seat", 0))
+        self._last_discount_factor = float(metrics.get("last_discount_factor", 1.0))
+        self._node_store_version = 0
+        self._worker_update_payload = None
+        self.config.current_iteration = self._outer_iteration
+        self.config.live_node_store = self.node_store
+        for window in (
+            self._recent_utilities,
+            self._recent_actions,
+            self._recent_preflop_actions,
+            self._recent_postflop_actions,
+            self._recent_vpip,
+            self._recent_pfr,
+            self._recent_three_bet,
+            self._recent_prejam,
+            self._recent_flop_seen,
+            self._recent_actions_per_hand,
+            self._recent_preflop_actions_per_hand,
+        ):
+            window.clear()
+        for window in self._position_profit_windows.values():
+            window.clear()
+        self._conditioned_counts = _new_postflop_conditioned_counts()
+        self._cumulative_perf = {key: 0.0 for key in self._cumulative_perf}
+        self._refresh_snapshot("Loaded")
 
     def get_snapshot(self) -> TrainingSnapshot:
-        with self._lock:
-            return copy.deepcopy(self._snapshot)
+        return copy.deepcopy(self._snapshot)
 
     def shutdown(self) -> None:
-        executor = self._rollout_executor
-        self._rollout_executor = None
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=False)
-        if self._gpu_rollout_service is not None:
-            self._gpu_rollout_service.stop()
-            self._gpu_rollout_service = None
-        self._gpu_registered_model_keys.clear()
+        if self._rollout_executor is not None:
+            self._rollout_executor.shutdown(wait=False, cancel_futures=True)
+            self._rollout_executor = None
+        self._invalidate_worker_snapshot_sync()
+        return None
 
 
-# Backward-compatible alias for any legacy imports.
 DeepCFRTrainerV21 = DeepCFRTrainerV24
-
-

@@ -14,192 +14,222 @@ FEATURES_DIR = os.path.join(SRC_ROOT, "features")
 if FEATURES_DIR not in sys.path:
     sys.path.insert(0, FEATURES_DIR)
 
-from poker_state_v24 import ACTION_COUNT_V24, STATE_DIM_V24
+from poker_state_v24 import ACTION_COUNT_V24, PUBLIC_BELIEF_STATE_DIM_V24, STATE_DIM_V24
 
 
-class ResidualBlock(nn.Module):
+class MLPBlock(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.relu = nn.ReLU()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        x = x + residual
-        return self.relu(x)
+        return x + self.net(x)
 
 
-class PokerDeepCFRNet(nn.Module):
+class _BasePokerNet(nn.Module):
     def __init__(
         self,
-        state_dim: int = STATE_DIM_V24,
-        hidden_dim: int = 256,
-        action_dim: int = ACTION_COUNT_V24,
+        state_dim: int,
+        hidden_dim: int,
+        action_dim: int,
+        head_name: str,
         init_weights: bool = True,
     ):
         super().__init__()
-        self.state_dim = state_dim
-        self.hidden_dim = hidden_dim
-        self.action_dim = action_dim
-
-        self.input_layer = nn.Linear(state_dim, hidden_dim)
-        self.input_relu = nn.ReLU()
-        self.block1 = ResidualBlock(hidden_dim)
-        self.block2 = ResidualBlock(hidden_dim)
-        self.block3 = ResidualBlock(hidden_dim)
-
-        self.regret_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim),
+        self.state_dim = int(state_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.action_dim = int(action_dim)
+        self.input_layer = nn.Linear(self.state_dim, self.hidden_dim)
+        self.input_activation = nn.GELU()
+        self.block1 = MLPBlock(self.hidden_dim)
+        self.block2 = MLPBlock(self.hidden_dim)
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+        head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim // 2, self.action_dim),
         )
-        self.strategy_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim),
-        )
-        self.exploit_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim),
-        )
-
+        setattr(self, head_name, head)
+        self._head_name = head_name
         if init_weights:
             self.apply(self._init_weights)
 
-    def _init_weights(self, module: nn.Module) -> None:
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             nn.init.orthogonal_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def _forward_trunk(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_relu(self.input_layer(x))
+        x = self.input_activation(self.input_layer(x))
         x = self.block1(x)
         x = self.block2(x)
-        x = self.block3(x)
-        return x
+        return self.output_norm(x)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        trunk = self._forward_trunk(x)
-        return {
-            "regret": self.regret_head(trunk),
-            "strategy": self.strategy_head(trunk),
-            "exploit": self.exploit_head(trunk),
-        }
+    def _head(self) -> nn.Sequential:
+        return getattr(self, self._head_name)
 
-    def forward_regret(self, x: torch.Tensor) -> torch.Tensor:
-        return self.regret_head(self._forward_trunk(x))
-
-    def forward_strategy(self, x: torch.Tensor) -> torch.Tensor:
-        return self.strategy_head(self._forward_trunk(x))
-
-    def forward_exploit(self, x: torch.Tensor) -> torch.Tensor:
-        return self.exploit_head(self._forward_trunk(x))
-
-    def clone_cpu(self) -> "PokerDeepCFRNet":
-        snapshot = PokerDeepCFRNet(
+    def clone_cpu(self):
+        clone = self.__class__(
             state_dim=self.state_dim,
             hidden_dim=self.hidden_dim,
             action_dim=self.action_dim,
             init_weights=False,
         )
-        snapshot.load_state_dict(copy.deepcopy(self.state_dict()))
-        snapshot.eval()
-        snapshot.to("cpu")
-        for param in snapshot.parameters():
-            param.requires_grad = False
-        return snapshot
+        clone.load_state_dict(copy.deepcopy(self.state_dict()))
+        clone.eval()
+        clone.to("cpu")
+        for param in clone.parameters():
+            param.requires_grad_(False)
+        return clone
 
 
-def _map_action_head_tensor(target_tensor: torch.Tensor, source_tensor: torch.Tensor) -> Optional[torch.Tensor]:
-    if source_tensor.ndim not in (1, 2) or target_tensor.ndim != source_tensor.ndim:
-        return None
-    if int(source_tensor.shape[0]) != 5 or int(target_tensor.shape[0]) != ACTION_COUNT_V24:
-        return None
-    if source_tensor.ndim == 2 and int(source_tensor.shape[1]) != int(target_tensor.shape[1]):
-        return None
+class PokerDeepCFRNet(_BasePokerNet):
+    def __init__(
+        self,
+        state_dim: int = STATE_DIM_V24,
+        hidden_dim: int = 160,
+        action_dim: int = ACTION_COUNT_V24,
+        init_weights: bool = True,
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            hidden_dim=hidden_dim,
+            action_dim=action_dim,
+            head_name="strategy_head",
+            init_weights=init_weights,
+        )
 
-    mapped = torch.zeros_like(target_tensor)
-    source = source_tensor.to(device=mapped.device, dtype=mapped.dtype)
-    row_map = {
-        0: (0,),
-        1: (1,),
-        2: (2,),
-        3: (3, 4, 5),
-        4: (6, 7, 8, 9, 10),
-    }
-    for source_idx, target_indices in row_map.items():
-        for target_idx in target_indices:
-            mapped[target_idx].copy_(source[source_idx])
-    return mapped
+    @property
+    def policy_head(self) -> nn.Sequential:
+        return self.strategy_head
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {"strategy": self.forward_strategy(x)}
+
+    def forward_strategy(self, x: torch.Tensor) -> torch.Tensor:
+        return self.strategy_head(self._forward_trunk(x))
+
+    def forward_regret(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_strategy(x)
+
+    def forward_postflop_value(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_strategy(x)
+
+    def forward_exploit(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_strategy(x)
 
 
-def _map_input_weight(target_tensor: torch.Tensor, source_tensor: torch.Tensor) -> Optional[torch.Tensor]:
-    if target_tensor.ndim != 2 or source_tensor.ndim != 2:
-        return None
-    if int(target_tensor.shape[0]) != int(source_tensor.shape[0]):
-        return None
+class AdvantageNet(_BasePokerNet):
+    def __init__(
+        self,
+        state_dim: int = STATE_DIM_V24,
+        hidden_dim: int = 160,
+        action_dim: int = ACTION_COUNT_V24,
+        init_weights: bool = True,
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            hidden_dim=hidden_dim,
+            action_dim=action_dim,
+            head_name="regret_head",
+            init_weights=init_weights,
+        )
 
-    mapped = torch.zeros_like(target_tensor)
-    source = source_tensor.to(device=mapped.device, dtype=mapped.dtype)
-    cols = min(int(target_tensor.shape[1]), int(source_tensor.shape[1]))
-    mapped[:, :cols] = source[:, :cols]
-    return mapped
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {"regret": self.forward_regret(x)}
+
+    def forward_regret(self, x: torch.Tensor) -> torch.Tensor:
+        return self.regret_head(self._forward_trunk(x))
 
 
-def _mapped_tensor_for_model(key: str, target_tensor: torch.Tensor, source_tensor: torch.Tensor) -> Optional[torch.Tensor]:
-    if target_tensor.shape == source_tensor.shape:
-        return source_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
-    if key == "input_layer.weight":
-        return _map_input_weight(target_tensor, source_tensor)
-    if key.endswith(".2.weight") or key.endswith(".2.bias"):
-        return _map_action_head_tensor(target_tensor, source_tensor)
-    return None
+class PokerLeafValueNet(nn.Module):
+    def __init__(
+        self,
+        state_dim: int = PUBLIC_BELIEF_STATE_DIM_V24,
+        hidden_dim: int = 96,
+        init_weights: bool = True,
+    ):
+        super().__init__()
+        self.state_dim = int(state_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_layer = nn.Linear(self.state_dim, self.hidden_dim)
+        self.activation = nn.GELU()
+        self.block1 = MLPBlock(self.hidden_dim)
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim // 2, 1),
+        )
+        if init_weights:
+            self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _forward_trunk(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.activation(self.input_layer(x))
+        return self.block1(x)
+
+    def forward_value(self, x: torch.Tensor) -> torch.Tensor:
+        return self.value_head(self._forward_trunk(x)).squeeze(-1)
+
+    def clone_cpu(self) -> "PokerLeafValueNet":
+        clone = PokerLeafValueNet(
+            state_dim=self.state_dim,
+            hidden_dim=self.hidden_dim,
+            init_weights=False,
+        )
+        clone.load_state_dict(copy.deepcopy(self.state_dict()))
+        clone.eval()
+        clone.to("cpu")
+        for param in clone.parameters():
+            param.requires_grad_(False)
+        return clone
 
 
 def load_compatible_state_dict(model: PokerDeepCFRNet, state_dict: Dict[str, torch.Tensor]) -> None:
-    model_state = model.state_dict()
-    compatible_state: Dict[str, torch.Tensor] = {}
-    missing: list[str] = []
-    unexpected: list[str] = []
-
-    for key, target_tensor in model_state.items():
-        source_tensor = state_dict.get(key)
-        if source_tensor is None:
-            if str(key).startswith("exploit_head."):
-                compatible_state[key] = torch.zeros_like(target_tensor)
-            else:
-                missing.append(key)
-            continue
-
-        mapped = _mapped_tensor_for_model(key, target_tensor, source_tensor)
-        if mapped is None:
-            if str(key).startswith("exploit_head."):
-                compatible_state[key] = torch.zeros_like(target_tensor)
-            else:
-                missing.append(key)
-            continue
-        compatible_state[key] = mapped
-
-    for key in state_dict.keys():
-        if key not in model_state and not str(key).startswith("exploit_head."):
-            unexpected.append(str(key))
-
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    unexpected = [key for key in incompatible.unexpected_keys if not key.startswith("regret_head")]
+    missing = [key for key in incompatible.missing_keys if not key.startswith("regret_head")]
     if missing or unexpected:
-        missing_text = ", ".join(missing) if missing else "-"
-        unexpected_text = ", ".join(unexpected) if unexpected else "-"
         raise RuntimeError(
             "Incompatible checkpoint for PokerDeepCFRNet "
-            f"(missing: {missing_text}; unexpected: {unexpected_text})"
+            f"(missing: {', '.join(missing) if missing else '-'}; "
+            f"unexpected: {', '.join(unexpected) if unexpected else '-'})"
         )
 
-    model.load_state_dict(compatible_state, strict=False)
+
+def load_compatible_advantage_state_dict(model: AdvantageNet, state_dict: Dict[str, torch.Tensor]) -> None:
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    unexpected = [key for key in incompatible.unexpected_keys if not key.startswith("strategy_head")]
+    missing = [key for key in incompatible.missing_keys if not key.startswith("strategy_head")]
+    if missing or unexpected:
+        raise RuntimeError(
+            "Incompatible checkpoint for AdvantageNet "
+            f"(missing: {', '.join(missing) if missing else '-'}; "
+            f"unexpected: {', '.join(unexpected) if unexpected else '-'})"
+        )
+
+
+def load_compatible_leaf_value_state_dict(model: PokerLeafValueNet, state_dict: Dict[str, torch.Tensor]) -> None:
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Incompatible checkpoint for PokerLeafValueNet "
+            f"(missing: {', '.join(incompatible.missing_keys) if incompatible.missing_keys else '-'}; "
+            f"unexpected: {', '.join(incompatible.unexpected_keys) if incompatible.unexpected_keys else '-'})"
+        )
 
 
 def _normalize_legal_mask(legal_mask: np.ndarray) -> np.ndarray:
@@ -207,12 +237,36 @@ def _normalize_legal_mask(legal_mask: np.ndarray) -> np.ndarray:
     if mask.shape[0] != ACTION_COUNT_V24:
         raise ValueError(f"Expected legal mask of length {ACTION_COUNT_V24}, got {mask.shape}")
     mask = np.where(mask > 0.5, 1.0, 0.0).astype(np.float32)
-    if mask.sum() <= 0.0:
+    if float(mask.sum()) <= 0.0:
         mask[:] = 1.0
     return mask
 
 
-def regret_matching(logits: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
+def _default_safe_policy(mask: np.ndarray) -> np.ndarray:
+    probs = np.zeros_like(mask, dtype=np.float32)
+    if mask.shape[0] > 1 and mask[1] > 0.5:
+        probs[1] = 1.0
+    elif mask.shape[0] > 2 and mask[2] > 0.5:
+        probs[2] = 0.7
+        if mask.shape[0] > 0 and mask[0] > 0.5:
+            probs[0] = 0.3
+        else:
+            probs[2] = 1.0
+    elif mask.shape[0] > 0 and mask[0] > 0.5:
+        probs[0] = 1.0
+    else:
+        probs = mask.copy()
+    total = float(probs.sum())
+    if total <= 1e-8:
+        return (mask / float(mask.sum())).astype(np.float32)
+    return (probs / total).astype(np.float32)
+
+
+def regret_matching(
+    logits: np.ndarray,
+    legal_mask: np.ndarray,
+    fallback_policy: Optional[np.ndarray] = None,
+) -> np.ndarray:
     logits = np.asarray(logits, dtype=np.float32).reshape(-1)
     if logits.shape[0] != ACTION_COUNT_V24:
         raise ValueError(f"Expected logits of length {ACTION_COUNT_V24}, got {logits.shape}")
@@ -220,8 +274,14 @@ def regret_matching(logits: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
     regrets = np.maximum(logits, 0.0) * mask
     total = float(regrets.sum())
     if total <= 1e-8:
-        probs = mask / float(mask.sum())
-        return probs.astype(np.float32)
+        if fallback_policy is None:
+            return _default_safe_policy(mask)
+        fallback = np.asarray(fallback_policy, dtype=np.float32).reshape(-1)
+        fallback = fallback * mask
+        denom = float(fallback.sum())
+        if denom <= 1e-8:
+            return _default_safe_policy(mask)
+        return (fallback / denom).astype(np.float32)
     return (regrets / total).astype(np.float32)
 
 
@@ -231,32 +291,35 @@ def masked_policy(logits: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected logits of length {ACTION_COUNT_V24}, got {logits.shape}")
     mask = _normalize_legal_mask(legal_mask)
     masked = np.full_like(logits, -1e9, dtype=np.float32)
-    masked[mask > 0.5] = logits[mask > 0.5]
+    legal = mask > 0.5
+    masked[legal] = logits[legal]
     max_val = float(masked.max())
     exp_vals = np.zeros_like(masked, dtype=np.float32)
-    legal = mask > 0.5
-    exp_vals[legal] = np.exp(masked[legal] - max_val)
+    exp_vals[legal] = np.exp(np.clip(masked[legal] - max_val, -20.0, 0.0))
     denom = float(exp_vals.sum())
     if denom <= 1e-8:
-        probs = mask / float(mask.sum())
-        return probs.astype(np.float32)
+        return _default_safe_policy(mask)
     return (exp_vals / denom).astype(np.float32)
 
 
 class AdvantageBuffer:
     def __init__(
         self,
-        capacity: int = 1_000_000,
+        capacity: int = 131_072,
         state_dim: int = STATE_DIM_V24,
         action_dim: int = ACTION_COUNT_V24,
     ):
         self.capacity = int(capacity)
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.states = np.zeros((self.capacity, state_dim), dtype=np.float32)
-        self.legal_masks = np.zeros((self.capacity, action_dim), dtype=np.float32)
-        self.targets = np.zeros((self.capacity, action_dim), dtype=np.float32)
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.legal_masks = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
+        self.targets = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
         self.weights = np.ones(self.capacity, dtype=np.float32)
+        self.position = 0
+        self.size = 0
+
+    def clear(self) -> None:
         self.position = 0
         self.size = 0
 
@@ -289,22 +352,22 @@ class AdvantageBuffer:
         }
 
     def __len__(self) -> int:
-        return self.size
+        return int(self.size)
 
 
 class StrategyBuffer:
     def __init__(
         self,
-        capacity: int = 2_000_000,
+        capacity: int = 1_000_000,
         state_dim: int = STATE_DIM_V24,
         action_dim: int = ACTION_COUNT_V24,
     ):
         self.capacity = int(capacity)
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.states = np.zeros((self.capacity, state_dim), dtype=np.float32)
-        self.legal_masks = np.zeros((self.capacity, action_dim), dtype=np.float32)
-        self.targets = np.zeros((self.capacity, action_dim), dtype=np.float32)
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.legal_masks = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
+        self.targets = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
         self.weights = np.ones(self.capacity, dtype=np.float32)
         self.size = 0
         self.inserts = 0
@@ -344,6 +407,4 @@ class StrategyBuffer:
         }
 
     def __len__(self) -> int:
-        return self.size
-
-
+        return int(self.size)

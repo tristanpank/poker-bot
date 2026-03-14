@@ -14,6 +14,7 @@ from backend.models.schemas import (
     HealthResponse,
     LegalActionsResponse,
     ModelInfo,
+    ModelWarmupResponse,
     PokerStepRequest,
     PokerStepResponse,
     HAND_STRENGTH_CATEGORIES,
@@ -63,6 +64,39 @@ async def list_models() -> list[ModelInfo]:
         ))
     
     return models
+
+
+@router.post("/warmup", response_model=ModelWarmupResponse)
+async def warmup_model(version: str | None = None) -> ModelWarmupResponse:
+    """
+    Explicitly load a model into memory so the first real action request is fast.
+    """
+    settings = get_settings()
+    target_version = str(version or settings.model_version).lower()
+
+    try:
+        from backend.services.model_service import get_model_service
+
+        model_service = get_model_service()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model service unavailable: {str(e)}",
+        ) from e
+
+    try:
+        already_loaded = model_service.is_loaded(target_version)
+        model_service.load_model(target_version)
+        return ModelWarmupResponse(
+            status="ready",
+            version=target_version,
+            model_loaded=True,
+            already_loaded=already_loaded,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Warmup error: {str(e)}")
 
 
 @router.post("/legal", response_model=LegalActionsResponse)

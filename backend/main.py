@@ -12,11 +12,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import get_settings
-from backend.routers.cv import router as cv_router
 
 _poker_router = None
 _get_model_service: Callable[[], Any] | None = None
 _poker_import_error: Exception | None = None
+_cv_router = None
+_cv_import_error: Exception | None = None
 
 
 def _init_poker_dependencies() -> None:
@@ -43,6 +44,20 @@ def _init_poker_dependencies() -> None:
         _poker_import_error = exc
 
 
+def _init_cv_dependencies() -> None:
+    global _cv_router, _cv_import_error
+
+    if _cv_router is not None or _cv_import_error is not None:
+        return
+
+    try:
+        from backend.routers.cv import router as cv_router
+
+        _cv_router = cv_router
+    except Exception as exc:  # pragma: no cover - environment dependent
+        _cv_import_error = exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -51,8 +66,9 @@ async def lifespan(app: FastAPI):
     Preloads the default model on startup for faster first request.
     """
     _init_poker_dependencies()
+    _init_cv_dependencies()
 
-    if _poker_router is not None and os.getenv("ENABLE_POKER_PRELOAD", "0") == "1":
+    if _poker_router is not None and os.getenv("ENABLE_POKER_PRELOAD", "1") == "1":
         try:
             from backend.services.model_service import get_model_service
 
@@ -78,6 +94,7 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     settings = get_settings()
     _init_poker_dependencies()
+    _init_cv_dependencies()
     
     app = FastAPI(
         title=settings.app_name,
@@ -98,7 +115,8 @@ def create_app() -> FastAPI:
     # Include routers
     if _poker_router is not None:
         app.include_router(_poker_router)
-    app.include_router(cv_router)
+    if _cv_router is not None:
+        app.include_router(_cv_router)
     
     # Root endpoint
     @app.get("/")
@@ -108,7 +126,7 @@ def create_app() -> FastAPI:
             "version": "0.1.0",
             "docs": "/docs",
             "health": "/poker/health" if _poker_router is not None else None,
-            "cv": "/cv/analyze-raw",
+            "cv": "/cv/analyze-raw" if _cv_router is not None else None,
             "poker_enabled": _poker_router is not None,
         }
     

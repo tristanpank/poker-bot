@@ -19,6 +19,18 @@ if str(_models_path) not in sys.path:
 _features_path = _project_root / "training" / "src" / "features"
 if str(_features_path) not in sys.path:
     sys.path.insert(0, str(_features_path))
+_workers_path = _project_root / "training" / "src" / "workers"
+if str(_workers_path) not in sys.path:
+    sys.path.insert(0, str(_workers_path))
+
+from poker_worker_v24 import infoset_key_from_vector
+from tabular_policy_v24 import (
+    TabularPolicySnapshot,
+    deserialize_node_store,
+    freeze_policy_snapshot,
+    normalize_masked_policy,
+    uniform_legal_policy,
+)
 
 from backend.config import get_settings
 from backend.poker_versions import get_action_names, get_version_spec, version_to_int
@@ -34,7 +46,7 @@ class ModelService:
     def __init__(self):
         self.settings = get_settings()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._models: dict[str, torch.nn.Module] = {}
+        self._models: dict[str, object] = {}
         self._lock = threading.Lock()
 
     def _extract_state_dict(self, checkpoint: object) -> dict[str, torch.Tensor]:
@@ -48,6 +60,60 @@ class ModelService:
         if isinstance(checkpoint, dict):
             raise ValueError("Checkpoint dictionary does not include a recognized model state dict.")
         raise ValueError("Checkpoint payload is not a dictionary.")
+
+    def _extract_tabular_snapshot(self, checkpoint: object) -> Optional[TabularPolicySnapshot]:
+        if isinstance(checkpoint, TabularPolicySnapshot):
+            return checkpoint
+        if not isinstance(checkpoint, dict):
+            return None
+        format_version = str(checkpoint.get("format_version", "")).strip().lower()
+        if format_version != "tabular_mccfr_v24" and "actor_snapshot" not in checkpoint and "node_store" not in checkpoint:
+            return None
+
+        actor_snapshot = checkpoint.get("actor_snapshot")
+        if isinstance(actor_snapshot, TabularPolicySnapshot):
+            return actor_snapshot
+        if isinstance(actor_snapshot, dict):
+            return TabularPolicySnapshot.from_payload(actor_snapshot)
+
+        node_store = checkpoint.get("node_store")
+        if isinstance(node_store, dict):
+            metadata = {}
+            if isinstance(checkpoint.get("config"), dict):
+                metadata["config"] = dict(checkpoint["config"])
+            return freeze_policy_snapshot(deserialize_node_store(node_store), metadata=metadata)
+        return None
+
+    def _tabular_policy_for_observation(
+        self,
+        snapshot: TabularPolicySnapshot,
+        observation: np.ndarray,
+        legal_actions: list[int],
+        version: str,
+    ) -> np.ndarray:
+        spec = get_version_spec(version)
+        vec = np.asarray(observation, dtype=np.float32).reshape(-1)
+        if vec.shape[0] < spec.state_dim:
+            padded = np.zeros(spec.state_dim, dtype=np.float32)
+            padded[: vec.shape[0]] = vec
+            vec = padded
+        elif vec.shape[0] > spec.state_dim:
+            vec = vec[: spec.state_dim]
+
+        infoset_key = infoset_key_from_vector(vec)
+        legal_mask = np.zeros(spec.action_dim, dtype=np.float32)
+        for action in legal_actions:
+            if 0 <= int(action) < spec.action_dim:
+                legal_mask[int(action)] = 1.0
+
+        entry = snapshot.policy_table.get(infoset_key)
+        if entry is None:
+            return uniform_legal_policy(legal_mask)
+        if float(np.asarray(entry.average_policy, dtype=np.float32).sum()) > 1e-8:
+            return normalize_masked_policy(entry.average_policy, legal_mask)
+        if float(np.asarray(entry.current_policy, dtype=np.float32).sum()) > 1e-8:
+            return normalize_masked_policy(entry.current_policy, legal_mask)
+        return uniform_legal_policy(legal_mask)
 
     def _infer_deepcfr_dims(
         self,
@@ -97,7 +163,7 @@ class ModelService:
     def _action_label(self, action_id: int, version: str) -> str:
         return get_action_names(version).get(action_id, f"ACTION_{action_id}")
         
-    def load_model(self, version: str = None) -> torch.nn.Module:
+    def load_model(self, version: str = None) -> object:
         """
         Load a model by version. Models are cached after first load.
         
@@ -125,7 +191,12 @@ class ModelService:
                 raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
             
             # Load the checkpoint
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+
+            tabular_snapshot = self._extract_tabular_snapshot(checkpoint)
+            if tabular_snapshot is not None:
+                self._models[version] = tabular_snapshot
+                return tabular_snapshot
 
             if version_num >= 21:
                 state_dict = self._extract_state_dict(checkpoint)
@@ -207,6 +278,15 @@ class ModelService:
         version = (version or self.settings.model_version).lower()
         version_num = version_to_int(version)
         model = self.load_model(version)
+
+        if isinstance(model, TabularPolicySnapshot):
+            scores = self._tabular_policy_for_observation(model, observation, legal_actions, version)
+            best_action = int(np.argmax(scores))
+            score_dict = {
+                self._action_label(i, version): float(scores[i])
+                for i in range(len(scores))
+            }
+            return best_action, score_dict
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
@@ -235,7 +315,7 @@ class ModelService:
         }
 
         return best_action, score_dict
-    
+
     def is_loaded(self, version: str = None) -> bool:
         """Check if a model version is loaded."""
         version = (version or self.settings.model_version).lower()

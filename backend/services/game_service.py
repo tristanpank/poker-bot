@@ -7,7 +7,10 @@ V19+: Uses range-weighted Monte Carlo equity for more realistic post-flop estima
 
 import math
 import random
+import sys
 from itertools import combinations
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, Optional
 
 import numpy as np
@@ -20,17 +23,32 @@ from backend.models.schemas import (
     PlayerState,
 )
 from backend.poker_versions import (
+    ACTION_AGGRO_LARGE,
+    ACTION_AGGRO_SMALL,
     ACTION_ALL_IN,
     ACTION_CALL,
     ACTION_CHECK,
     ACTION_FOLD,
     ACTION_RAISE_HALF_POT,
     ACTION_RAISE_POT_OR_ALL_IN,
+    V24_FACING_BET_RAISE_TO_MULTIPLIERS,
     V24_NON_ALL_IN_RAISE_ACTIONS,
-    V24_RAISE_MULTIPLIERS,
+    V24_POSTFLOP_BET_POT_MULTIPLIERS,
+    V24_PREFLOP_OPEN_RAISE_TO_BB,
     get_version_spec,
     version_to_int,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_TRAINING_FEATURES_PATH = _REPO_ROOT / "training" / "src" / "features"
+if str(_TRAINING_FEATURES_PATH) not in sys.path:
+    sys.path.insert(0, str(_TRAINING_FEATURES_PATH))
+
+from preflop_blueprint_v24 import (  # noqa: E402
+    BUILTIN_PREFLOP_BLUEPRINT_NAME,
+    preflop_blueprint_policy,
+)
+from poker_state_v24 import encode_info_state  # noqa: E402
 
 
 FRONTEND_ACTION_FOLD = "fold"
@@ -40,6 +58,59 @@ FRONTEND_ACTION_RAISE = "raise_amt"
 
 FEATURE_RANKS = "23456789TJQKA"
 FEATURE_SUITS = "cdhs"
+
+
+class _RuntimePot:
+    def __init__(self, amount: float):
+        self.amount = float(max(0.0, amount))
+
+
+class _WebsiteRuntimeState:
+    def __init__(
+        self,
+        *,
+        actor_index: int,
+        board_cards: list[Card],
+        hole_cards: list[list[Card]],
+        stacks: list[float],
+        bets: list[float],
+        pots: list[_RuntimePot],
+        min_raise_to: int,
+        max_raise_to: int,
+    ):
+        self.actor_index = int(actor_index)
+        self.board_cards = list(board_cards)
+        self.hole_cards = [list(cards) for cards in hole_cards]
+        self.stacks = [float(value) for value in stacks]
+        self.bets = [float(value) for value in bets]
+        self.pots = list(pots)
+        self.min_completion_betting_or_raising_to_amount = int(max(0, min_raise_to))
+        self.max_completion_betting_or_raising_to_amount = int(max(0, max_raise_to))
+        self.min_completion_betting_or_raising_to = self.min_completion_betting_or_raising_to_amount
+        self.max_completion_betting_or_raising_to = self.max_completion_betting_or_raising_to_amount
+
+    def can_fold(self) -> bool:
+        if self.actor_index < 0 or self.actor_index >= len(self.bets):
+            return False
+        return float(max(self.bets) - self.bets[self.actor_index]) > 1e-6
+
+    def can_check_or_call(self) -> bool:
+        if self.actor_index < 0 or self.actor_index >= len(self.bets):
+            return False
+        to_call = float(max(self.bets) - self.bets[self.actor_index])
+        if to_call <= 1e-6:
+            return True
+        return float(self.stacks[self.actor_index]) > 1e-6
+
+    def can_complete_bet_or_raise_to(self) -> bool:
+        if self.actor_index < 0 or self.actor_index >= len(self.bets):
+            return False
+        to_call = max(0.0, float(max(self.bets) - self.bets[self.actor_index]))
+        return (
+            float(self.stacks[self.actor_index]) > to_call + 1e-6
+            and self.max_completion_betting_or_raising_to_amount >= self.min_completion_betting_or_raising_to_amount
+            and self.max_completion_betting_or_raising_to_amount > int(max(self.bets))
+        )
 
 
 # =============================================================================
@@ -145,6 +216,27 @@ def _normalize(value: float, cap: float) -> float:
     return float(clipped / cap)
 
 
+def _street_action_order(player_count: int, street_idx: int) -> list[int]:
+    count = max(0, int(player_count))
+    if count <= 0:
+        return []
+    if int(street_idx) == 0:
+        start = 0 if count <= 2 else 2
+    else:
+        start = 1 if count == 2 else 0
+    return [int((start + offset) % count) for offset in range(count)]
+
+
+def _action_order_position_counts(active_flags: list[bool], hero_seat: int, street_idx: int) -> tuple[int, int]:
+    order = _street_action_order(len(active_flags), street_idx)
+    if hero_seat not in order:
+        return 0, 0
+    hero_idx = order.index(int(hero_seat))
+    players_before = sum(1 for seat in order[:hero_idx] if active_flags[seat])
+    players_after = sum(1 for seat in order[hero_idx + 1 :] if active_flags[seat])
+    return int(players_before), int(players_after)
+
+
 def _estimate_preflop_strength(hole_cards: list[Card], num_opponents: int = 1) -> float:
     if len(hole_cards) != 2:
         return 0.35
@@ -194,11 +286,27 @@ def _has_flush_draw(cards: list[Card]) -> float:
     return 1.0 if max(suit_counts, default=0) >= 4 else 0.0
 
 
-def _current_hand_strength_scalar(hole_cards: list[Card], board_cards: list[Card]) -> float:
+def _sorted_suit_hist(cards: list[Card]) -> np.ndarray:
+    hist = np.zeros(4, dtype=np.float32)
+    if not cards:
+        return hist
+    suit_counts = np.zeros(4, dtype=np.float32)
+    for card in cards:
+        suit_counts[_suit_index(card)] += 1.0
+    hist[:] = np.sort(suit_counts)[::-1]
+    hist /= float(len(cards))
+    return hist
+
+
+def _current_hand_strength_scalar(
+    hole_cards: list[Card],
+    board_cards: list[Card],
+    num_opponents: int = 1,
+) -> float:
     if len(hole_cards) != 2:
         return 0.0
     if len(board_cards) < 3:
-        return _estimate_preflop_strength(hole_cards, num_opponents=1)
+        return 0.0
 
     cards = hole_cards + board_cards
     rank_counts = [0] * 13
@@ -297,7 +405,31 @@ class GameService:
             return str(game_state.model_version).lower()
         return str(self.settings.model_version).lower()
 
+    def _seat_for_player_index(self, game_state: GameStateRequest, player_index: int) -> int:
+        if player_index < 0 or player_index >= len(game_state.players):
+            return -1
+        player_count = max(1, len(game_state.players))
+        return int(game_state.players[player_index].position) % player_count
+
+    def _starting_stacks_by_seat(self, game_state: GameStateRequest) -> list[int]:
+        player_count = len(game_state.players)
+        fallback = [max(0, int(player.stack + player.bet)) for player in game_state.players]
+        starting = list(game_state.starting_stacks or [])
+        by_seat = [0] * player_count
+        if len(starting) != player_count:
+            for idx, player in enumerate(game_state.players):
+                seat = int(player.position) % player_count
+                by_seat[seat] = int(fallback[idx])
+            return by_seat
+        for idx, player in enumerate(game_state.players):
+            seat = int(player.position) % player_count
+            by_seat[seat] = max(0, int(starting[idx]))
+        return by_seat
+
     def _street_raise_count(self, game_state: GameStateRequest) -> int:
+        explicit = getattr(game_state, "street_raise_count", None)
+        if explicit is not None:
+            return max(0, int(explicit))
         current_bet = max(0, int(game_state.current_bet))
         big_blind = max(1, int(game_state.big_blind))
         board_len = len(game_state.community_cards)
@@ -310,6 +442,166 @@ class GameService:
         if current_bet <= 0:
             return 0
         return 1
+
+    def _estimated_preflop_raise_count(self, game_state: GameStateRequest) -> int:
+        explicit = getattr(game_state, "preflop_raise_count", None)
+        if explicit is not None:
+            return max(0, int(explicit))
+        current_bet = max(0, int(game_state.current_bet))
+        big_blind = max(1, int(game_state.big_blind))
+        if current_bet <= big_blind:
+            return 0
+        prior_levels = {
+            max(0, int(player.bet))
+            for player in game_state.players
+            if big_blind <= max(0, int(player.bet)) < current_bet
+        }
+        return int(len(prior_levels))
+
+    def _estimated_preflop_call_count(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> int:
+        explicit = getattr(game_state, "preflop_call_count", None)
+        if explicit is not None:
+            return max(0, int(explicit))
+        big_blind = max(1, int(game_state.big_blind))
+        if self._estimated_preflop_raise_count(game_state) != 0:
+            return 0
+        matching_big_blinds = sum(
+            1
+            for idx, player in enumerate(game_state.players)
+            if idx != actor_index and max(0, int(player.bet)) == big_blind
+        )
+        return int(
+            max(
+                0,
+                matching_big_blinds - 1,
+            )
+        )
+
+    def _estimated_preflop_last_raiser_position(
+        self,
+        game_state: GameStateRequest,
+    ) -> Optional[int]:
+        explicit = getattr(game_state, "preflop_last_raiser", None)
+        if explicit is not None:
+            return int(explicit)
+        if len(game_state.community_cards) != 0:
+            return None
+        current_bet = max(0, int(game_state.current_bet))
+        big_blind = max(1, int(game_state.big_blind))
+        if current_bet <= big_blind:
+            return None
+        by_seat = {int(player.position) % 6: player for player in game_state.players}
+        candidates = [
+            seat
+            for seat, player in by_seat.items()
+            if player.is_active and max(0, int(player.bet)) == current_bet
+        ]
+        if not candidates:
+            return None
+        preflop_order = [2, 3, 4, 5, 0, 1]
+        indexed = {seat: idx for idx, seat in enumerate(preflop_order)}
+        return int(max(candidates, key=lambda seat: indexed.get(int(seat), -1)))
+
+    def _last_aggressor(self, game_state: GameStateRequest) -> Optional[int]:
+        explicit = getattr(game_state, "last_aggressor", None)
+        if explicit is not None:
+            return int(explicit)
+        return self._estimated_preflop_last_raiser_position(game_state)
+
+    def _build_v24_runtime_state(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> tuple[int, _WebsiteRuntimeState, SimpleNamespace]:
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            raise ValueError("Invalid actor index for v24 runtime state")
+
+        player_count = len(game_state.players)
+        actor_seat = self._seat_for_player_index(game_state, actor_index)
+        board_cards = [card_schema_to_pokerkit(card) for card in game_state.community_cards]
+        hole_cards_by_seat: list[list[Card]] = [[] for _ in range(player_count)]
+        stacks_by_seat = [0.0] * player_count
+        bets_by_seat = [0.0] * player_count
+        in_hand = [False] * player_count
+        starting_stacks = self._starting_stacks_by_seat(game_state)
+
+        for idx, player in enumerate(game_state.players):
+            seat = int(player.position) % player_count
+            stacks_by_seat[seat] = float(max(0, int(player.stack)))
+            bets_by_seat[seat] = float(max(0, int(player.bet)))
+            in_hand[seat] = bool(player.is_active)
+            if player.hole_cards:
+                hole_cards_by_seat[seat] = [card_schema_to_pokerkit(card) for card in player.hole_cards]
+
+        actor_player = game_state.players[actor_index]
+        min_raise_to, max_raise_to = self._get_raise_bounds(game_state, actor_player)
+        pot_without_live_bets = max(0.0, float(game_state.pot) - float(sum(bets_by_seat)))
+        state = _WebsiteRuntimeState(
+            actor_index=actor_seat,
+            board_cards=board_cards,
+            hole_cards=hole_cards_by_seat,
+            stacks=stacks_by_seat,
+            bets=bets_by_seat,
+            pots=[_RuntimePot(pot_without_live_bets)],
+            min_raise_to=min_raise_to,
+            max_raise_to=max_raise_to,
+        )
+        contributions = [
+            max(0.0, float(starting_stacks[seat]) - float(stacks_by_seat[seat]))
+            for seat in range(player_count)
+        ]
+        hand_ctx = SimpleNamespace(
+            starting_stacks=list(starting_stacks),
+            big_blind=int(game_state.big_blind),
+            small_blind=max(1, int(game_state.big_blind) // 2),
+            in_hand=list(in_hand),
+            contributions=contributions,
+            hole_cards_by_seat=hole_cards_by_seat,
+            current_street=get_street_from_board(board_cards),
+            street_raise_count=int(self._street_raise_count(game_state)),
+            preflop_raise_count=int(self._estimated_preflop_raise_count(game_state)),
+            preflop_call_count=int(self._estimated_preflop_call_count(game_state, actor_index)),
+            preflop_last_raiser=self._estimated_preflop_last_raiser_position(game_state),
+            last_aggressor=self._last_aggressor(game_state),
+        )
+        return actor_seat, state, hand_ctx
+
+    def _all_in_allowed_for_actor(self, game_state: GameStateRequest, actor_index: int) -> bool:
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            return False
+        if len(game_state.community_cards) != 0:
+            return True
+        actor = game_state.players[actor_index]
+        big_blind = max(1.0, float(game_state.big_blind))
+        hero_stack = float(max(0, int(actor.stack)))
+        opponent_stacks = [
+            float(max(0, int(player.stack)))
+            for idx, player in enumerate(game_state.players)
+            if idx != actor_index and player.is_active
+        ]
+        effective_stack = min([hero_stack] + opponent_stacks) if opponent_stacks else hero_stack
+        effective_stack_bb = effective_stack / big_blind
+        if effective_stack_bb <= 25.0:
+            return True
+        return self._estimated_preflop_raise_count(game_state) >= 2
+
+    def _v24_raise_context(self, game_state: GameStateRequest, actor_index: int) -> str:
+        actor_player = game_state.players[actor_index]
+        street = get_street_from_board(game_state.community_cards)
+        current_bet = max(0, int(game_state.current_bet))
+        actor_bet = max(0, int(actor_player.bet))
+        to_call = max(0, current_bet - actor_bet)
+        if street == 0:
+            if self._estimated_preflop_raise_count(game_state) == 0:
+                return "preflop_open"
+            return "preflop_raise"
+        if to_call > 0:
+            return "postflop_raise"
+        return "postflop_bet"
 
     def _v24_raise_target(
         self,
@@ -327,16 +619,28 @@ class GameService:
         min_raise_to, max_raise_to = self._get_raise_bounds(game_state, actor_player)
         if stack <= to_call or max_raise_to < min_raise_to:
             return None
-
-        if action == ACTION_ALL_IN:
-            return int(max_raise_to)
-
-        multiplier = V24_RAISE_MULTIPLIERS.get(int(action))
-        if multiplier is None:
+        if action not in V24_NON_ALL_IN_RAISE_ACTIONS:
             return None
 
         pot = float(max(0, game_state.pot))
-        target = int(round(actor_bet + to_call + (multiplier * pot)))
+        big_blind = float(max(1, int(game_state.big_blind)))
+        context = self._v24_raise_context(game_state, actor_index)
+        if context == "preflop_open":
+            base_size_bb = V24_PREFLOP_OPEN_RAISE_TO_BB.get(int(action))
+            if base_size_bb is None:
+                return None
+            limper_bonus_bb = min(3.0, float(self._estimated_preflop_call_count(game_state, actor_index)))
+            target = int(round((base_size_bb + limper_bonus_bb) * big_blind))
+        elif context == "postflop_bet":
+            multiplier = V24_POSTFLOP_BET_POT_MULTIPLIERS.get(int(action))
+            if multiplier is None:
+                return None
+            target = int(round(actor_bet + to_call + (multiplier * pot)))
+        else:
+            multiplier = V24_FACING_BET_RAISE_TO_MULTIPLIERS.get(int(action))
+            if multiplier is None:
+                return None
+            target = int(round(current_bet * multiplier))
         target = max(int(min_raise_to), min(target, int(max_raise_to)))
         return int(target)
 
@@ -358,20 +662,80 @@ class GameService:
 
         actions: list[int] = []
         seen_targets: set[int] = set()
-        max_raise_to = int(max_raise_to)
         for action_id in V24_NON_ALL_IN_RAISE_ACTIONS:
             target = self._v24_raise_target(action_id, game_state, actor_index)
             if target is None:
-                continue
-            if target >= max_raise_to:
                 continue
             if target in seen_targets:
                 continue
             seen_targets.add(target)
             actions.append(action_id)
-
-        actions.append(ACTION_ALL_IN)
         return actions
+
+    def _effective_stack_bb_for_actor(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> float:
+        actor = game_state.players[actor_index]
+        big_blind = max(1.0, float(game_state.big_blind))
+        hero_stack = float(max(0, int(actor.stack)))
+        opponent_stacks = [
+            float(max(0, int(player.stack)))
+            for idx, player in enumerate(game_state.players)
+            if idx != actor_index and player.is_active
+        ]
+        effective_stack = min([hero_stack] + opponent_stacks) if opponent_stacks else hero_stack
+        return float(effective_stack / big_blind)
+
+    def get_preflop_blueprint_recommendation(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+        version: Optional[str] = None,
+    ) -> Optional[dict[str, object]]:
+        resolved_version = self._resolve_version(version, game_state)
+        if version_to_int(resolved_version) < 24:
+            return None
+        if len(game_state.community_cards) != 0:
+            return None
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            return None
+
+        actor = game_state.players[actor_index]
+        if actor.hole_cards is None or len(actor.hole_cards) != 2:
+            return None
+
+        legal_actions = self.get_legal_action_ids_for_actor(game_state, actor_index, version=resolved_version)
+        if not legal_actions:
+            return None
+
+        spec = get_version_spec(resolved_version)
+        legal_mask = np.zeros(max(spec.action_dim, max(legal_actions) + 1), dtype=np.float32)
+        for action_id in legal_actions:
+            legal_mask[int(action_id)] = 1.0
+
+        hole_cards = [card_schema_to_pokerkit(card) for card in actor.hole_cards]
+        to_call_bb = float(max(0, int(game_state.current_bet) - int(actor.bet))) / float(max(1, int(game_state.big_blind)))
+        policy, meta = preflop_blueprint_policy(
+            hole_cards=hole_cards,
+            actor_seat=int(actor.position) % 6,
+            legal_mask=legal_mask,
+            effective_stack_bb=self._effective_stack_bb_for_actor(game_state, actor_index),
+            to_call_bb=to_call_bb,
+            preflop_raise_count=int(self._estimated_preflop_raise_count(game_state)),
+            preflop_call_count=int(self._estimated_preflop_call_count(game_state, actor_index)),
+            aggressor_seat=self._estimated_preflop_last_raiser_position(game_state),
+            blueprint_name=BUILTIN_PREFLOP_BLUEPRINT_NAME,
+        )
+        if float(np.asarray(policy, dtype=np.float32).sum()) <= 1e-8 or not bool(meta.get("covered", False)):
+            return None
+        action_id = int(np.argmax(policy))
+        return {
+            "action_id": action_id,
+            "policy": np.asarray(policy, dtype=np.float32),
+            "meta": meta,
+        }
     
     def monte_carlo_equity(
         self, 
@@ -485,11 +849,20 @@ class GameService:
         if stack <= to_call:
             return 0, max_raise_to
 
-        # Approximate minimum legal no-limit raise sizing from available UI state.
-        min_increment = max(big_blind, to_call)
-        min_raise_to = current_bet + min_increment
         if current_bet <= 0:
             min_raise_to = max(big_blind, hero_bet + big_blind)
+            return int(min_raise_to), int(max_raise_to)
+
+        prior_highest_below = 0
+        for player in game_state.players:
+            player_bet = max(0, int(player.bet))
+            if player_bet < current_bet:
+                prior_highest_below = max(prior_highest_below, player_bet)
+        if current_bet <= big_blind:
+            min_increment = big_blind
+        else:
+            min_increment = max(big_blind, current_bet - prior_highest_below)
+        min_raise_to = current_bet + min_increment
 
         return int(min_raise_to), int(max_raise_to)
 
@@ -619,6 +992,8 @@ class GameService:
         next_state = game_state.model_copy(deep=True)
         players = next_state.players
         actor = players[actor_index]
+        actor_seat = self._seat_for_player_index(next_state, actor_index)
+        street = get_street_from_board(next_state.community_cards)
         current_bet = max(0, int(next_state.current_bet))
         pot = max(0, int(next_state.pot))
         to_call = int(legal["to_call"])
@@ -635,6 +1010,8 @@ class GameService:
             actor.stack -= call_amt
             actor.has_acted = True
             pot += call_amt
+            if street == 0 and to_call > 0:
+                next_state.preflop_call_count += 1
         elif action == FRONTEND_ACTION_RAISE:
             min_raise_to = legal["min_raise_to"]
             max_raise_to = legal["max_raise_to"]
@@ -662,6 +1039,11 @@ class GameService:
             pot += additional
             current_bet = target
             applied_raise_amt = target
+            next_state.last_aggressor = actor_seat
+            next_state.street_raise_count += 1
+            if street == 0:
+                next_state.preflop_raise_count += 1
+                next_state.preflop_last_raiser = actor_seat
 
         next_state.pot = pot
         next_state.current_bet = current_bet
@@ -843,9 +1225,15 @@ class GameService:
             pot=0,
             players=next_players,
             bot_position=next_bot_position,
+            starting_stacks=[int(player.stack) for player in next_players],
             current_bet=0,
             big_blind=int(game_state.big_blind),
             current_player_idx=next_actor_idx,
+            street_raise_count=0,
+            preflop_raise_count=0,
+            preflop_call_count=0,
+            preflop_last_raiser=None,
+            last_aggressor=None,
             model_version=game_state.model_version,
         )
 
@@ -890,6 +1278,13 @@ class GameService:
             street=street_idx,
         )
 
+        if version_to_int(resolved_version) >= 24:
+            bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
+            if bot_index < 0:
+                raise ValueError("No bot player found in game state")
+            bot_seat, runtime_state, hand_ctx = self._build_v24_runtime_state(game_state, bot_index)
+            return encode_info_state(runtime_state, bot_seat, hand_ctx), equity
+
         obs = np.zeros(spec.state_dim, dtype=np.float32)
 
         if len(hole_cards) == 2:
@@ -927,7 +1322,7 @@ class GameService:
         if board_len > 0:
             inv_len = 1.0 / float(board_len)
             obs[32:45] = board_rank_counts.astype(np.float32) * inv_len
-            obs[45:49] = board_suit_counts.astype(np.float32) * inv_len
+            obs[45:49] = _sorted_suit_hist(board_cards)
 
         obs[53] = 1.0 if np.any(board_rank_counts >= 2) else 0.0
         obs[54] = 1.0 if np.any(board_rank_counts >= 3) else 0.0
@@ -938,14 +1333,18 @@ class GameService:
         active_opponents = max(1, sum(1 for p in game_state.players if p.is_active and not p.is_bot))
         obs[58] = _estimate_preflop_strength(hole_cards, num_opponents=active_opponents)
         obs[59] = _has_flush_draw(hole_cards + board_cards)
-        obs[60] = _current_hand_strength_scalar(hole_cards, board_cards)
+        obs[60] = _current_hand_strength_scalar(hole_cards, board_cards, num_opponents=active_opponents)
 
         hero_seat = bot_player.position % 6
         obs[61 + hero_seat] = 1.0
 
-        active_players = sum(1 for p in game_state.players if p.is_active)
-        players_before = sum(1 for p in game_state.players if p.position < bot_player.position and p.is_active)
-        players_after = sum(1 for p in game_state.players if p.position > bot_player.position and p.is_active)
+        player_count = max(1, len(game_state.players))
+        active_flags = [False] * player_count
+        for player in game_state.players:
+            seat = int(player.position) % player_count
+            active_flags[seat] = bool(player.is_active)
+        active_players = sum(1 for flag in active_flags if flag)
+        players_before, players_after = _action_order_position_counts(active_flags, hero_seat, street_idx)
         obs[67] = _normalize(float(active_players), 6.0)
         obs[68] = _normalize(float(players_before), 5.0)
         obs[69] = _normalize(float(players_after), 5.0)
@@ -984,8 +1383,8 @@ class GameService:
             obs[81] = 1.0 if ACTION_FOLD in legal_actions else 0.0
             obs[82] = 1.0 if ACTION_CHECK in legal_actions else 0.0
             obs[83] = 1.0 if ACTION_CALL in legal_actions else 0.0
-            obs[84] = 1.0 if any(action_id in V24_NON_ALL_IN_RAISE_ACTIONS for action_id in legal_actions) else 0.0
-            obs[85] = 1.0 if ACTION_ALL_IN in legal_actions else 0.0
+            obs[84] = 1.0 if ACTION_AGGRO_SMALL in legal_actions else 0.0
+            obs[85] = 1.0 if ACTION_AGGRO_LARGE in legal_actions else 0.0
         else:
             for action_id in legal_actions:
                 if 0 <= action_id < min(spec.action_dim, 5):

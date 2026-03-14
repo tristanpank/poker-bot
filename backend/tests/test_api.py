@@ -90,6 +90,26 @@ class TestModelsEndpoint:
         assert isinstance(data, list)
 
 
+class TestWarmupEndpoint:
+    """Tests for the /poker/warmup endpoint."""
+
+    @pytest.mark.requires_models
+    def test_warmup_returns_200(self, client):
+        response = client.post("/poker/warmup", params={"version": "v24"})
+        assert response.status_code == 200
+
+    @pytest.mark.requires_models
+    def test_warmup_response_structure(self, client):
+        response = client.post("/poker/warmup", params={"version": "v24"})
+        log_response("POST /poker/warmup", response)
+        data = response.json()
+
+        assert data["status"] == "ready"
+        assert data["version"] == "v24"
+        assert data["model_loaded"] is True
+        assert "already_loaded" in data
+
+
 class TestActionEndpoint:
     """Tests for the /poker/action endpoint."""
     
@@ -147,11 +167,11 @@ class TestActionEndpoint:
     
     @pytest.mark.requires_models
     def test_action_id_is_valid(self, client, valid_game_state):
-        """Action ID should be between 0 and 10 for v24."""
+        """Action ID should be within the v24 action space."""
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         
-        assert 0 <= data["action_id"] <= 10
+        assert 0 <= data["action_id"] <= max(ACTION_NAMES_V24)
     
     @pytest.mark.requires_models
     def test_action_name_matches_id(self, client, valid_game_state):
@@ -182,7 +202,7 @@ class TestActionEndpoint:
     
     @pytest.mark.requires_models
     def test_q_values_has_all_actions(self, client, valid_game_state):
-        """Q-values should include the full v24 action ladder."""
+        """Q-values should include the current v24 action set."""
         response = client.post("/poker/action", json=valid_game_state)
         data = response.json()
         

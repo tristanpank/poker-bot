@@ -21,6 +21,7 @@ COPY backend/ /app/backend/
 # Checkpoints (.pt files) are baked into the image
 COPY training/src/models/ /app/training/src/models/
 COPY training/src/features/ /app/training/src/features/
+COPY training/src/workers/ /app/training/src/workers/
 COPY training/models/ /app/training/models/
 
 EXPOSE 8000

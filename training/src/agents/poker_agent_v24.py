@@ -3,7 +3,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 import numpy as np
@@ -11,8 +11,10 @@ import numpy as np
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.dirname(CURRENT_DIR)
 FEATURES_DIR = os.path.join(SRC_ROOT, "features")
+MODELS_DIR = os.path.join(SRC_ROOT, "models")
 TRAINERS_DIR = os.path.join(SRC_ROOT, "trainers")
-for _path in (FEATURES_DIR, TRAINERS_DIR):
+WORKERS_DIR = os.path.join(SRC_ROOT, "workers")
+for _path in (FEATURES_DIR, MODELS_DIR, TRAINERS_DIR, WORKERS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -49,7 +51,7 @@ except Exception:
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODEL_VERSION = "v24"
 MODEL_LABEL = MODEL_VERSION.upper()
-DEFAULT_CHECKPOINT_FILENAME = f"poker_agent_{MODEL_VERSION}_deepcfr.pt"
+DEFAULT_CHECKPOINT_FILENAME = f"poker_agent_{MODEL_VERSION}_tabular_mccfr.pt"
 DEFAULT_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "models", DEFAULT_CHECKPOINT_FILENAME)
 DEFAULT_RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 
@@ -61,32 +63,98 @@ ACTION_NAMES = list(ACTION_NAMES_V24)
 POSITION_NAMES = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
 RANK_LABELS = list("AKQJT98765432")
 EVAL_SCOPE_LABELS = ["Overall"] + POSITION_NAMES
-EVAL_METRIC_LABELS = ["VPIP", "PFR", "3-Bet"]
-EVAL_MODE_VALUES = ["heuristics", "checkpoints", "v21_table", "leak_pool", "exploit_suite", *list(SYNTHETIC_OPPONENT_STYLES)]
+EVAL_METRIC_LABELS = [
+    "VPIP",
+    "RFI",
+    "PFR",
+    "3-Bet",
+    "Flop Seen",
+    "Turn Seen",
+    "River Seen",
+    "Showdown",
+    "W$SD",
+    "C-Bet Flop",
+    "Fold vs Flop C-Bet",
+    "C-Bet Turn",
+    "Fold vs Turn C-Bet",
+]
+EVAL_MODE_VALUES = ["self_play", "heuristics", "checkpoints", "eval_suite", *list(SYNTHETIC_OPPONENT_STYLES)]
+POSTFLOP_CONDITION_STREET_KEYS = ("flop", "turn", "river")
+POSTFLOP_CONDITION_METRIC_KEYS = (
+    "check_when_legal",
+    "bet_raise_when_checked_to",
+    "fold_when_facing_bet",
+    "call_when_facing_bet",
+)
 EVAL_METRIC_KEY_BY_LABEL = {
     "VPIP": "vpip",
+    "RFI": "rfi",
     "PFR": "pfr",
     "3-Bet": "three_bet",
+    "Flop Seen": "flop_seen",
+    "Turn Seen": "turn_seen",
+    "River Seen": "river_seen",
+    "Showdown": "showdown_seen",
+    "W$SD": "showdown_won",
+    "C-Bet Flop": "cbet_flop",
+    "Fold vs Flop C-Bet": "fold_vs_cbet_flop",
+    "C-Bet Turn": "cbet_turn",
+    "Fold vs Turn C-Bet": "fold_vs_cbet_turn",
 }
 EVAL_METRIC_LABEL_BY_KEY = {
     "vpip": "VPIP",
+    "rfi": "RFI",
     "pfr": "PFR",
     "three_bet": "3-Bet",
+    "flop_seen": "Flop Seen",
+    "turn_seen": "Turn Seen",
+    "river_seen": "River Seen",
+    "showdown_seen": "Showdown",
+    "showdown_won": "W$SD",
+    "cbet_flop": "C-Bet Flop",
+    "fold_vs_cbet_flop": "Fold vs Flop C-Bet",
+    "cbet_turn": "C-Bet Turn",
+    "fold_vs_cbet_turn": "Fold vs Turn C-Bet",
 }
 EVAL_METRIC_POSITION_ATTR = {
     "vpip": "vpip_by_position",
+    "rfi": "rfi_by_position",
     "pfr": "pfr_by_position",
     "three_bet": "three_bet_by_position",
 }
 EVAL_METRIC_GRID_ATTR = {
     "vpip": "vpip_hand_grid",
+    "rfi": "rfi_hand_grid",
     "pfr": "pfr_hand_grid",
     "three_bet": "three_bet_hand_grid",
 }
 EVAL_METRIC_GRID_BY_POSITION_ATTR = {
     "vpip": "vpip_hand_grid_by_position",
+    "rfi": "rfi_hand_grid_by_position",
     "pfr": "pfr_hand_grid_by_position",
     "three_bet": "three_bet_hand_grid_by_position",
+}
+EVAL_POSTFLOP_METRIC_KEYS = {
+    "flop_seen",
+    "turn_seen",
+    "river_seen",
+    "showdown_seen",
+    "showdown_won",
+    "cbet_flop",
+    "fold_vs_cbet_flop",
+    "cbet_turn",
+    "fold_vs_cbet_turn",
+}
+EVAL_POSTFLOP_DENOM_COUNT_KEY = {
+    "flop_seen": "hands",
+    "turn_seen": "hands",
+    "river_seen": "hands",
+    "showdown_seen": "hands",
+    "showdown_won": "showdown_seen",
+    "cbet_flop": "cbet_flop_opportunity",
+    "fold_vs_cbet_flop": "fold_vs_cbet_flop_opportunity",
+    "cbet_turn": "cbet_turn_opportunity",
+    "fold_vs_cbet_turn": "fold_vs_cbet_turn_opportunity",
 }
 
 
@@ -115,6 +183,10 @@ class TrainingGUI(tk.Tk):
             "epsilon": 0.0,
             "loss": 0.0,
             "aux_loss": 0.0,
+            "postflop_value_loss": 0.0,
+            "ema_loss": 0.0,
+            "ema_aux_loss": 0.0,
+            "ema_postflop_value_loss": 0.0,
             "bb_100": 0.0,
             "bb_per_hand": 0.0,
             "bb100_window": 0,
@@ -124,17 +196,39 @@ class TrainingGUI(tk.Tk):
             "speed": 0.0,
             "eta": 0.0,
             "pool_size": 0,
+            "infoset_count": 0,
+            "pruning_active": False,
+            "discount_active": False,
+            "last_discount_factor": 1.0,
+            "algorithm_name": "tabular_mccfr_6max",
+            "monitor_mode": "self_play",
             "learner_steps": 0,
+            "chunk_learner_steps": 0,
+            "chunk_regret_steps": 0,
+            "chunk_strategy_steps": 0,
+            "chunk_postflop_value_steps": 0,
+            "chunk_advantage_samples": 0,
+            "chunk_strategy_samples": 0,
+            "chunk_postflop_value_samples": 0,
             "total_hands": 0,
             "buffer_size": 0,
             "buffer_cap": 1000000,
             "buffer_size_aux": 0,
             "buffer_cap_aux": 2000000,
             "action_pcts": {i: 0.0 for i in range(len(ACTION_NAMES))},
+            "mixed_action_pcts": {i: 0.0 for i in range(len(ACTION_NAMES))},
             "position_stats": {i: {"hands": 0, "avg": 0.0, "win": 0.0} for i in range(6)},
             "vpip": 0.0,
             "pfr": 0.0,
             "three_bet": 0.0,
+            "postflop_conditioned_rates": {
+                street: {metric: 0.0 for metric in POSTFLOP_CONDITION_METRIC_KEYS}
+                for street in POSTFLOP_CONDITION_STREET_KEYS
+            },
+            "postflop_conditioned_counts": {
+                street: {metric: {"hits": 0, "opportunities": 0} for metric in POSTFLOP_CONDITION_METRIC_KEYS}
+                for street in POSTFLOP_CONDITION_STREET_KEYS
+            },
             "state_err": 0.0,
             "fallbacks": 0.0,
             "perf_stats": {
@@ -147,7 +241,6 @@ class TrainingGUI(tk.Tk):
             "loss_history": [],
             "aux_loss_history": [],
             "bb100_history": [],
-            "epsilon_history": [],
             "action_history": {i: [] for i in range(len(ACTION_NAMES))},
             "position_bb100_history": {i: [] for i in range(6)},
             "hands_history": [],
@@ -225,8 +318,8 @@ class TrainingGUI(tk.Tk):
                 ax.grid(True, color=DARK_GRID, alpha=0.3, linewidth=0.5)
 
             self.ax_bb100.set_title("BB/100 Over Time", color=DARK_FG, fontsize=10)
-            self.ax_loss.set_title("Training Loss", color=DARK_FG, fontsize=10)
-            self.ax_actions.set_title("Action Distribution", color=DARK_FG, fontsize=10)
+            self.ax_loss.set_title("Infoset Growth", color=DARK_FG, fontsize=10)
+            self.ax_actions.set_title("Postflop Action Distribution", color=DARK_FG, fontsize=10)
             self.ax_positions.set_title("Position Performance (BB/100)", color=DARK_FG, fontsize=10)
 
             self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
@@ -243,8 +336,8 @@ class TrainingGUI(tk.Tk):
             grid.pack(fill=tk.BOTH, expand=True)
             specs = [
                 ("bb100", "BB/100 Over Time"),
-                ("loss", "Training Loss"),
-                ("actions", "Action Distribution"),
+                ("loss", "Infoset Growth"),
+                ("actions", "Postflop Action Distribution"),
                 ("positions", "Position Performance (BB/100)"),
             ]
             for idx, (key, title) in enumerate(specs):
@@ -263,13 +356,17 @@ class TrainingGUI(tk.Tk):
         stats1 = ttk.Frame(bottom)
         stats1.pack(fill=tk.X, pady=2)
 
-        self.lbl_eps = ttk.Label(stats1, text="Decisions: 0", font=("Consolas", 11))
+        self.lbl_eps = ttk.Label(stats1, text="Infosets: 0 | Decisions: 0", font=("Consolas", 11))
         self.lbl_eps.pack(side=tk.LEFT, padx=(0, 20))
-        self.lbl_loss_val = ttk.Label(stats1, text="Regret: 0.0000 | Strategy: 0.0000", font=("Consolas", 11))
+        self.lbl_loss_val = ttk.Label(
+            stats1,
+            text="Prune: Off | Discount: Off | Factor: x1.000",
+            font=("Consolas", 11),
+        )
         self.lbl_loss_val.pack(side=tk.LEFT, padx=(0, 20))
-        self.lbl_bb100_val = ttk.Label(stats1, text="BB/hand: +0.000 | BB/100: +0.0", font=("Consolas", 11))
+        self.lbl_bb100_val = ttk.Label(stats1, text="Self-Play BB/hand: +0.000 | BB/100: +0.0", font=("Consolas", 11))
         self.lbl_bb100_val.pack(side=tk.LEFT, padx=(0, 20))
-        self.lbl_buffer = ttk.Label(stats1, text="Adv: 0/1000k | Strat: 0/2000k", font=("Consolas", 11))
+        self.lbl_buffer = ttk.Label(stats1, text="Algorithm: tabular_mccfr_6max | Pool: 0", font=("Consolas", 11))
         self.lbl_buffer.pack(side=tk.LEFT, padx=(0, 20))
         self.lbl_hands = ttk.Label(stats1, text="Traversals: 0", font=("Consolas", 11))
         self.lbl_hands.pack(side=tk.LEFT, padx=(0, 20))
@@ -309,9 +406,8 @@ class TrainingGUI(tk.Tk):
         self.lbl_health = ttk.Label(
             bottom,
             text=(
-                "Healthy: BB/hand is the traverser's rolling raw stack delta, BB/100 is that value times 100, "
-                "VPIP/PFR/3-Bet are rolling preflop rates, "
-                "and State Err/Fallbacks stay at 0."
+                "Healthy: self-play BB/100 is sampled from the live tabular policy, infoset growth should keep climbing, "
+                "and invalid action counts should stay at 0."
             ),
             font=("Segoe UI", 9),
             foreground="#a6adc8",
@@ -367,6 +463,9 @@ class TrainingGUI(tk.Tk):
 
         self.btn_save = ttk.Button(ctrl_frame, text="Save Model", command=self._save_model)
         self.btn_save.pack(side=tk.RIGHT, padx=4)
+
+        self.btn_load = ttk.Button(ctrl_frame, text="Load Model", command=self._load_model)
+        self.btn_load.pack(side=tk.RIGHT, padx=4)
 
     def _build_perf_tab(self):
         tab = self.perf_tab
@@ -532,7 +631,7 @@ class TrainingGUI(tk.Tk):
             return fallback
 
     def _reset_histories(self) -> None:
-        for key in ["loss_history", "aux_loss_history", "bb100_history", "epsilon_history", "hands_history"]:
+        for key in ["loss_history", "aux_loss_history", "bb100_history", "hands_history"]:
             self.gui_state[key] = []
         for i in range(len(ACTION_NAMES)):
             self.gui_state["action_history"][i] = []
@@ -546,31 +645,46 @@ class TrainingGUI(tk.Tk):
         if self.training_start_time is None:
             self.training_start_time = time.time()
 
-        while self.gui_state["batch"] < self.gui_state["total_batches"]:
-            while self.pause_requested and not self.stop_requested:
-                self.gui_state["status"] = "Paused"
-                time.sleep(0.2)
+        try:
+            while self.gui_state["batch"] < self.gui_state["total_batches"]:
+                while self.pause_requested and not self.stop_requested:
+                    self.gui_state["status"] = "Paused"
+                    time.sleep(0.2)
 
-            if self.stop_requested:
-                break
+                if self.stop_requested:
+                    break
 
-            self.gui_state["status"] = "Training..."
-            chunk = self._read_int(self.spin_hands, self.trainer.config.traversals_per_chunk)
-            self.trainer.config.traversals_per_chunk = chunk
-            remaining = self.gui_state["total_batches"] - self.gui_state["batch"]
-            run_chunk = min(chunk, max(1, remaining))
-            chunk_start = time.perf_counter()
-            snapshot = self.trainer.train_for_traversals(run_chunk)
-            chunk_elapsed = max(1e-6, time.perf_counter() - chunk_start)
-            self._ingest_snapshot(snapshot, run_chunk, chunk_elapsed)
+                self.gui_state["status"] = "Training..."
+                chunk = self._read_int(self.spin_hands, self.trainer.config.traversals_per_chunk)
+                self.trainer.config.traversals_per_chunk = chunk
+                remaining = self.gui_state["total_batches"] - self.gui_state["batch"]
+                run_chunk = min(chunk, max(1, remaining))
+                chunk_start = time.perf_counter()
+                snapshot = self.trainer.train_for_traversals(run_chunk)
+                chunk_elapsed = max(1e-6, time.perf_counter() - chunk_start)
+                self._ingest_snapshot(snapshot, run_chunk, chunk_elapsed)
+            self.gui_state["status"] = "Stopped" if self.stop_requested else "Done"
+        except Exception as exc:
+            self.gui_state["status"] = f"Error: {exc}"
+            self.stop_requested = True
+        finally:
+            self.training_running = False
 
-        self.gui_state["status"] = "Stopped" if self.stop_requested else "Done"
-        self.training_running = False
-
-    def _ingest_snapshot(self, snapshot, chunk_size: int, chunk_elapsed_seconds: float) -> None:
-        total_actions = max(1, sum(snapshot.action_histogram))
+    def _ingest_snapshot(
+        self,
+        snapshot,
+        chunk_size: int,
+        chunk_elapsed_seconds: float,
+        append_history: bool = True,
+    ) -> None:
+        total_actions = max(1, sum(getattr(snapshot, "postflop_action_histogram", snapshot.action_histogram)))
         action_pcts = {
-            i: (snapshot.action_histogram[i] / total_actions * 100.0)
+            i: (getattr(snapshot, "postflop_action_histogram", snapshot.action_histogram)[i] / total_actions * 100.0)
+            for i in range(len(ACTION_NAMES))
+        }
+        mixed_total_actions = max(1, sum(snapshot.action_histogram))
+        mixed_action_pcts = {
+            i: (snapshot.action_histogram[i] / mixed_total_actions * 100.0)
             for i in range(len(ACTION_NAMES))
         }
 
@@ -580,11 +694,13 @@ class TrainingGUI(tk.Tk):
             avg = float(snapshot.position_avg_utility_bb.get(name, 0.0)) * 100.0
             pos_stats[i] = {"hands": approx_hands, "avg": avg, "win": 0.0}
 
-        chunk_size = max(1, int(chunk_size))
-        chunk_elapsed_seconds = max(1e-6, float(chunk_elapsed_seconds))
-        chunk_speed = float(chunk_size / chunk_elapsed_seconds)
-        prev_speed = float(self.gui_state.get("speed", 0.0))
-        speed = chunk_speed if prev_speed <= 0.0 else (0.35 * chunk_speed + 0.65 * prev_speed)
+        speed = float(self.gui_state.get("speed", 0.0))
+        if chunk_size > 0 and chunk_elapsed_seconds > 0.0:
+            chunk_size = max(1, int(chunk_size))
+            chunk_elapsed_seconds = max(1e-6, float(chunk_elapsed_seconds))
+            chunk_speed = float(chunk_size / chunk_elapsed_seconds)
+            prev_speed = float(self.gui_state.get("speed", 0.0))
+            speed = chunk_speed if prev_speed <= 0.0 else (0.35 * chunk_speed + 0.65 * prev_speed)
         remaining = (
             (self.gui_state["total_batches"] - snapshot.traversals_completed) / speed / 60.0
             if speed > 0
@@ -592,9 +708,15 @@ class TrainingGUI(tk.Tk):
         )
 
         self.gui_state["batch"] = snapshot.traversals_completed
-        self.gui_state["loss"] = snapshot.regret_loss
-        self.gui_state["aux_loss"] = snapshot.strategy_loss
-        self.gui_state["epsilon"] = snapshot.traverser_decisions
+        self.gui_state["loss"] = float(getattr(snapshot, "infoset_count", 0))
+        self.gui_state["aux_loss"] = float(snapshot.checkpoint_pool_size)
+        self.gui_state["infoset_count"] = int(getattr(snapshot, "infoset_count", 0))
+        self.gui_state["pruning_active"] = bool(getattr(snapshot, "pruning_active", False))
+        self.gui_state["discount_active"] = bool(getattr(snapshot, "discount_active", False))
+        self.gui_state["last_discount_factor"] = float(getattr(snapshot, "last_discount_factor", 1.0))
+        self.gui_state["algorithm_name"] = str(getattr(snapshot, "algorithm_name", "tabular_mccfr_6max"))
+        self.gui_state["monitor_mode"] = str(getattr(snapshot, "monitor_mode", "self_play"))
+        self.gui_state["traverser_decisions"] = int(snapshot.traverser_decisions)
         self.gui_state["bb_per_hand"] = snapshot.avg_utility_bb
         self.gui_state["bb_100"] = snapshot.avg_utility_bb * 100.0
         self.gui_state["bb100_window"] = snapshot.utility_window_count
@@ -604,27 +726,39 @@ class TrainingGUI(tk.Tk):
         self.gui_state["eta"] = remaining
         self.gui_state["pool_size"] = snapshot.checkpoint_pool_size
         self.gui_state["learner_steps"] = snapshot.learner_steps
+        self.gui_state["chunk_learner_steps"] = getattr(snapshot, "chunk_learner_steps", 0)
+        self.gui_state["chunk_regret_steps"] = getattr(snapshot, "chunk_regret_steps", 0)
+        self.gui_state["chunk_strategy_steps"] = getattr(snapshot, "chunk_strategy_steps", 0)
+        self.gui_state["chunk_postflop_value_steps"] = getattr(snapshot, "chunk_postflop_value_steps", 0)
+        self.gui_state["chunk_advantage_samples"] = getattr(snapshot, "chunk_advantage_samples", 0)
+        self.gui_state["chunk_strategy_samples"] = getattr(snapshot, "chunk_strategy_samples", 0)
+        self.gui_state["chunk_postflop_value_samples"] = getattr(snapshot, "chunk_postflop_value_samples", 0)
         self.gui_state["total_hands"] = snapshot.traversals_completed
-        self.gui_state["buffer_size"] = snapshot.advantage_buffer_size
-        self.gui_state["buffer_size_aux"] = snapshot.strategy_buffer_size
         self.gui_state["action_pcts"] = action_pcts
+        self.gui_state["mixed_action_pcts"] = mixed_action_pcts
         self.gui_state["position_stats"] = pos_stats
         self.gui_state["vpip"] = snapshot.vpip * 100.0
         self.gui_state["pfr"] = snapshot.pfr * 100.0
         self.gui_state["three_bet"] = snapshot.three_bet * 100.0
+        self.gui_state["postflop_conditioned_rates"] = getattr(snapshot, "postflop_conditioned_rates_by_street", {})
+        self.gui_state["postflop_conditioned_counts"] = getattr(snapshot, "postflop_conditioned_counts_by_street", {})
+        self.gui_state["preflop_jam_rate"] = snapshot.preflop_jam_rate * 100.0
+        self.gui_state["flop_seen_rate"] = snapshot.flop_seen_rate * 100.0
+        self.gui_state["avg_actions_per_hand"] = snapshot.avg_actions_per_hand
+        self.gui_state["avg_preflop_actions_per_hand"] = snapshot.avg_preflop_actions_per_hand
         self.gui_state["state_err"] = float(snapshot.invalid_state_count)
         self.gui_state["fallbacks"] = float(snapshot.invalid_action_count)
         self.gui_state["perf_stats"] = dict(snapshot.perf_breakdown_ms)
 
-        self.gui_state["loss_history"].append(snapshot.regret_loss)
-        self.gui_state["aux_loss_history"].append(snapshot.strategy_loss)
-        self.gui_state["bb100_history"].append(snapshot.avg_utility_bb * 100.0)
-        self.gui_state["epsilon_history"].append(float(snapshot.traverser_decisions))
-        self.gui_state["hands_history"].append(snapshot.traversals_completed)
-        for i in range(len(ACTION_NAMES)):
-            self.gui_state["action_history"][i].append(action_pcts.get(i, 0.0))
-        for pos in range(6):
-            self.gui_state["position_bb100_history"][pos].append(pos_stats[pos]["avg"])
+        if append_history:
+            self.gui_state["loss_history"].append(float(getattr(snapshot, "infoset_count", 0)))
+            self.gui_state["aux_loss_history"].append(float(snapshot.checkpoint_pool_size))
+            self.gui_state["bb100_history"].append(snapshot.avg_utility_bb * 100.0)
+            self.gui_state["hands_history"].append(snapshot.traversals_completed)
+            for i in range(len(ACTION_NAMES)):
+                self.gui_state["action_history"][i].append(action_pcts.get(i, 0.0))
+            for pos in range(6):
+                self.gui_state["position_bb100_history"][pos].append(pos_stats[pos]["avg"])
 
     def _start_training(self) -> None:
         if self.training_running:
@@ -704,6 +838,42 @@ class TrainingGUI(tk.Tk):
                 f"Model saved to:\n{DEFAULT_CHECKPOINT_PATH}\n\nTraining tab image export failed:\n{detail}",
             )
 
+    def _load_model(self) -> None:
+        if self.training_running:
+            messagebox.showwarning("Load", "Stop training before loading a checkpoint.")
+            return
+
+        initial_dir = os.path.dirname(DEFAULT_CHECKPOINT_PATH)
+        initial_file = os.path.basename(DEFAULT_CHECKPOINT_PATH)
+        path = filedialog.askopenfilename(
+            title="Load Checkpoint",
+            initialdir=initial_dir if os.path.isdir(initial_dir) else PROJECT_ROOT,
+            initialfile=initial_file,
+            filetypes=[("PyTorch Checkpoints", "*.pt *.pth"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            self.trainer.load_checkpoint(path)
+        except Exception as exc:
+            messagebox.showerror("Load Error", str(exc))
+            return
+
+        self._reset_histories()
+        self.training_start_time = None
+        self._last_eval_report = None
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.gui_state["speed"] = 0.0
+        self.gui_state["eta"] = 0.0
+        self.gui_state["status"] = "Loaded"
+        snapshot = self.trainer.get_snapshot()
+        current_target = self._read_int(self.spin_batches, 524288)
+        self.gui_state["total_batches"] = max(int(snapshot.traversals_completed), int(current_target))
+        self._ingest_snapshot(snapshot, 0, 0.0, append_history=False)
+        self.update_gui()
+        messagebox.showinfo("Load", f"Checkpoint loaded:\n{path}\n\nTraining can now continue from this state.")
+
     def _save_training_tab_image(self, image_path: str) -> tuple[bool, str]:
         prior_tab = None
         try:
@@ -750,18 +920,17 @@ class TrainingGUI(tk.Tk):
 
         def _eval_thread():
             try:
-                if mode == "checkpoints":
+                if mode == "eval_suite":
+                    results = self.trainer.evaluate_eval_suite(num_hands)
+                elif mode == "checkpoints":
                     results = self.trainer.evaluate_vs_checkpoint_pool(num_hands)
-                elif mode == "v21_table":
-                    results = self.trainer.evaluate_vs_v21_table(num_hands)
-                elif mode == "leak_pool":
-                    results = self.trainer.evaluate_vs_leak_pool(num_hands)
-                elif mode == "exploit_suite":
-                    results = self.trainer.evaluate_exploit_suite(num_hands)
                 elif mode in SYNTHETIC_OPPONENT_STYLES:
                     results = self.trainer.evaluate_vs_synthetic_style(mode, num_hands)
                 else:
-                    results = self.trainer.evaluate_vs_heuristics(num_hands)
+                    if mode == "self_play":
+                        results = self.trainer.evaluate_self_play(num_hands)
+                    else:
+                        results = self.trainer.evaluate_vs_heuristics(num_hands)
                 self.after(0, lambda: self._show_eval_results(results))
             except Exception as exc:
                 error_message = str(exc)
@@ -785,26 +954,68 @@ class TrainingGUI(tk.Tk):
     def _eval_metric_label(self, metric_key: str) -> str:
         return EVAL_METRIC_LABEL_BY_KEY.get(metric_key, "VPIP")
 
+    def _is_postflop_eval_metric(self, metric_key: str) -> bool:
+        return metric_key in EVAL_POSTFLOP_METRIC_KEYS
+
+    def _eval_metric_sample_size(self, results, metric_key: str, scope_key: str) -> Optional[int]:
+        if not self._is_postflop_eval_metric(metric_key):
+            return None
+        denom_key = EVAL_POSTFLOP_DENOM_COUNT_KEY.get(metric_key)
+        if denom_key is None:
+            return None
+        if scope_key in POSITION_NAMES:
+            position_counts = getattr(results, "postflop_counts_by_position", {}) or {}
+            seat_counts = position_counts.get(scope_key, {}) or {}
+            return int(seat_counts.get(denom_key, 0))
+        counts = getattr(results, "postflop_counts", {}) or {}
+        return int(counts.get(denom_key, 0))
+
     def _extract_eval_metric_data(self, results, metric_key: str, scope_key: str):
         metric_key = metric_key if metric_key in EVAL_METRIC_LABEL_BY_KEY else "vpip"
-        overall_pct = float(getattr(results, metric_key, 0.0)) * 100.0
-        by_position_attr = EVAL_METRIC_POSITION_ATTR.get(metric_key, "vpip_by_position")
-        by_position = getattr(results, by_position_attr, {}) or {}
-
-        if scope_key in POSITION_NAMES:
-            scope_label = scope_key
-            selected_pct = float(by_position.get(scope_key, 0.0)) * 100.0
+        if self._is_postflop_eval_metric(metric_key):
+            overall_pct = float((getattr(results, "postflop_rates", {}) or {}).get(metric_key, 0.0)) * 100.0
+            by_position = getattr(results, "postflop_rates_by_position", {}) or {}
+            position_values = [
+                float((by_position.get(pos_name, {}) or {}).get(metric_key, 0.0)) * 100.0 for pos_name in POSITION_NAMES
+            ]
+            if scope_key in POSITION_NAMES:
+                scope_label = scope_key
+                selected_pct = float((by_position.get(scope_key, {}) or {}).get(metric_key, 0.0)) * 100.0
+            else:
+                scope_label = "Overall"
+                selected_pct = overall_pct
+            hand_grid = (getattr(results, "postflop_hand_grids", {}) or {}).get(metric_key, [])
+            if scope_key in POSITION_NAMES:
+                hand_grid = (
+                    ((getattr(results, "postflop_hand_grids_by_position", {}) or {}).get(scope_key, {}) or {}).get(metric_key, hand_grid)
+                )
         else:
-            scope_label = "Overall"
-            selected_pct = overall_pct
+            overall_pct = float(getattr(results, metric_key, 0.0)) * 100.0
+            by_position_attr = EVAL_METRIC_POSITION_ATTR.get(metric_key, "vpip_by_position")
+            by_position = getattr(results, by_position_attr, {}) or {}
+            position_values = [float(by_position.get(pos_name, 0.0)) * 100.0 for pos_name in POSITION_NAMES]
+            if scope_key in POSITION_NAMES:
+                scope_label = scope_key
+                selected_pct = float(by_position.get(scope_key, 0.0)) * 100.0
+            else:
+                scope_label = "Overall"
+                selected_pct = overall_pct
 
-        hand_grid_attr = EVAL_METRIC_GRID_ATTR.get(metric_key, "vpip_hand_grid")
-        hand_grid = getattr(results, hand_grid_attr, [])
+            hand_grid_attr = EVAL_METRIC_GRID_ATTR.get(metric_key, "vpip_hand_grid")
+            hand_grid = getattr(results, hand_grid_attr, [])
+            if scope_key in POSITION_NAMES:
+                hand_grid_by_position_attr = EVAL_METRIC_GRID_BY_POSITION_ATTR.get(metric_key, "vpip_hand_grid_by_position")
+                hand_grid_by_position = getattr(results, hand_grid_by_position_attr, {}) or {}
+                hand_grid = hand_grid_by_position.get(scope_key, hand_grid)
+
         if scope_key in POSITION_NAMES:
-            hand_grid_by_position_attr = EVAL_METRIC_GRID_BY_POSITION_ATTR.get(metric_key, "vpip_hand_grid_by_position")
-            hand_grid_by_position = getattr(results, hand_grid_by_position_attr, {}) or {}
-            hand_grid = hand_grid_by_position.get(scope_key, hand_grid)
-        return overall_pct, selected_pct, hand_grid, scope_label
+            bar_labels = [scope_key]
+            bar_values = [selected_pct]
+        else:
+            bar_labels = POSITION_NAMES
+            bar_values = position_values
+        sample_size = self._eval_metric_sample_size(results, metric_key, scope_key)
+        return overall_pct, selected_pct, hand_grid, scope_label, bar_labels, bar_values, sample_size
 
     def _on_eval_chart_selection_changed(self, _event=None) -> None:
         if self._last_eval_report is not None:
@@ -814,21 +1025,22 @@ class TrainingGUI(tk.Tk):
         scope_key = self._selected_eval_scope_key()
         metric_key = self._selected_eval_metric_key()
         metric_label = self._eval_metric_label(metric_key)
-        overall_pct, selected_pct, hand_grid, scope_label = self._extract_eval_metric_data(
+        overall_pct, selected_pct, hand_grid, scope_label, bar_labels, bar_values, sample_size = self._extract_eval_metric_data(
             results,
             metric_key,
             scope_key,
         )
+        sample_suffix = f" | n={sample_size:,}" if sample_size is not None else ""
 
         if self.eval_ax is not None:
             self.eval_ax.clear()
             self.eval_ax.set_facecolor("#181825")
-            counts = list(results.action_histogram)
+            counts = list(getattr(results, "postflop_action_histogram", results.action_histogram))
             total = sum(counts)
             pcts = [count / total * 100.0 if total > 0 else 0.0 for count in counts]
             bars = self.eval_ax.bar(ACTION_NAMES, pcts, color=_action_palette(), edgecolor="none")
             self.eval_ax.set_ylabel("% of Actions", color=DARK_FG, fontsize=9)
-            self.eval_ax.set_title(f"Eval Actions ({results.hands:,} hands)", color=DARK_FG, fontsize=10)
+            self.eval_ax.set_title(f"Eval Postflop Actions ({results.hands:,} hands)", color=DARK_FG, fontsize=10)
             self.eval_ax.tick_params(colors=DARK_FG, labelsize=8)
             for spine in self.eval_ax.spines.values():
                 spine.set_color(DARK_GRID)
@@ -848,23 +1060,20 @@ class TrainingGUI(tk.Tk):
             self.eval_vpip_ax.clear()
             self.eval_vpip_ax.set_facecolor("#181825")
             if scope_key in POSITION_NAMES:
-                labels = [scope_key]
-                values = [selected_pct]
                 colors = [ACCENT_COLORS[POSITION_NAMES.index(scope_key) % len(ACCENT_COLORS)]]
+                title = f"{metric_label} {scope_label}{sample_suffix}"
             else:
-                labels = [metric_label]
-                values = [overall_pct]
-                colors = [ACCENT_COLORS[2]]
-            metric_bars = self.eval_vpip_ax.bar(labels, values, color=colors, edgecolor="none")
+                colors = [ACCENT_COLORS[idx % len(ACCENT_COLORS)] for idx in range(len(bar_labels))]
+                title = f"{metric_label} by Position{sample_suffix}"
+            metric_bars = self.eval_vpip_ax.bar(bar_labels, bar_values, color=colors, edgecolor="none")
             self.eval_vpip_ax.set_ylabel(f"{metric_label} %", color=DARK_FG, fontsize=9)
-            subtitle = scope_label
-            self.eval_vpip_ax.set_title(f"{metric_label} {subtitle}", color=DARK_FG, fontsize=10)
+            self.eval_vpip_ax.set_title(title, color=DARK_FG, fontsize=10)
             self.eval_vpip_ax.tick_params(colors=DARK_FG, labelsize=8)
             for spine in self.eval_vpip_ax.spines.values():
                 spine.set_color(DARK_GRID)
-            top = max(5.0, max(values) * 1.2 if values else 5.0)
+            top = max(5.0, max(bar_values) * 1.2 if bar_values else 5.0)
             self.eval_vpip_ax.set_ylim(0.0, top)
-            for bar, pct in zip(metric_bars, values):
+            for bar, pct in zip(metric_bars, bar_values):
                 self.eval_vpip_ax.text(
                     bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + max(0.3, top * 0.02),
@@ -884,7 +1093,11 @@ class TrainingGUI(tk.Tk):
                 self.eval_hand_ax.set_xticklabels(RANK_LABELS, color=DARK_FG, fontsize=7)
                 self.eval_hand_ax.set_yticks(range(len(RANK_LABELS)))
                 self.eval_hand_ax.set_yticklabels(RANK_LABELS, color=DARK_FG, fontsize=7)
-                self.eval_hand_ax.set_title(f"{scope_label} {metric_label} by Starting Hand", color=DARK_FG, fontsize=10)
+                self.eval_hand_ax.set_title(
+                    f"{scope_label} {metric_label} by Starting Hand{sample_suffix}",
+                    color=DARK_FG,
+                    fontsize=10,
+                )
                 self.eval_hand_ax.text(
                     0.5,
                     -0.17,
@@ -897,18 +1110,23 @@ class TrainingGUI(tk.Tk):
                     clip_on=False,
                 )
             else:
-                self.eval_hand_ax.set_title(f"{scope_label} {metric_label} by Starting Hand (No Data)", color=DARK_FG, fontsize=10)
+                self.eval_hand_ax.set_title(
+                    f"{scope_label} {metric_label} by Starting Hand (No Data){sample_suffix}",
+                    color=DARK_FG,
+                    fontsize=10,
+                )
                 self.eval_hand_ax.set_xticks([])
                 self.eval_hand_ax.set_yticks([])
             self.eval_canvas.draw()
         else:
             self._draw_eval_fallback(
-                results.action_histogram,
+                getattr(results, "postflop_action_histogram", results.action_histogram),
                 metric_label,
-                scope_key,
-                selected_pct,
+                bar_labels,
+                bar_values,
                 hand_grid,
-                scope_label,
+                f"{scope_label} {metric_label}{sample_suffix}",
+                f"{scope_label} {metric_label} by Starting Hand{sample_suffix}",
             )
 
     def _show_eval_results(self, results) -> None:
@@ -924,9 +1142,15 @@ class TrainingGUI(tk.Tk):
         self.eval_text.delete("1.0", tk.END)
 
         if is_suite:
+            suite_title = str(getattr(results, "suite_name", "suite") or "suite").replace("_", " ").upper()
+
+            def _avg_postflop_metric(reports, metric_key: str) -> float:
+                values = [float((getattr(report, "postflop_rates", {}) or {}).get(metric_key, 0.0)) for report in reports.values()]
+                return float(sum(values) / len(values)) if values else 0.0
+
             lines = [
                 f"{'=' * 40}",
-                "  EXPLOIT SUITE RESULTS",
+                f"  {suite_title} RESULTS",
                 f"{'=' * 40}",
                 "",
                 f"  Hands / Mode:     {results.hands_per_mode:,}",
@@ -942,8 +1166,20 @@ class TrainingGUI(tk.Tk):
             for mode_name, report in results.leak_reports.items():
                 lines.append(
                     f"  {mode_name:12s} {report.avg_profit_bb:+8.3f} BB | "
-                    f"WR {report.win_rate:6.1%} | VPIP {report.vpip:6.1%}"
+                    f"WR {report.win_rate:6.1%} | SD {(report.postflop_rates or {}).get('showdown_seen', 0.0):6.1%} | "
+                    f"W$SD {(report.postflop_rates or {}).get('showdown_won', 0.0):6.1%} | "
+                    f"CBetF {(report.postflop_rates or {}).get('cbet_flop', 0.0):6.1%} | "
+                    f"FoldVsF {(report.postflop_rates or {}).get('fold_vs_cbet_flop', 0.0):6.1%}"
                 )
+            lines.append("")
+            lines.append(
+                f"  Leak Avg      {'':3s} {results.avg_leak_profit_bb:+8.3f} BB | "
+                f"WR {results.avg_leak_win_rate:6.1%} | "
+                f"SD {_avg_postflop_metric(results.leak_reports, 'showdown_seen'):6.1%} | "
+                f"W$SD {_avg_postflop_metric(results.leak_reports, 'showdown_won'):6.1%} | "
+                f"CBetF {_avg_postflop_metric(results.leak_reports, 'cbet_flop'):6.1%} | "
+                f"FoldVsF {_avg_postflop_metric(results.leak_reports, 'fold_vs_cbet_flop'):6.1%}"
+            )
             lines.append("")
             lines.append(f"{'-' * 40}")
             lines.append("  ROBUST POOL")
@@ -951,8 +1187,20 @@ class TrainingGUI(tk.Tk):
             for mode_name, report in results.robust_reports.items():
                 lines.append(
                     f"  {mode_name:12s} {report.avg_profit_bb:+8.3f} BB | "
-                    f"WR {report.win_rate:6.1%} | VPIP {report.vpip:6.1%}"
+                    f"WR {report.win_rate:6.1%} | SD {(report.postflop_rates or {}).get('showdown_seen', 0.0):6.1%} | "
+                    f"W$SD {(report.postflop_rates or {}).get('showdown_won', 0.0):6.1%} | "
+                    f"CBetF {(report.postflop_rates or {}).get('cbet_flop', 0.0):6.1%} | "
+                    f"FoldVsF {(report.postflop_rates or {}).get('fold_vs_cbet_flop', 0.0):6.1%}"
                 )
+            lines.append("")
+            lines.append(
+                f"  Robust Avg    {'':3s} {results.avg_robust_profit_bb:+8.3f} BB | "
+                f"WR {results.avg_robust_win_rate:6.1%} | "
+                f"SD {_avg_postflop_metric(results.robust_reports, 'showdown_seen'):6.1%} | "
+                f"W$SD {_avg_postflop_metric(results.robust_reports, 'showdown_won'):6.1%} | "
+                f"CBetF {_avg_postflop_metric(results.robust_reports, 'cbet_flop'):6.1%} | "
+                f"FoldVsF {_avg_postflop_metric(results.robust_reports, 'fold_vs_cbet_flop'):6.1%}"
+            )
 
             self.eval_text.insert(tk.END, "\n".join(lines))
             self.eval_text.config(state=tk.DISABLED)
@@ -966,7 +1214,37 @@ class TrainingGUI(tk.Tk):
                     for spine in ax.spines.values():
                         spine.set_color(DARK_GRID)
                 self.eval_canvas.draw()
+            else:
+                self._draw_eval_fallback(
+                    [],
+                    "Exploit Suite",
+                    [],
+                    [],
+                    [],
+                    "Exploit suite summary in text panel",
+                    "Exploit suite summary in text panel",
+                )
             return
+
+        postflop_rates = getattr(results, "postflop_rates", {}) or {}
+        postflop_counts = getattr(results, "postflop_counts", {}) or {}
+        postflop_profit = getattr(results, "postflop_profit_by_stage", {}) or {}
+        conditioned_rates = getattr(results, "postflop_conditioned_rates_by_street", {}) or {}
+        conditioned_counts = getattr(results, "postflop_conditioned_counts_by_street", {}) or {}
+        avg_postflop_actions = max(0.0, float(results.avg_actions_per_hand) - float(results.avg_preflop_actions_per_hand))
+
+        def _fmt_rate(metric_key: str, hit_key: str, opp_key: str) -> str:
+            rate = float(postflop_rates.get(metric_key, 0.0))
+            hits = int(postflop_counts.get(hit_key, 0))
+            opportunities = int(postflop_counts.get(opp_key, 0))
+            return f"{rate:6.1%} ({hits}/{opportunities})"
+
+        def _fmt_conditioned(street_key: str, metric_key: str) -> str:
+            rate = float((conditioned_rates.get(street_key, {}) or {}).get(metric_key, 0.0))
+            metric_counts = ((conditioned_counts.get(street_key, {}) or {}).get(metric_key, {}) or {})
+            hits = int(metric_counts.get("hits", 0))
+            opportunities = int(metric_counts.get("opportunities", 0))
+            return f"{rate:6.1%} ({hits}/{opportunities})"
 
         lines = [
             f"{'=' * 40}",
@@ -978,10 +1256,12 @@ class TrainingGUI(tk.Tk):
             f"  Avg Profit:      {results.avg_profit_bb:+.3f} BB",
             f"  Win Rate:        {results.win_rate:.1%}",
             f"  VPIP:            {results.vpip:.1%}",
+            f"  RFI:             {results.rfi:.1%}",
             f"  PFR:             {results.pfr:.1%}",
             f"  3-Bet:           {results.three_bet:.1%}",
             f"  Illegal Actions: {results.illegal_action_count}",
             f"  Runtime:         {results.runtime_seconds:.2f}s",
+            f"  Avg Actions:     {results.avg_actions_per_hand:.2f} total | {avg_postflop_actions:.2f} postflop",
             "",
             f"{'-' * 40}",
             "  POSITION BREAKDOWN",
@@ -998,15 +1278,81 @@ class TrainingGUI(tk.Tk):
         for pos_name in POSITION_NAMES:
             lines.append(
                 f"  {pos_name:4s} VPIP {results.vpip_by_position.get(pos_name, 0.0):6.1%} | "
+                f"RFI {results.rfi_by_position.get(pos_name, 0.0):6.1%} | "
                 f"PFR {results.pfr_by_position.get(pos_name, 0.0):6.1%} | "
                 f"3-Bet {results.three_bet_by_position.get(pos_name, 0.0):6.1%}"
             )
 
         lines.append("")
         lines.append(f"{'-' * 40}")
-        lines.append("  ACTION BREAKDOWN")
+        lines.append("  POSTFLOP REACH")
         lines.append(f"{'-' * 40}")
+        lines.append(f"  Flop Seen       {_fmt_rate('flop_seen', 'flop_seen', 'hands')}")
+        lines.append(f"  Turn Seen       {_fmt_rate('turn_seen', 'turn_seen', 'hands')}")
+        lines.append(f"  River Seen      {_fmt_rate('river_seen', 'river_seen', 'hands')}")
+        lines.append(f"  Showdown Seen   {_fmt_rate('showdown_seen', 'showdown_seen', 'hands')}")
+        lines.append(f"  W$SD            {_fmt_rate('showdown_won', 'showdown_won', 'showdown_seen')}")
 
+        lines.append("")
+        lines.append(f"{'-' * 40}")
+        lines.append("  POSTFLOP PROFIT")
+        lines.append(f"{'-' * 40}")
+        lines.append(f"  All Hands       {float(postflop_profit.get('all_hands', 0.0)):+8.3f} BB")
+        lines.append(f"  Saw Flop        {float(postflop_profit.get('flop_seen', 0.0)):+8.3f} BB")
+        lines.append(f"  Saw Turn        {float(postflop_profit.get('turn_seen', 0.0)):+8.3f} BB")
+        lines.append(f"  Saw River       {float(postflop_profit.get('river_seen', 0.0)):+8.3f} BB")
+        lines.append(f"  Showdown        {float(postflop_profit.get('showdown_seen', 0.0)):+8.3f} BB")
+
+        lines.append("")
+        lines.append(f"{'-' * 40}")
+        lines.append("  POSTFLOP TACTICS")
+        lines.append(f"{'-' * 40}")
+        lines.append(f"  Flop C-Bet      {_fmt_rate('cbet_flop', 'cbet_flop_taken', 'cbet_flop_opportunity')}")
+        lines.append(
+            f"  Fold vs F CBet  {_fmt_rate('fold_vs_cbet_flop', 'fold_vs_cbet_flop', 'fold_vs_cbet_flop_opportunity')}"
+        )
+        lines.append(f"  Turn C-Bet      {_fmt_rate('cbet_turn', 'cbet_turn_taken', 'cbet_turn_opportunity')}")
+        lines.append(
+            f"  Fold vs T CBet  {_fmt_rate('fold_vs_cbet_turn', 'fold_vs_cbet_turn', 'fold_vs_cbet_turn_opportunity')}"
+        )
+        lines.append(f"  Postflop Acts   {avg_postflop_actions:8.2f} / hand")
+
+        lines.append("")
+        lines.append(f"{'-' * 40}")
+        lines.append("  POSTFLOP CONDITIONED")
+        lines.append(f"{'-' * 40}")
+        for street_key in POSTFLOP_CONDITION_STREET_KEYS:
+            lines.append(
+                f"  {street_key.title():5s} Check {_fmt_conditioned(street_key, 'check_when_legal')} | "
+                f"Bet/Raise {_fmt_conditioned(street_key, 'bet_raise_when_checked_to')} | "
+                f"FoldVsBet {_fmt_conditioned(street_key, 'fold_when_facing_bet')} | "
+                f"CallVsBet {_fmt_conditioned(street_key, 'call_when_facing_bet')}"
+            )
+
+        lines.append("")
+        lines.append(f"{'-' * 40}")
+        lines.append("  PREFLOP ACTION BREAKDOWN")
+        lines.append(f"{'-' * 40}")
+        preflop_total = sum(getattr(results, "preflop_action_histogram", []) or [])
+        for i, name in enumerate(ACTION_NAMES):
+            count = (getattr(results, "preflop_action_histogram", results.action_histogram) or [0] * len(ACTION_NAMES))[i]
+            pct = count / preflop_total * 100.0 if preflop_total > 0 else 0.0
+            lines.append(f"  {name:8s}  {count:5d}  ({pct:5.1f}%)")
+
+        lines.append("")
+        lines.append(f"{'-' * 40}")
+        lines.append("  POSTFLOP ACTION BREAKDOWN")
+        lines.append(f"{'-' * 40}")
+        postflop_total = sum(getattr(results, "postflop_action_histogram", []) or [])
+        for i, name in enumerate(ACTION_NAMES):
+            count = (getattr(results, "postflop_action_histogram", results.action_histogram) or [0] * len(ACTION_NAMES))[i]
+            pct = count / postflop_total * 100.0 if postflop_total > 0 else 0.0
+            lines.append(f"  {name:8s}  {count:5d}  ({pct:5.1f}%)")
+
+        lines.append("")
+        lines.append(f"{'-' * 40}")
+        lines.append("  OVERALL ACTION BREAKDOWN")
+        lines.append(f"{'-' * 40}")
         total = sum(results.action_histogram)
         for i, name in enumerate(ACTION_NAMES):
             count = results.action_histogram[i]
@@ -1021,28 +1367,31 @@ class TrainingGUI(tk.Tk):
         gs = self.gui_state
 
         self.lbl_status.config(text=f"Status: {gs['status']}")
-        warmup_target = self.trainer.config.warmup_advantage_samples
-        if gs["buffer_size"] < warmup_target:
-            phase_text = f"Learner: Warmup {gs['buffer_size']:,}/{warmup_target:,}"
-        else:
-            phase_text = f"Learner: Updating | Steps: {gs.get('learner_steps', 0):,} | Pool: {gs['pool_size']}"
+        phase_text = (
+            f"Algorithm: {gs.get('algorithm_name', 'tabular_mccfr_6max')} | Iteration: {gs.get('learner_steps', 0):,} "
+            f"| Prune: {'On' if gs.get('pruning_active', False) else 'Off'} "
+            f"| Discount: {'On' if gs.get('discount_active', False) else 'Off'}"
+        )
         self.lbl_phase.config(text=phase_text)
         pct = gs["batch"] / max(1, gs["total_batches"]) * 100.0
         self.prog_bar["value"] = pct
         self.lbl_progress.config(text=f"{gs['batch']:,} / {gs['total_batches']:,} traversals ({pct:.0f}%)")
         self.lbl_speed.config(text=f"Speed: {gs['speed']:.1f} t/s | ETA: {gs['eta']:.1f}m | Traversals: {gs['total_hands']:,}")
 
-        self.lbl_eps.config(text=f"Decisions: {int(gs['epsilon']):,}")
-        self.lbl_loss_val.config(text=f"Regret: {gs['loss']:.4f} | Strategy: {gs['aux_loss']:.4f}")
+        self.lbl_eps.config(text=f"Infosets: {int(gs.get('infoset_count', 0)):,} | Decisions: {int(gs.get('traverser_decisions', 0)):,}")
+        self.lbl_loss_val.config(
+            text=(
+                f"Prune: {'On' if gs.get('pruning_active', False) else 'Off'} | "
+                f"Discount: {'On' if gs.get('discount_active', False) else 'Off'} | "
+                f"Factor: x{float(gs.get('last_discount_factor', 1.0)):.3f}"
+            )
+        )
         bb100_window = int(gs.get("bb100_window", 0))
         self.lbl_bb100_val.config(
-            text=f"BB/hand: {gs.get('bb_per_hand', 0.0):+.3f} | BB/100: {gs['bb_100']:+.1f} ({bb100_window}h)"
+            text=f"{str(gs.get('monitor_mode', 'self_play')).title()} BB/hand: {gs.get('bb_per_hand', 0.0):+.3f} | BB/100: {gs['bb_100']:+.1f} ({bb100_window}h)"
         )
         self.lbl_buffer.config(
-            text=(
-                f"Adv: {gs['buffer_size']:,}/{gs['buffer_cap']//1000}k "
-                f"| Strat: {gs['buffer_size_aux']:,}/{gs['buffer_cap_aux']//1000}k"
-            )
+            text=f"Algorithm: {gs.get('algorithm_name', 'tabular_mccfr_6max')} | Pool: {gs['pool_size']}"
         )
         self.lbl_hands.config(text=f"Traversals: {gs['total_hands']:,}")
         self.lbl_pool.config(text=f"Pool: {gs['pool_size']}")
@@ -1069,29 +1418,35 @@ class TrainingGUI(tk.Tk):
             val = gs["perf_stats"].get(key, 0.0)
             lbl.config(text=f"{val:.3f} ms")
 
-        total_action_pct = sum(gs["action_pcts"].values())
-        fold_pct = gs["action_pcts"].get(0, 0.0)
-        entropy = self.trainer.get_snapshot().action_entropy
-        if gs["buffer_size"] < warmup_target:
-            health_text = (
-                f"Warming up: updates start after {warmup_target:,} advantage samples. "
-                f"BB/hand uses the last {int(gs.get('bb100_window', 0)):,} traversals; BB/100 is BB/hand x 100."
-            )
-        elif int(gs.get("state_err", 0.0)) > 0 or int(gs.get("fallbacks", 0.0)) > 0:
+        conditioned_rates = gs.get("postflop_conditioned_rates", {})
+        conditioned_counts = gs.get("postflop_conditioned_counts", {})
+        flop_check_rate = float((conditioned_rates.get("flop", {}) or {}).get("check_when_legal", 0.0))
+        flop_check_opp = int(
+            ((conditioned_counts.get("flop", {}) or {}).get("check_when_legal", {}) or {}).get("opportunities", 0)
+        )
+        turn_check_rate = float((conditioned_rates.get("turn", {}) or {}).get("check_when_legal", 0.0))
+        turn_check_opp = int(
+            ((conditioned_counts.get("turn", {}) or {}).get("check_when_legal", {}) or {}).get("opportunities", 0)
+        )
+        fold_vs_bet_rate = float((conditioned_rates.get("flop", {}) or {}).get("fold_when_facing_bet", 0.0))
+        fold_vs_bet_opp = int(
+            ((conditioned_counts.get("flop", {}) or {}).get("fold_when_facing_bet", {}) or {}).get("opportunities", 0)
+        )
+        if int(gs.get("state_err", 0.0)) > 0 or int(gs.get("fallbacks", 0.0)) > 0:
             health_text = "Warning: state/action errors should stay at 0. Stop and inspect encoder or action mapping."
-        elif total_action_pct > 0.0 and fold_pct >= 80.0:
+        elif flop_check_opp >= 50 and flop_check_rate < 0.10:
             health_text = (
-                "Warning: policy is folding too often. Healthy training should show some calls and raises, "
-                "not mostly Fold."
+                "Warning: flop check frequency on check-legal nodes is too low. Postflop policy is still over-betting."
             )
-        elif total_action_pct > 0.0 and entropy < 0.35:
-            health_text = "Warning: entropy is very low. Healthy values are roughly 0.8-2.0 with a mixed action profile."
+        elif turn_check_opp >= 30 and turn_check_rate < 0.08:
+            health_text = "Warning: turn check frequency on check-legal nodes is still collapsing."
+        elif fold_vs_bet_opp >= 30 and fold_vs_bet_rate < 0.05:
+            health_text = "Warning: fold-vs-bet is unrealistically low on flop facing-bet nodes."
         else:
             health_text = (
-                f"Healthy: BB/hand is over the last {int(gs.get('bb100_window', 0)):,} traversals, "
-                f"BB/100 is the same rolling value x 100, "
-                f"VPIP/PFR/3-Bet use the last {int(gs.get('style_window', 0)):,}, "
-                f"and position BB/100 uses up to {int(gs.get('position_window', 0))} seat samples."
+                f"Healthy: {str(gs.get('monitor_mode', 'self_play')).title()} BB/100 is over the last {int(gs.get('bb100_window', 0)):,} traversals, "
+                f"infoset growth should remain positive, "
+                f"and conditioned postflop checks/folds are the primary sanity signals."
             )
         self.lbl_health.config(text=health_text)
 
@@ -1122,23 +1477,23 @@ class TrainingGUI(tk.Tk):
         self.ax_loss.clear()
         self.ax_loss.set_facecolor("#181825")
         self.ax_loss.grid(True, color=DARK_GRID, alpha=0.3, linewidth=0.5)
-        self.ax_loss.set_title("Training Loss", color=DARK_FG, fontsize=10)
+        self.ax_loss.set_title("Infoset Growth", color=DARK_FG, fontsize=10)
 
         if gs["loss_history"]:
-            data_regret = gs["loss_history"]
-            self.ax_loss.plot(data_regret, color="#f38ba8", linewidth=1, alpha=0.4, label="Regret")
-            if len(data_regret) > 10:
-                window = min(50, max(2, len(data_regret) // 3))
-                smoothed = np.convolve(data_regret, np.ones(window) / window, mode="valid")
-                self.ax_loss.plot(range(window - 1, len(data_regret)), smoothed, color="#f38ba8", linewidth=2)
+            data_infosets = gs["loss_history"]
+            self.ax_loss.plot(data_infosets, color="#f38ba8", linewidth=1, alpha=0.4, label="Infosets")
+            if len(data_infosets) > 10:
+                window = min(50, max(2, len(data_infosets) // 3))
+                smoothed = np.convolve(data_infosets, np.ones(window) / window, mode="valid")
+                self.ax_loss.plot(range(window - 1, len(data_infosets)), smoothed, color="#f38ba8", linewidth=2)
 
         if gs["aux_loss_history"]:
-            data_strategy = gs["aux_loss_history"]
-            self.ax_loss.plot(data_strategy, color="#89b4fa", linewidth=1, alpha=0.35, label="Strategy")
-            if len(data_strategy) > 10:
-                window = min(50, max(2, len(data_strategy) // 3))
-                smoothed = np.convolve(data_strategy, np.ones(window) / window, mode="valid")
-                self.ax_loss.plot(range(window - 1, len(data_strategy)), smoothed, color="#89b4fa", linewidth=2)
+            data_pool = gs["aux_loss_history"]
+            self.ax_loss.plot(data_pool, color="#89b4fa", linewidth=1, alpha=0.35, label="Pool")
+            if len(data_pool) > 10:
+                window = min(50, max(2, len(data_pool) // 3))
+                smoothed = np.convolve(data_pool, np.ones(window) / window, mode="valid")
+                self.ax_loss.plot(range(window - 1, len(data_pool)), smoothed, color="#89b4fa", linewidth=2)
         if gs["loss_history"] or gs["aux_loss_history"]:
             self.ax_loss.legend(
                 loc="upper right",
@@ -1155,7 +1510,7 @@ class TrainingGUI(tk.Tk):
         self.ax_actions.clear()
         self.ax_actions.set_facecolor("#181825")
         self.ax_actions.grid(True, color=DARK_GRID, alpha=0.3, linewidth=0.5)
-        self.ax_actions.set_title("Action Distribution", color=DARK_FG, fontsize=10)
+        self.ax_actions.set_title("Postflop Action Distribution", color=DARK_FG, fontsize=10)
         hist = gs["action_history"]
         if hist[0]:
             n = len(hist[0])
@@ -1480,7 +1835,14 @@ class TrainingGUI(tk.Tk):
             canvas.create_text(center_x, bottom + 10, text=labels[idx], fill=DARK_FG, font=("Consolas", 8))
             canvas.create_text(center_x, y - 8, text=f"{float(value):.1f}%", fill=DARK_FG, font=("Consolas", 8))
 
-    def _draw_heatmap_chart(self, canvas: tk.Canvas, grid_values, metric_label: str = "VPIP", scope_label: str = "Overall") -> None:
+    def _draw_heatmap_chart(
+        self,
+        canvas: tk.Canvas,
+        grid_values,
+        metric_label: str = "VPIP",
+        scope_label: str = "Overall",
+        title: Optional[str] = None,
+    ) -> None:
         frame = self._draw_chart_frame(canvas)
         if frame is None:
             return
@@ -1488,7 +1850,7 @@ class TrainingGUI(tk.Tk):
         canvas.create_text(
             (left + right) / 2,
             top + 2,
-            text=f"{scope_label} {metric_label} by Starting Hand",
+            text=title or f"{scope_label} {metric_label} by Starting Hand",
             fill=DARK_FG,
             font=("Consolas", 9, "bold"),
             anchor="n",
@@ -1528,7 +1890,7 @@ class TrainingGUI(tk.Tk):
             anchor="s",
         )
 
-    def _draw_eval_fallback(self, counts, metric_label, scope_key, selected_pct, hand_grid, scope_label) -> None:
+    def _draw_eval_fallback(self, counts, metric_label, bar_labels, bar_values, hand_grid, bar_title, heatmap_title) -> None:
         action_canvas = getattr(self, "eval_fallback_action_canvas", None)
         vpip_canvas = getattr(self, "eval_fallback_vpip_canvas", None)
         hand_canvas = getattr(self, "eval_fallback_hand_canvas", None)
@@ -1564,13 +1926,26 @@ class TrainingGUI(tk.Tk):
             if pct > 0.0:
                 action_canvas.create_text(center_x, y - 8, text=f"{pct:.1f}%", fill=DARK_FG, font=("Consolas", 8))
 
-        label = metric_label if scope_key == "overall" else scope_key
-        self._draw_percentage_bar_chart(vpip_canvas, [label], [selected_pct], f"{metric_label} {scope_label}")
-        self._draw_heatmap_chart(hand_canvas, hand_grid, metric_label=metric_label, scope_label=scope_label)
+        self._draw_percentage_bar_chart(vpip_canvas, bar_labels, bar_values, bar_title)
+        self._draw_heatmap_chart(hand_canvas, hand_grid, metric_label=metric_label, title=heatmap_title)
+
+    def _on_close(self) -> None:
+        self.stop_requested = True
+        self.pause_requested = False
+        try:
+            self.trainer.shutdown()
+        finally:
+            self.destroy()
 
 
 if __name__ == "__main__":
     app = TrainingGUI()
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        try:
+            app.trainer.shutdown()
+        except Exception:
+            pass
 
 

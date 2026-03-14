@@ -8,7 +8,7 @@ import time
 import tkinter as tk
 from types import SimpleNamespace
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -24,7 +24,12 @@ for _path in (FEATURES_DIR, MODELS_DIR, WORKERS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from poker_model_v24 import PokerDeepCFRNet, load_compatible_state_dict
+from poker_model_v24 import (
+    PokerDeepCFRNet,
+    PokerLeafValueNet,
+    load_compatible_leaf_value_state_dict,
+    load_compatible_state_dict,
+)
 from poker_state_v24 import (
     ACTION_ALL_IN,
     ACTION_CALL,
@@ -33,6 +38,7 @@ from poker_state_v24 import (
     ACTION_NAMES_V21,
     ALL_RAISE_ACTIONS,
     POSITION_NAMES_V21,
+    PUBLIC_BELIEF_STATE_DIM_V24,
     STATE_DIM_V21,
     abstract_raise_target,
     build_legal_action_mask,
@@ -40,13 +46,16 @@ from poker_state_v24 import (
     flatten_cards_list,
     street_from_board_len,
 )
+from tabular_policy_v24 import TabularPolicySnapshot, deserialize_node_store, freeze_policy_snapshot
 from poker_worker_v24 import (
     HandContext,
+    _record_action_history,
     _new_preflop_stats,
     _policy_action_for_snapshot,
     _record_postflop_action_stats,
     _record_preflop_action_stats,
     apply_abstract_action,
+    build_runtime_policy_config,
 )
 
 NUM_PLAYERS = 6
@@ -54,9 +63,14 @@ DEFAULT_BIG_BLIND = 10
 DEFAULT_STACK_BB = 100.0
 DEFAULT_HERO_SEAT = 5
 DEFAULT_INTER_HAND_DELAY_MS = 850
-DEFAULT_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "models", "poker_agent_v24_deepcfr.pt")
-ACTION_SHORT_NAMES = ["F", "X", "C", "R25", "R50", "R75", "R100", "R125", "R150", "R200", "AI"]
+DEFAULT_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "models", "poker_agent_v24_tabular_mccfr.pt")
+ACTION_SHORT_NAMES = ["F", "X", "C", "AS", "AL"]
 CARD_BACK = "?? ??"
+SUPPORTED_ACTION_ABSTRACTIONS = {
+    "conservative_5a",
+    "contextual_postflop_v3_5a",
+    "contextual_v1",
+}
 
 COLOR_BG = "#0f1420"
 COLOR_PANEL = "#1b2436"
@@ -73,6 +87,7 @@ COLOR_TABLE_INNER = "#187a5f"
 COLOR_BOARD_BG = "#0d1220"
 
 STREET_NAMES = {0: "Preflop", 1: "Flop", 2: "Turn", 3: "River"}
+PolicySource = Union[PokerDeepCFRNet, TabularPolicySnapshot]
 
 
 def _format_card(card) -> str:
@@ -90,6 +105,59 @@ def _format_cards(cards) -> str:
 
 def _seat_label(seat: int) -> str:
     return f"{POSITION_NAMES_V21[seat]} ({seat})"
+
+
+def _seat_hole_cards_for_display(state, hand_ctx: Optional[HandContext], seat: int):
+    if hand_ctx is not None:
+        captured = getattr(hand_ctx, "hole_cards_by_seat", None)
+        if isinstance(captured, list) and 0 <= int(seat) < len(captured):
+            flat = flatten_cards_list(captured[int(seat)])
+            if flat:
+                return flat
+    hole_cards = getattr(state, "hole_cards", None)
+    if isinstance(hole_cards, list) and 0 <= int(seat) < len(hole_cards):
+        return flatten_cards_list(hole_cards[int(seat)])
+    return []
+
+
+def _format_post_hand_log(
+    hand_index: int,
+    hero_profit_bb: float,
+    hero_seat: int,
+    state,
+    hand_ctx: Optional[HandContext],
+    clone_name_by_seat: Dict[int, str],
+    clone_id_by_seat: Dict[int, int],
+    clone_bankroll_chips,
+    big_blind: int,
+) -> str:
+    outcome = "won" if hero_profit_bb > 0 else "lost" if hero_profit_bb < 0 else "chopped"
+    hero_stack_bb = float(state.stacks[hero_seat]) / float(max(1, int(big_blind)))
+    lines = [f"Hand #{int(hand_index)} complete. You {outcome} {hero_profit_bb:+.2f} BB."]
+    board_cards = _format_cards(getattr(state, "board_cards", []))
+    if board_cards != "-":
+        lines.append(f"Board: {board_cards}")
+    lines.append(
+        f"You ({_seat_label(hero_seat)}): "
+        f"{_format_cards(_seat_hole_cards_for_display(state, hand_ctx, hero_seat))} [{hero_stack_bb:.1f} BB]"
+    )
+    lines.append("Revealed opponent cards:")
+    for seat in range(len(getattr(state, "stacks", []))):
+        if int(seat) == int(hero_seat):
+            continue
+        name = clone_name_by_seat.get(seat, f"Clone {seat}")
+        clone_id = clone_id_by_seat.get(seat, -1)
+        stack_chips = (
+            clone_bankroll_chips[clone_id]
+            if 0 <= clone_id < len(clone_bankroll_chips)
+            else int(state.stacks[seat])
+        )
+        lines.append(
+            f"{name} ({_seat_label(seat)}): "
+            f"{_format_cards(_seat_hole_cards_for_display(state, hand_ctx, seat))} "
+            f"[{stack_chips / float(max(1, int(big_blind))):.1f} BB]"
+        )
+    return "\n".join(lines)
 
 
 def _sample_action(probs: np.ndarray, rng: random.Random) -> int:
@@ -136,16 +204,21 @@ def _infer_model_dims(state_dict: Dict[str, torch.Tensor], config: Dict[str, obj
     action_dim = int(config.get("action_count", 0) or 0)
 
     input_weight = None
+    strategy_weight = None
     regret_weight = None
     for key, tensor in state_dict.items():
         if input_weight is None and str(key).endswith("input_layer.weight"):
             input_weight = tensor
+        if strategy_weight is None and str(key).endswith("strategy_head.2.weight"):
+            strategy_weight = tensor
         if regret_weight is None and str(key).endswith("regret_head.2.weight"):
             regret_weight = tensor
 
     if input_weight is not None:
         hidden_dim = int(input_weight.shape[0])
         state_dim = int(input_weight.shape[1])
+    if strategy_weight is not None:
+        action_dim = int(strategy_weight.shape[0])
     if regret_weight is not None:
         action_dim = int(regret_weight.shape[0])
 
@@ -153,6 +226,23 @@ def _infer_model_dims(state_dict: Dict[str, torch.Tensor], config: Dict[str, obj
     state_dim = state_dim if state_dim > 0 else STATE_DIM_V21
     action_dim = action_dim if action_dim > 0 else ACTION_COUNT_V21
     return state_dim, hidden_dim, action_dim
+
+
+def _infer_leaf_value_dims(state_dict: Dict[str, torch.Tensor], config: Dict[str, object]) -> tuple[int, int]:
+    state_dim = int(config.get("public_belief_state_dim", PUBLIC_BELIEF_STATE_DIM_V24) or PUBLIC_BELIEF_STATE_DIM_V24)
+    hidden_dim = int(config.get("leaf_value_hidden_dim", 0) or 0)
+
+    input_weight = state_dict.get("input_layer.weight")
+    head_weight = state_dict.get("value_head.2.weight")
+    if input_weight is not None and len(input_weight.shape) == 2:
+        hidden_dim = int(input_weight.shape[0])
+        state_dim = int(input_weight.shape[1])
+    if head_weight is not None and len(head_weight.shape) != 2:
+        hidden_dim = hidden_dim if hidden_dim > 0 else 128
+
+    state_dim = state_dim if state_dim > 0 else PUBLIC_BELIEF_STATE_DIM_V24
+    hidden_dim = hidden_dim if hidden_dim > 0 else 128
+    return state_dim, hidden_dim
 
 
 def _aligned_state_vector_for_model(model: Optional[PokerDeepCFRNet], state_vec: np.ndarray) -> np.ndarray:
@@ -171,15 +261,56 @@ def _aligned_state_vector_for_model(model: Optional[PokerDeepCFRNet], state_vec:
     return aligned
 
 
-def load_policy(path: str) -> tuple[PokerDeepCFRNet, Dict[str, object]]:
-    payload = torch.load(path, map_location="cpu")
-    state_dict = _state_dict_from_payload(payload)
+def _load_tabular_policy(payload: Dict[str, object], config: Dict[str, object]) -> TabularPolicySnapshot:
+    actor_snapshot_payload = payload.get("actor_snapshot")
+    if isinstance(actor_snapshot_payload, dict):
+        return TabularPolicySnapshot.from_payload(actor_snapshot_payload)
+
+    node_store_payload = payload.get("node_store", {})
+    if isinstance(node_store_payload, dict):
+        node_store = deserialize_node_store(node_store_payload)
+        metrics = payload.get("metrics", {})
+        metadata = {}
+        if isinstance(metrics, dict):
+            metadata = {
+                "traversals_completed": int(metrics.get("traversals_completed", 0)),
+                "iteration": int(metrics.get("outer_iteration", 0)),
+            }
+        elif isinstance(config, dict):
+            metadata = {
+                "traversals_completed": int(config.get("traversals_completed", 0) or 0),
+                "iteration": int(config.get("current_iteration", 0) or 0),
+            }
+        return freeze_policy_snapshot(node_store, metadata)
+
+    raise ValueError("Could not find actor snapshot or node store in tabular v24 checkpoint.")
+
+
+def load_policy(path: str) -> tuple[PolicySource, Optional[PokerLeafValueNet], Dict[str, object]]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     config = _config_from_payload(payload)
-    _, hidden_dim, _ = _infer_model_dims(state_dict, config)
+    format_version = str(payload.get("format_version", "") or "")
+    if format_version == "tabular_mccfr_v24" or "actor_snapshot" in payload or "node_store" in payload:
+        return _load_tabular_policy(payload, config), None, config
+
+    state_dict = _state_dict_from_payload(payload)
+    abstraction_name = str(config.get("action_abstraction_name", "legacy_v24") or "legacy_v24")
+    state_dim, hidden_dim, action_dim = _infer_model_dims(state_dict, config)
+    if abstraction_name not in SUPPORTED_ACTION_ABSTRACTIONS:
+        raise RuntimeError(
+            "Loaded checkpoint uses an incompatible action abstraction "
+            f"({abstraction_name}). Supported abstractions: "
+            f"{', '.join(sorted(SUPPORTED_ACTION_ABSTRACTIONS))}."
+        )
+    if action_dim != ACTION_COUNT_V21:
+        raise RuntimeError(
+            "Loaded checkpoint uses an incompatible action count "
+            f"({action_dim}). Human eval expects {ACTION_COUNT_V21} actions."
+        )
     model = PokerDeepCFRNet(
-        state_dim=STATE_DIM_V21,
+        state_dim=state_dim,
         hidden_dim=hidden_dim,
-        action_dim=ACTION_COUNT_V21,
+        action_dim=action_dim,
         init_weights=False,
     )
     load_compatible_state_dict(model, state_dict)
@@ -187,23 +318,25 @@ def load_policy(path: str) -> tuple[PokerDeepCFRNet, Dict[str, object]]:
     model.to("cpu")
     for param in model.parameters():
         param.requires_grad_(False)
-    return model, config
+    leaf_model = None
+    leaf_state_dict = payload.get("leaf_value_state_dict")
+    if isinstance(leaf_state_dict, dict):
+        leaf_state_dim, leaf_hidden_dim = _infer_leaf_value_dims(leaf_state_dict, config)
+        leaf_model = PokerLeafValueNet(
+            state_dim=leaf_state_dim,
+            hidden_dim=leaf_hidden_dim,
+            init_weights=False,
+        )
+        load_compatible_leaf_value_state_dict(leaf_model, leaf_state_dict)
+        leaf_model.eval()
+        leaf_model.to("cpu")
+        for param in leaf_model.parameters():
+            param.requires_grad_(False)
+    return model, leaf_model, config
 
 
 def _runtime_policy_config(config: Optional[Dict[str, object]]) -> SimpleNamespace:
-    payload = dict(config or {})
-    defaults = {
-        "exploit_prior_enabled": True,
-        "exploit_prior_strength": 0.55,
-        "exploit_min_confidence": 0.10,
-        "exploit_only_preflop_unopened": False,
-        "exploit_teacher_mix": 0.65,
-        "opponent_profile_short_alpha": 0.25,
-        "opponent_profile_long_alpha": 0.05,
-        "opponent_profile_confidence_scale": 256.0,
-    }
-    defaults.update(payload)
-    return SimpleNamespace(**defaults)
+    return build_runtime_policy_config(config)
 
 
 def _opponent_metric_specs() -> tuple:
@@ -332,9 +465,9 @@ class HumanEvalGUI(tk.Tk):
         self.hero_start_seat = int(hero_seat) % NUM_PLAYERS
         self.current_hero_seat = self.hero_start_seat
 
-        self.base_model: Optional[PokerDeepCFRNet] = None
+        self.base_model: Optional[PolicySource] = None
         self.model_runtime_config = _runtime_policy_config({})
-        self.seat_models: Dict[int, PokerDeepCFRNet] = {}
+        self.seat_models: Dict[int, PolicySource] = {}
         self.clone_name_by_seat: Dict[int, str] = {}
         self.clone_id_by_seat: Dict[int, int] = {}
         self.player_id_by_seat: Dict[int, str] = {}
@@ -691,8 +824,9 @@ class HumanEvalGUI(tk.Tk):
             messagebox.showerror("Model Error", msg)
             return
         try:
-            self.base_model, model_config = load_policy(path)
+            self.base_model, leaf_model, model_config = load_policy(path)
             self.model_runtime_config = _runtime_policy_config(model_config)
+            setattr(self.model_runtime_config, "resolve_leaf_value_model", leaf_model)
             self._rebuild_clone_lineup()
             self.status_var.set(f"Loaded model: {path}")
             self._append_log(f"Loaded v24 model from {path}")
@@ -700,6 +834,7 @@ class HumanEvalGUI(tk.Tk):
         except Exception as exc:
             self.base_model = None
             self.model_runtime_config = _runtime_policy_config({})
+            setattr(self.model_runtime_config, "resolve_leaf_value_model", None)
             self.seat_models = {}
             self.clone_name_by_seat = {}
             msg = f"Failed to load model:\n{exc}"
@@ -735,7 +870,10 @@ class HumanEvalGUI(tk.Tk):
             return
         opponent_seats = [seat for seat in range(NUM_PLAYERS) if seat != self.hero_seat]
         for clone_idx, seat in enumerate(opponent_seats):
-            self.seat_models[seat] = self.base_model.clone_cpu()
+            if isinstance(self.base_model, PokerDeepCFRNet):
+                self.seat_models[seat] = self.base_model.clone_cpu()
+            else:
+                self.seat_models[seat] = self.base_model
             self.clone_name_by_seat[seat] = f"Clone {clone_idx + 1}"
             self.clone_id_by_seat[seat] = clone_idx
             self.player_id_by_seat[seat] = f"clone_{clone_idx + 1}"
@@ -907,6 +1045,9 @@ class HumanEvalGUI(tk.Tk):
         )
         while state.can_deal_hole():
             state.deal_hole()
+        hole_cards_by_seat = [
+            list(flatten_cards_list(state.hole_cards[seat])) for seat in range(min(NUM_PLAYERS, len(state.hole_cards)))
+        ]
 
         contributions = [float(start - stack) for start, stack in zip(stacks, state.stacks)]
         hand_ctx = HandContext(
@@ -915,6 +1056,7 @@ class HumanEvalGUI(tk.Tk):
             small_blind=self.small_blind,
             in_hand=[True] * NUM_PLAYERS,
             contributions=contributions,
+            hole_cards_by_seat=hole_cards_by_seat,
         )
         return state, hand_ctx
 
@@ -972,11 +1114,25 @@ class HumanEvalGUI(tk.Tk):
         if self.state is None or self.hand_ctx is None:
             return
         dealt = False
-        while self.state.status and self.state.can_deal_board():
+        while self.state.status:
+            burn_index = len(getattr(self.hand_ctx, "dealt_burn_cards", ()))
+            if burn_index < len(getattr(self.state, "burn_cards", ())):
+                self.hand_ctx.dealt_burn_cards.extend(self.state.burn_cards[burn_index:])
+            if bool(getattr(self.state, "card_burning_status", False)):
+                if len(getattr(self.hand_ctx, "dealt_burn_cards", ())) >= len(getattr(self.state, "burn_cards", ())):
+                    self.state.burn_card()
+                    self.hand_ctx.dealt_burn_cards.append(self.state.burn_cards[-1])
+                continue
+            if not self.state.can_deal_board():
+                break
+            previous_board_len = len(flatten_cards_list(self.state.board_cards))
             self.state.deal_board()
             board = flatten_cards_list(self.state.board_cards)
             self.hand_ctx.current_street = street_from_board_len(len(board))
             self.hand_ctx.street_raise_count = 0
+            self.hand_ctx.flop_seen = self.hand_ctx.current_street >= 1
+            if len(board) > previous_board_len:
+                self.hand_ctx.dealt_board_cards.extend(board[previous_board_len:])
             if self.hand_ctx.current_street == 1:
                 self.hand_ctx.cbet_flop_initiator = None
                 self.hand_ctx.cbet_turn_initiator = None
@@ -1084,7 +1240,7 @@ class HumanEvalGUI(tk.Tk):
         action_id = ACTION_ALL_IN if int(target_to_chips) >= int(max_raise) else int(ALL_RAISE_ACTIONS[0])
         closest_gap = None
         for candidate in ALL_RAISE_ACTIONS:
-            candidate_target = abstract_raise_target(self.state, candidate)
+            candidate_target = abstract_raise_target(self.state, candidate, self.hand_ctx)
             if candidate_target is None:
                 continue
             gap = abs(int(candidate_target) - int(target_to_chips))
@@ -1130,6 +1286,7 @@ class HumanEvalGUI(tk.Tk):
             self.hand_ctx.preflop_last_raiser = actor
         raise_delta_bb = max(0.0, (float(self.state.bets[actor]) - before_bet) / float(self.big_blind))
         self.hand_ctx.last_aggressive_size_bb = raise_delta_bb
+        _record_action_history(self.hand_ctx, actor, action_id, False)
 
         action_name = f"Raise To {float(self.state.bets[actor]) / float(self.big_blind):.2f} BB"
         actor_name = "You" if actor == self.hero_seat else self.clone_name_by_seat.get(actor, f"Clone {actor}")
@@ -1270,22 +1427,18 @@ class HumanEvalGUI(tk.Tk):
             self.model_runtime_config,
         )
 
-        clone_cards = []
-        for seat in range(NUM_PLAYERS):
-            if seat == self.hero_seat:
-                continue
-            name = self.clone_name_by_seat.get(seat, f"Clone {seat}")
-            clone_id = self.clone_id_by_seat.get(seat, -1)
-            stack_chips = self.clone_bankroll_chips[clone_id] if 0 <= clone_id < len(self.clone_bankroll_chips) else int(
-                self.state.stacks[seat]
-            )
-            clone_cards.append(
-                f"{name}: {_format_cards(self.state.hole_cards[seat])} [{stack_chips / float(self.big_blind):.1f} BB]"
-            )
-
-        outcome = "won" if hero_profit_bb > 0 else "lost" if hero_profit_bb < 0 else "chopped"
         self._append_log(
-            f"Hand #{self.hand_index} complete. You {outcome} {hero_profit_bb:+.2f} BB | " + " | ".join(clone_cards)
+            _format_post_hand_log(
+                hand_index=self.hand_index,
+                hero_profit_bb=hero_profit_bb,
+                hero_seat=self.hero_seat,
+                state=self.state,
+                hand_ctx=self.hand_ctx,
+                clone_name_by_seat=self.clone_name_by_seat,
+                clone_id_by_seat=self.clone_id_by_seat,
+                clone_bankroll_chips=self.clone_bankroll_chips,
+                big_blind=self.big_blind,
+            )
         )
 
         if self.session_running:
@@ -1427,7 +1580,11 @@ class HumanEvalGUI(tk.Tk):
             stack_bb = float(self.state.stacks[seat]) / float(self.big_blind)
             bet_bb = float(self.state.bets[seat]) / float(self.big_blind)
             show_cards = seat == self.hero_seat or self.show_model_cards_var.get() or (not self.hand_active)
-            cards = _format_cards(self.state.hole_cards[seat]) if show_cards else CARD_BACK
+            cards = (
+                _format_cards(_seat_hole_cards_for_display(self.state, self.hand_ctx, seat))
+                if show_cards
+                else CARD_BACK
+            )
             last_action = self.last_action_by_seat.get(seat, "-")
 
             canvas.create_text(x, y0 + 14, text=f"{POSITION_NAMES_V21[seat]} | {role}", fill="#ffffff", font=("Segoe UI", 9, "bold"))
