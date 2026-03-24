@@ -4,6 +4,9 @@ venv
 checkpoints
 test_repos
 training/models/
-
+# Other models
+logs
+external
+training/results/v26
 # Docker
 docker-compose.override.yml

@@ -67,7 +67,7 @@ class ModelService:
         if not isinstance(checkpoint, dict):
             return None
         format_version = str(checkpoint.get("format_version", "")).strip().lower()
-        if format_version != "tabular_mccfr_v24" and "actor_snapshot" not in checkpoint and "node_store" not in checkpoint:
+        if format_version not in {"tabular_mccfr_v24", "tabular_mccfr_v25"} and "actor_snapshot" not in checkpoint and "node_store" not in checkpoint:
             return None
 
         actor_snapshot = checkpoint.get("actor_snapshot")
@@ -144,7 +144,9 @@ class ModelService:
 
     def _deepcfr_runtime(self, version: str):
         version_num = version_to_int(version)
-        if version_num >= 24:
+        if version_num >= 25:
+            module_name = "poker_model_v24"
+        elif version_num >= 24:
             module_name = "poker_model_v24"
         elif version_num >= 23:
             module_name = "poker_model_v23"

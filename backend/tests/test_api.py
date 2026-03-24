@@ -10,7 +10,9 @@ import json
 from fastapi.testclient import TestClient
 
 from backend.main import app
-from backend.poker_versions import ACTION_NAMES_V24
+from backend.models.schemas import GameStateRequest
+from backend.poker_versions import ACTION_NAMES_V24, ACTION_NAMES_V25
+from backend.services.game_service import GameService
 
 
 def log_response(test_name: str, response):
@@ -253,6 +255,98 @@ class TestActionEndpoint:
         data = response.json()
         # With top two pair, equity should be high
         assert data["equity"] > 0.5
+
+    def test_v25_runtime_action_route_uses_game_service_resolver(self, client, monkeypatch, valid_game_state):
+        game_state = dict(valid_game_state)
+        game_state["model_version"] = "v25"
+
+        expected_q = {name: 0.0 for name in ACTION_NAMES_V25.values()}
+        expected_q["CALL"] = 0.75
+        expected_q["RAISE_SMALL"] = 0.25
+
+        monkeypatch.setattr(
+            GameService,
+            "get_runtime_action_for_actor",
+            lambda self, game_state, actor_index, version=None: (2, dict(expected_q)),
+        )
+
+        class DummyModelService:
+            def get_action(self, *args, **kwargs):
+                raise AssertionError("Legacy observation-only inference should not be used for v25 runtime resolving.")
+
+        monkeypatch.setattr("backend.services.model_service.get_model_service", lambda: DummyModelService())
+
+        response = client.post("/poker/action", json=game_state)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["action_id"] == 2
+        assert data["action"] == "CALL"
+        assert data["q_values"] == expected_q
+
+
+class TestV25RuntimeResolving:
+    def test_game_service_runtime_action_for_actor_uses_resolved_policy(self, monkeypatch):
+        import numpy as np
+        import backend.services.game_service as game_service_module
+
+        game_state = GameStateRequest.model_validate(
+            {
+                "community_cards": [],
+                "pot": 15,
+                "players": [
+                    {
+                        "position": 0,
+                        "stack": 990,
+                        "bet": 5,
+                        "hole_cards": [
+                            {"rank": "A", "suit": "h"},
+                            {"rank": "K", "suit": "s"},
+                        ],
+                        "is_bot": True,
+                        "is_active": True,
+                    },
+                    {
+                        "position": 1,
+                        "stack": 990,
+                        "bet": 10,
+                        "hole_cards": None,
+                        "is_bot": False,
+                        "is_active": True,
+                    },
+                ],
+                "bot_position": 0,
+                "current_bet": 10,
+                "big_blind": 10,
+                "current_player_idx": 0,
+                "model_version": "v25",
+            }
+        )
+
+        class DummyModelService:
+            def load_model(self, version):
+                assert version == "v25"
+                return object()
+
+        monkeypatch.setattr("backend.services.model_service.get_model_service", lambda: DummyModelService())
+
+        def fake_runtime_policy(snapshot, state, actor, hand_ctx, rng, config=None, return_details=False, sample_action=True, **kwargs):
+            del snapshot, state, actor, hand_ctx, rng, kwargs
+            assert config.runtime_subgame_resolving_enabled is True
+            assert sample_action is False
+            policy = np.array([0.05, 0.0, 0.70, 0.20, 0.05, 0.0, 0.0], dtype=np.float32)
+            if return_details:
+                return 2, {"policy": policy, "legal_mask": np.array([1, 0, 1, 1, 1, 0, 0], dtype=np.float32), "resolved": True}
+            return 2
+
+        monkeypatch.setattr(game_service_module, "runtime_policy_action_for_snapshot_v25", fake_runtime_policy)
+
+        service = GameService()
+        action_id, q_values = service.get_runtime_action_for_actor(game_state, 0, version="v25")
+
+        assert action_id == 2
+        assert q_values["CALL"] == pytest.approx(0.70)
+        assert q_values["RAISE_SMALL"] == pytest.approx(0.20)
+        assert set(q_values.keys()) == set(ACTION_NAMES_V25.values())
 
 
 class TestActionEndpointErrors:

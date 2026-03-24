@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   backend:
     build:
@@ -14,6 +12,8 @@ services:
       - ./training/src/models:/app/training/src/models:ro
       - ./training/src/features:/app/training/src/features:ro
       - ./training/src/workers:/app/training/src/workers:ro
+      # Mount trained checkpoints so the container does not rely on baked image copies
+      - ./training/models:/app/training/models:ro
     environment:
       - ENABLE_POKER_ROUTER=1
       - ENABLE_POKER_PRELOAD=1

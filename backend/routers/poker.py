@@ -19,7 +19,7 @@ from backend.models.schemas import (
     PokerStepResponse,
     HAND_STRENGTH_CATEGORIES,
 )
-from backend.poker_versions import get_action_names, get_version_spec
+from backend.poker_versions import get_action_names, get_version_spec, version_to_int
 from backend.services.game_service import get_game_service, GameService, compute_hand_strength_category
 
 
@@ -254,12 +254,18 @@ async def get_action(
                 detail=f"Model service unavailable: {str(e)}",
             ) from e
         
-        # Get model's action
-        action_id, q_values = model_service.get_action(
-            observation, 
-            legal_actions,
-            version=version
-        )
+        if version_to_int(version) >= 25:
+            action_id, q_values = game_service.get_runtime_action_for_actor(
+                game_state,
+                game_state.current_player_idx,
+                version=version,
+            )
+        else:
+            action_id, q_values = model_service.get_action(
+                observation,
+                legal_actions,
+                version=version,
+            )
         
         # Calculate raise amount if applicable
         amount = game_service.calculate_raise_amount(action_id, game_state, version=version)

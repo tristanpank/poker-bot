@@ -38,6 +38,16 @@ ACTION_NAMES_V24 = {
     4: "RAISE_LARGE",
 }
 
+ACTION_NAMES_V25 = {
+    0: "FOLD",
+    1: "CHECK",
+    2: "CALL",
+    3: "RAISE_SMALL",
+    4: "RAISE_MEDIUM",
+    5: "RAISE_LARGE",
+    6: "ALL_IN",
+}
+
 ACTION_NAMES = ACTION_NAMES_V24
 
 V24_NON_ALL_IN_RAISE_ACTIONS = (
@@ -58,6 +68,30 @@ V24_POSTFLOP_BET_POT_MULTIPLIERS = {
 V24_FACING_BET_RAISE_TO_MULTIPLIERS = {
     ACTION_AGGRO_SMALL: 2.50,
     ACTION_AGGRO_LARGE: 3.50,
+}
+
+V25_NON_ALL_IN_RAISE_ACTIONS = (
+    3,
+    4,
+    5,
+)
+
+V25_PREFLOP_OPEN_RAISE_TO_BB = {
+    3: 2.25,
+    4: 2.50,
+    5: 3.00,
+}
+
+V25_POSTFLOP_BET_POT_MULTIPLIERS = {
+    3: 0.33,
+    4: 0.66,
+    5: 1.00,
+}
+
+V25_FACING_BET_RAISE_TO_MULTIPLIERS = {
+    3: 2.20,
+    4: 2.80,
+    5: 3.50,
 }
 
 
@@ -95,6 +129,15 @@ DEEP_CFR_V24_SPEC = PokerVersionSpec(
     summarized_legal_features=True,
 )
 
+DEEP_CFR_V25_SPEC = PokerVersionSpec(
+    version_floor=25,
+    state_dim=91,
+    action_dim=7,
+    action_names=ACTION_NAMES_V25,
+    opponent_profile_dim=11,
+    summarized_legal_features=True,
+)
+
 LEGACY_V15_SPEC = PokerVersionSpec(
     version_floor=15,
     state_dim=520,
@@ -119,6 +162,8 @@ def version_to_int(version: str | None) -> int:
 
 def get_version_spec(version: str | None) -> PokerVersionSpec:
     version_num = version_to_int(version)
+    if version_num >= 25:
+        return DEEP_CFR_V25_SPEC
     if version_num >= 24:
         return DEEP_CFR_V24_SPEC
     if version_num >= 23:

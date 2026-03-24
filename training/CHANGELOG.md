@@ -2,6 +2,48 @@
 
 All notable changes to the poker bot model architecture and training methodology.
 
+## [V26] - External DeepCFR 6-Max NLHE Integration
+
+**Key Changes:**
+- Reworked `v26` to wrap the external `deepcfr-texas-no-limit-holdem-6-players` repository instead of the earlier short-deck path
+- New trainer adapter: `training/src/trainers/poker_trainer_v26.py`
+- New launcher: `training/src/agents/poker_agent_v26.py`
+- Supports the external flow of:
+  - installing the repo requirements into the active Python environment
+  - random-opponent training
+  - resume training from a checkpoint
+  - self-play training from a checkpoint
+  - mixed training against a checkpoint pool
+  - CLI play and PyQt GUI play
+
+**Important Constraints:**
+- `v26` is now full-deck, 6-player no-limit hold'em
+- Integration is still wrapper-based rather than a direct backend inference replacement
+- The default no-training path uses the external repo's shipped flagship checkpoints
+
+**Rationale:** This external repo is a much closer fit to the current product direction than the earlier short-deck MCCFR code. `v26` now gives the project an off-the-shelf 6-max NLHE option, including a workable default play path even before new training runs are started.
+
+---
+
+## [V25] - Cleaned Tabular MCCFR with Expanded Action Space
+
+**Key Changes:**
+- **Expanded action space**: 7 actions
+  - `FOLD`, `CHECK`, `CALL`
+  - `RAISE_SMALL`, `RAISE_MEDIUM`, `RAISE_LARGE`, `ALL_IN`
+- **Action abstraction cleanup**:
+  - Preflop opens now distinguish small / medium / large raise sizes
+  - Postflop betting separates small, medium, and large bet sizes instead of collapsing them
+  - Short-stack all-in remains available as its own action instead of being merged into the largest raise bucket
+- **Tabular-only cleanup**:
+  - Removed legacy neural-model compatibility from the v25 worker path
+  - Trimmed unused trainer config fields carried over from the initial v24 implementation
+  - Kept the state feature layout stable while updating the action abstraction
+
+**Rationale:** V24’s 5-action abstraction collapsed several strategically distinct raise sizes into only two aggressive buckets. V25 keeps the successful tabular MCCFR core but gives the policy finer control over raise sizing and removes leftover implementation baggage that was no longer active.
+
+---
+
 ## [V18] - Hybrid Training with Massive Bust Penalty
 
 **Key Changes:**

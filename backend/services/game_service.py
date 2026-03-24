@@ -35,6 +35,7 @@ from backend.poker_versions import (
     V24_NON_ALL_IN_RAISE_ACTIONS,
     V24_POSTFLOP_BET_POT_MULTIPLIERS,
     V24_PREFLOP_OPEN_RAISE_TO_BB,
+    get_action_names,
     get_version_spec,
     version_to_int,
 )
@@ -43,12 +44,25 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TRAINING_FEATURES_PATH = _REPO_ROOT / "training" / "src" / "features"
 if str(_TRAINING_FEATURES_PATH) not in sys.path:
     sys.path.insert(0, str(_TRAINING_FEATURES_PATH))
+_TRAINING_WORKERS_PATH = _REPO_ROOT / "training" / "src" / "workers"
+if str(_TRAINING_WORKERS_PATH) not in sys.path:
+    sys.path.insert(0, str(_TRAINING_WORKERS_PATH))
 
 from preflop_blueprint_v24 import (  # noqa: E402
     BUILTIN_PREFLOP_BLUEPRINT_NAME,
-    preflop_blueprint_policy,
+    preflop_blueprint_policy as preflop_blueprint_policy_v24,
 )
-from poker_state_v24 import encode_info_state  # noqa: E402
+from preflop_blueprint_v25 import preflop_blueprint_policy as preflop_blueprint_policy_v25  # noqa: E402
+from poker_state_v24 import encode_info_state as encode_info_state_v24  # noqa: E402
+from poker_state_v25 import (  # noqa: E402
+    abstract_raise_target as abstract_raise_target_v25,
+    build_legal_action_mask as build_legal_action_mask_v25,
+    encode_info_state as encode_info_state_v25,
+)
+from poker_worker_v25 import (  # noqa: E402
+    _policy_action_for_snapshot as runtime_policy_action_for_snapshot_v25,
+    build_runtime_policy_config as build_runtime_policy_config_v25,
+)
 
 
 FRONTEND_ACTION_FOLD = "fold"
@@ -672,6 +686,37 @@ class GameService:
             actions.append(action_id)
         return actions
 
+    def _v25_raise_target(
+        self,
+        action: int,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> Optional[int]:
+        try:
+            actor_seat, runtime_state, hand_ctx = self._build_v24_runtime_state(game_state, actor_index)
+        except ValueError:
+            return None
+        if runtime_state.actor_index != actor_seat:
+            return None
+        target = abstract_raise_target_v25(runtime_state, int(action), hand_ctx)
+        return None if target is None else int(target)
+
+    def _v25_legal_raise_actions(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+    ) -> list[int]:
+        try:
+            actor_seat, runtime_state, hand_ctx = self._build_v24_runtime_state(game_state, actor_index)
+        except ValueError:
+            return []
+        legal_mask = build_legal_action_mask_v25(runtime_state, actor_seat, hand_ctx)
+        return [
+            int(action_id)
+            for action_id in np.flatnonzero(np.asarray(legal_mask, dtype=np.float32) > 0.5)
+            if int(action_id) >= 3
+        ]
+
     def _effective_stack_bb_for_actor(
         self,
         game_state: GameStateRequest,
@@ -717,7 +762,8 @@ class GameService:
 
         hole_cards = [card_schema_to_pokerkit(card) for card in actor.hole_cards]
         to_call_bb = float(max(0, int(game_state.current_bet) - int(actor.bet))) / float(max(1, int(game_state.big_blind)))
-        policy, meta = preflop_blueprint_policy(
+        blueprint_policy = preflop_blueprint_policy_v25 if version_to_int(resolved_version) >= 25 else preflop_blueprint_policy_v24
+        policy, meta = blueprint_policy(
             hole_cards=hole_cards,
             actor_seat=int(actor.position) % 6,
             legal_mask=legal_mask,
@@ -957,7 +1003,9 @@ class GameService:
             elif action == FRONTEND_ACTION_CALL:
                 action_ids.append(ACTION_CALL)
             elif action == FRONTEND_ACTION_RAISE:
-                if version_num >= 24:
+                if version_num >= 25:
+                    action_ids.extend(self._v25_legal_raise_actions(game_state, actor_index))
+                elif version_num >= 24:
                     action_ids.extend(self._v24_legal_raise_actions(game_state, actor_index))
                 else:
                     action_ids.extend([ACTION_RAISE_HALF_POT, ACTION_RAISE_POT_OR_ALL_IN])
@@ -1278,12 +1326,19 @@ class GameService:
             street=street_idx,
         )
 
+        if version_to_int(resolved_version) >= 25:
+            bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
+            if bot_index < 0:
+                raise ValueError("No bot player found in game state")
+            bot_seat, runtime_state, hand_ctx = self._build_v24_runtime_state(game_state, bot_index)
+            return encode_info_state_v25(runtime_state, bot_seat, hand_ctx), equity
+
         if version_to_int(resolved_version) >= 24:
             bot_index = next((idx for idx, player in enumerate(game_state.players) if player.is_bot), -1)
             if bot_index < 0:
                 raise ValueError("No bot player found in game state")
             bot_seat, runtime_state, hand_ctx = self._build_v24_runtime_state(game_state, bot_index)
-            return encode_info_state(runtime_state, bot_seat, hand_ctx), equity
+            return encode_info_state_v24(runtime_state, bot_seat, hand_ctx), equity
 
         obs = np.zeros(spec.state_dim, dtype=np.float32)
 
@@ -1408,6 +1463,54 @@ class GameService:
 
         return obs, equity
 
+    def get_runtime_action_for_actor(
+        self,
+        game_state: GameStateRequest,
+        actor_index: int,
+        version: Optional[str] = None,
+    ) -> tuple[int, dict[str, float]]:
+        resolved_version = self._resolve_version(version, game_state)
+        if version_to_int(resolved_version) < 25:
+            raise ValueError("Runtime subgame resolving is only available for v25+")
+        if actor_index < 0 or actor_index >= len(game_state.players):
+            raise ValueError("Invalid actor index")
+
+        try:
+            from backend.services.model_service import get_model_service
+        except Exception as exc:
+            raise RuntimeError(f"Model service unavailable: {exc}") from exc
+
+        model_service = get_model_service()
+        snapshot = model_service.load_model(resolved_version)
+        actor_seat, runtime_state, hand_ctx = self._build_v24_runtime_state(game_state, actor_index)
+        runtime_config = build_runtime_policy_config_v25(
+            {
+                "evaluation_mode": "self_play",
+                "eval_hero_seat": actor_seat,
+                "runtime_subgame_resolving_enabled": True,
+                "runtime_subgame_resolving_hero_only": True,
+                "runtime_subgame_traversals": 32,
+                "runtime_subgame_use_average_policy": True,
+            }
+        )
+        action_id, details = runtime_policy_action_for_snapshot_v25(
+            snapshot,
+            runtime_state,
+            actor_seat,
+            hand_ctx,
+            random.Random(0),
+            config=runtime_config,
+            return_details=True,
+            sample_action=False,
+        )
+        policy = np.asarray(details.get("policy", ()), dtype=np.float32).reshape(-1)
+        action_names = get_action_names(resolved_version)
+        score_dict = {
+            action_names.get(idx, f"ACTION_{idx}"): float(policy[idx]) if idx < len(policy) else 0.0
+            for idx in range(len(action_names))
+        }
+        return int(action_id), score_dict
+
     def get_legal_actions(self, game_state: GameStateRequest, version: Optional[str] = None) -> list[int]:
         """
         Determine legal v21 actions from betting state.
@@ -1457,7 +1560,11 @@ class GameService:
         if stack <= to_call or max_raise_to < min_raise_to:
             return None
 
-        if version_num >= 24:
+        if version_num >= 25:
+            target = self._v25_raise_target(action, game_state, actor_index)
+            if target is None:
+                return None
+        elif version_num >= 24:
             target = self._v24_raise_target(action, game_state, actor_index)
             if target is None:
                 return None
