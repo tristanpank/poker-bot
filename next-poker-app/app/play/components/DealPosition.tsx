@@ -1,5 +1,18 @@
 import React from 'react';
 
+const seatRoleByPlayers: Record<number, string[]> = {
+    2: ['SB/BTN', 'BB'],
+    3: ['SB', 'BB', 'BTN'],
+    4: ['SB', 'BB', 'UTG', 'BTN'],
+    5: ['SB', 'BB', 'UTG', 'CO', 'BTN'],
+    6: ['SB', 'BB', 'UTG', 'MP', 'CO', 'BTN'],
+};
+
+function getSeatRole(position: number, numPlayers: number): string {
+    const roles = seatRoleByPlayers[numPlayers] ?? seatRoleByPlayers[6];
+    return roles[position] ?? `Seat ${position + 1}`;
+}
+
 type DealPositionProps = {
     tableSize: number;
     onSelectSeat: (seatIndex: number) => void;
@@ -19,7 +32,7 @@ export default function DealPosition({ tableSize, onSelectSeat, canUndo, onUndo 
                     <button key={i} onClick={() => onSelectSeat(i)}
                         className="p-5 rounded-2xl border-2 transition-all duration-200 flex flex-col items-center gap-1 bg-[var(--color-surface)] border-[var(--color-border-color)] text-[var(--color-text-primary)] hover:bg-[var(--color-accent)]/15 hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] active:scale-95">
                         <span className="text-2xl font-bold">{i}</span>
-                        <span className="text-[9px] uppercase tracking-wider text-[var(--color-text-secondary)]">Seat {i}</span>
+                        <span className="text-[9px] uppercase tracking-wider text-[var(--color-text-secondary)]">{getSeatRole(i, tableSize)}</span>
                     </button>
                 ))}
             </div>

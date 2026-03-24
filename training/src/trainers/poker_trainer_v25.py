@@ -22,8 +22,8 @@ for _path in (FEATURES_DIR, MODELS_DIR, WORKERS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from poker_state_v24 import ACTION_COUNT_V21, POSITION_NAMES_V21, STATE_DIM_V21
-from poker_worker_v24 import (
+from poker_state_v25 import ACTION_COUNT_V25, POSITION_NAMES_V25, STATE_DIM_V25
+from poker_worker_v25 import (
     SYNTHETIC_OPPONENT_STYLES,
     build_runtime_policy_config,
     freeze_policy_snapshot,
@@ -61,16 +61,16 @@ POSTFLOP_CONDITION_RATE_COUNT_KEYS = {
 @dataclass
 class DeepCFRConfig:
     num_players: int = 6
-    small_blind: int = 5
-    big_blind: int = 10
-    state_dim: int = STATE_DIM_V21
-    action_count: int = ACTION_COUNT_V21
-    action_abstraction_name: str = "conservative_5a"
+    small_blind: int = 1
+    big_blind: int = 2
+    state_dim: int = STATE_DIM_V25
+    action_count: int = ACTION_COUNT_V25
+    action_abstraction_name: str = "expanded_7a"
     algorithm_name: str = "tabular_mccfr_6max"
     traversals_per_player_per_iteration: int = 2048
     traversals_per_chunk: int = 2048
     strategy_interval_traversals: int = 1000
-    training_monitor_interval_traversals: int = 32
+    training_monitor_interval_traversals: int = 1
     prune_after_iteration: int = 128
     lcfr_after_iteration: int = 128
     discount_interval_iterations: int = 2
@@ -85,34 +85,12 @@ class DeepCFRConfig:
     synthetic_opponent_style: str = ""
     current_iteration: int = 0
     parallel_rollouts: bool = True
-
-    # Legacy v24 fields are tolerated but unused in the tabular reset.
-    hidden_dim: int = 160
-    device: str = os.getenv("POKER_V24_DEVICE", "cpu").strip().lower() or "cpu"
-    learning_rate: float = 2e-4
-    policy_learning_rate: float = 2e-4
-    advantage_batch_size: int = 768
-    policy_batch_size: int = 768
-    advantage_capacity: int = 131_072
-    strategy_capacity: int = 1_000_000
-    advantage_train_steps: int = 0
-    policy_train_steps: int = 0
-    full_branch_depth: int = 1
-    warm_start_iterations: int = 0
-    training_guardrail_phaseout_traversals: int = 0
-    training_teacher_guidance_start_mix: float = 0.0
-    teacher_guidance_mix_current: float = 0.0
-    training_prior_fallback_start_mix: float = 0.0
-    prior_fallback_mix_current: float = 0.0
-    training_action_epsilon_start: float = 0.0
-    training_action_epsilon_current: float = 0.0
-    safe_fallback_enabled: bool = False
-    live_policy_stabilization_enabled: bool = False
-    rollout_workers: int = max(1, max(1, (os.cpu_count() or 2) - 1))
+    rollout_workers: int = max(1, max(8, (os.cpu_count() or 2) - 1))
     rollout_worker_chunk_size: int = 64
-    quantize_local_actor_model: bool = False
-    quantize_local_opponent_models: bool = False
-    preflop_blueprint_name: str = ""
+    runtime_subgame_resolving_enabled: bool = False
+    runtime_subgame_resolving_hero_only: bool = True
+    runtime_subgame_traversals: int = 32
+    runtime_subgame_use_average_policy: bool = True
 
 
 @dataclass
@@ -315,7 +293,7 @@ def _rate_grid_from_counts(hit_counts: np.ndarray, total_counts: np.ndarray) -> 
     return grid.tolist()
 
 
-class DeepCFRTrainerV24:
+class DeepCFRTrainerV25:
     def __init__(self, config: Optional[DeepCFRConfig] = None):
         self.config = config or DeepCFRConfig()
         self.node_store: Dict[str, TabularNode] = {}
@@ -635,7 +613,7 @@ class DeepCFRTrainerV24:
             postflop_action_histogram=post_hist.astype(int).tolist(),
             postflop_conditioned_rates_by_street=_conditioned_rates(self._conditioned_counts),
             postflop_conditioned_counts_by_street=_format_conditioned_counts(self._conditioned_counts),
-            position_avg_utility_bb={POSITION_NAMES_V21[seat]: (float(np.mean(window)) if window else 0.0) for seat, window in self._position_profit_windows.items()},
+            position_avg_utility_bb={POSITION_NAMES_V25[seat]: (float(np.mean(window)) if window else 0.0) for seat, window in self._position_profit_windows.items()},
             perf_breakdown_ms={key: float(value / max(1, self.traversals_completed) * 1000.0) for key, value in self._cumulative_perf.items()},
             infoset_count=len(self.node_store),
             pruning_active=bool(self._outer_iteration >= int(self.config.prune_after_iteration)),
@@ -809,7 +787,7 @@ class DeepCFRTrainerV24:
         total_profit = wins = illegal = vpip = pfr = three = prejam = flop_seen = 0
         total_actions = total_preflop_actions = 0
         counts = _new_postflop_counts()
-        counts_by_pos = {name: _new_postflop_counts() for name in POSITION_NAMES_V21}
+        counts_by_pos = {name: _new_postflop_counts() for name in POSITION_NAMES_V25}
         conditioned = _new_postflop_conditioned_counts()
 
         for hand in hand_results:
@@ -827,7 +805,7 @@ class DeepCFRTrainerV24:
             pre_hist += np.asarray(hand.preflop_action_counts, dtype=np.int64)
             post_hist += np.asarray(hand.postflop_action_counts, dtype=np.int64)
             seat = int(hand.hero_seat)
-            name = POSITION_NAMES_V21[seat]
+            name = POSITION_NAMES_V25[seat]
             position_profit[seat].append(float(hand.hero_profit_bb))
             vpip_attempts[seat] += 1 if hand.vpip else 0
             pfr_attempts[seat] += 1 if hand.pfr else 0
@@ -883,19 +861,19 @@ class DeepCFRTrainerV24:
         pfr_hand_grid = _rate_grid_from_counts(hand_pfr_hits, hand_counts)
         three_bet_hand_grid = _rate_grid_from_counts(hand_three_bet_hits, hand_counts)
         vpip_hand_grid_by_position = {
-            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_vpip_hits[seat], position_hand_counts[seat])
+            POSITION_NAMES_V25[seat]: _rate_grid_from_counts(position_hand_vpip_hits[seat], position_hand_counts[seat])
             for seat in range(self.config.num_players)
         }
         rfi_hand_grid_by_position = {
-            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_rfi_hits[seat], position_hand_rfi_counts[seat])
+            POSITION_NAMES_V25[seat]: _rate_grid_from_counts(position_hand_rfi_hits[seat], position_hand_rfi_counts[seat])
             for seat in range(self.config.num_players)
         }
         pfr_hand_grid_by_position = {
-            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_pfr_hits[seat], position_hand_counts[seat])
+            POSITION_NAMES_V25[seat]: _rate_grid_from_counts(position_hand_pfr_hits[seat], position_hand_counts[seat])
             for seat in range(self.config.num_players)
         }
         three_bet_hand_grid_by_position = {
-            POSITION_NAMES_V21[seat]: _rate_grid_from_counts(position_hand_three_bet_hits[seat], position_hand_counts[seat])
+            POSITION_NAMES_V25[seat]: _rate_grid_from_counts(position_hand_three_bet_hits[seat], position_hand_counts[seat])
             for seat in range(self.config.num_players)
         }
         zero_grid = np.zeros((13, 13), dtype=np.float32).tolist()
@@ -920,11 +898,11 @@ class DeepCFRTrainerV24:
             postflop_action_histogram=post_hist.astype(int).tolist(),
             postflop_conditioned_rates_by_street=_conditioned_rates(conditioned),
             postflop_conditioned_counts_by_street=_format_conditioned_counts(conditioned),
-            position_avg_profit_bb={POSITION_NAMES_V21[seat]: (float(np.mean(values)) if values else 0.0) for seat, values in position_profit.items()},
-            vpip_by_position={POSITION_NAMES_V21[seat]: float(vpip_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
-            rfi_by_position={POSITION_NAMES_V21[seat]: float(rfi_attempts[seat] / max(1, rfi_opp[seat])) if rfi_opp[seat] > 0 else 0.0 for seat in range(self.config.num_players)},
-            pfr_by_position={POSITION_NAMES_V21[seat]: float(pfr_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
-            three_bet_by_position={POSITION_NAMES_V21[seat]: float(three_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
+            position_avg_profit_bb={POSITION_NAMES_V25[seat]: (float(np.mean(values)) if values else 0.0) for seat, values in position_profit.items()},
+            vpip_by_position={POSITION_NAMES_V25[seat]: float(vpip_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
+            rfi_by_position={POSITION_NAMES_V25[seat]: float(rfi_attempts[seat] / max(1, rfi_opp[seat])) if rfi_opp[seat] > 0 else 0.0 for seat in range(self.config.num_players)},
+            pfr_by_position={POSITION_NAMES_V25[seat]: float(pfr_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
+            three_bet_by_position={POSITION_NAMES_V25[seat]: float(three_attempts[seat] / max(1, vpip_opp[seat])) for seat in range(self.config.num_players)},
             vpip_hand_grid=vpip_hand_grid,
             rfi_hand_grid=rfi_hand_grid,
             pfr_hand_grid=pfr_hand_grid,
@@ -938,7 +916,7 @@ class DeepCFRTrainerV24:
             postflop_rates_by_position={name: _postflop_rates(pos_counts) for name, pos_counts in counts_by_pos.items()},
             postflop_counts_by_position={name: {key: int(value) for key, value in pos_counts.items()} for name, pos_counts in counts_by_pos.items()},
             postflop_hand_grids={metric: zero_grid for metric in POSTFLOP_RATE_KEYS},
-            postflop_hand_grids_by_position={name: {metric: zero_grid for metric in POSTFLOP_RATE_KEYS} for name in POSITION_NAMES_V21},
+            postflop_hand_grids_by_position={name: {metric: zero_grid for metric in POSTFLOP_RATE_KEYS} for name in POSITION_NAMES_V25},
             postflop_profit_by_stage={stage: 0.0 for stage in ("all_hands", "flop_seen", "turn_seen", "river_seen", "showdown_seen")},
         )
 
@@ -1003,7 +981,7 @@ class DeepCFRTrainerV24:
         return self._evaluate("checkpoints", num_hands)
 
     def evaluate_vs_v21_table(self, num_hands: int) -> EvaluationReport:
-        raise RuntimeError("Legacy v21 table evaluation was removed from v24.")
+        raise RuntimeError("Legacy v21 table evaluation is not supported in v25.")
 
     def evaluate_vs_leak_pool(self, num_hands: int) -> EvaluationReport:
         return self._evaluate("synthetic", num_hands)
@@ -1052,7 +1030,7 @@ class DeepCFRTrainerV24:
         self._ensure_actor_snapshot_current()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
-            "format_version": "tabular_mccfr_v24",
+            "format_version": "tabular_mccfr_v25",
             "config": asdict(self.config),
             "node_store": serialize_node_store(self.node_store),
             "actor_snapshot": self.actor_snapshot.to_payload(),
@@ -1072,13 +1050,15 @@ class DeepCFRTrainerV24:
 
     def load_checkpoint(self, path: str) -> None:
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict) or str(payload.get("format_version", "")) != "tabular_mccfr_v24":
-            raise RuntimeError("Checkpoint is incompatible with the tabular MCCFR v24 format.")
+        if not isinstance(payload, dict) or str(payload.get("format_version", "")) != "tabular_mccfr_v25":
+            raise RuntimeError("Checkpoint is incompatible with the tabular MCCFR v25 format.")
+        lcfr_override = int(getattr(self.config, "lcfr_after_iteration", 256))
         config_payload = payload.get("config", {})
         if isinstance(config_payload, dict):
             for key, value in config_payload.items():
                 if hasattr(self.config, key):
                     setattr(self.config, key, value)
+        self.config.lcfr_after_iteration = lcfr_override
         if str(getattr(self.config, "algorithm_name", "")) == "tabular_mccfr_6max":
             self.config.parallel_rollouts = True
             self.config.rollout_workers = max(int(getattr(self.config, "rollout_workers", 1)), self._default_rollout_workers())
@@ -1143,4 +1123,5 @@ class DeepCFRTrainerV24:
         return None
 
 
-DeepCFRTrainerV21 = DeepCFRTrainerV24
+DeepCFRTrainerV24 = DeepCFRTrainerV25
+DeepCFRTrainerV21 = DeepCFRTrainerV25

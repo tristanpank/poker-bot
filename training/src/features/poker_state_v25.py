@@ -9,55 +9,65 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
-from preflop_blueprint_v24 import canonical_preflop_hand_key, combo_percentile_for_hand_key
+from preflop_blueprint_v25 import canonical_preflop_hand_key, combo_percentile_for_hand_key
 
-BASE_STATE_DIM_V24 = 80
-ACTION_COUNT_V24 = 5
-ACTION_COUNT_V21 = ACTION_COUNT_V24
-VALIDATE_INFO_STATE_V24 = os.getenv("POKER_V24_VALIDATE_INFO_STATE", "0").strip() in {"1", "true", "True"}
-VALIDATE_INFO_STATE_V21 = VALIDATE_INFO_STATE_V24
+BASE_STATE_DIM_V25 = 80
+ACTION_COUNT_V25 = 7
+VALIDATE_INFO_STATE_V25 = os.getenv("POKER_V25_VALIDATE_INFO_STATE", "0").strip() in {"1", "true", "True"}
 
 ACTION_FOLD = 0
 ACTION_CHECK = 1
 ACTION_CALL = 2
-ACTION_AGGRO_SMALL = 3
-ACTION_AGGRO_LARGE = 4
+ACTION_RAISE_SMALL = 3
+ACTION_RAISE_MEDIUM = 4
+ACTION_RAISE_LARGE = 5
+ACTION_ALL_IN = 6
 
-ACTION_RAISE_33_POT = ACTION_AGGRO_SMALL
-ACTION_RAISE_66_POT = ACTION_AGGRO_SMALL
-ACTION_RAISE_POT = ACTION_AGGRO_LARGE
-ACTION_RAISE_133_POT = ACTION_AGGRO_LARGE
-ACTION_ALL_IN = ACTION_AGGRO_LARGE
-ACTION_RAISE_POT_OR_ALL_IN = ACTION_AGGRO_LARGE
+ACTION_RAISE_33_POT = ACTION_RAISE_SMALL
+ACTION_RAISE_66_POT = ACTION_RAISE_MEDIUM
+ACTION_RAISE_POT = ACTION_RAISE_LARGE
+ACTION_RAISE_POT_OR_ALL_IN = ACTION_RAISE_LARGE
 
-ACTION_NAMES_V24 = ["Fold", "Check", "Call", "Aggro Small", "Aggro Large"]
-ACTION_NAMES_V21 = ACTION_NAMES_V24
-NON_ALL_IN_RAISE_ACTIONS = (ACTION_AGGRO_SMALL, ACTION_AGGRO_LARGE)
-ALL_RAISE_ACTIONS = NON_ALL_IN_RAISE_ACTIONS
-SMALL_RAISE_ACTIONS = (ACTION_AGGRO_SMALL,)
-MEDIUM_RAISE_ACTIONS = (ACTION_AGGRO_LARGE,)
-LARGE_RAISE_ACTIONS = (ACTION_AGGRO_LARGE,)
+ACTION_NAMES_V25 = ["Fold", "Check", "Call", "Raise Small", "Raise Medium", "Raise Large", "All In"]
+NON_ALL_IN_RAISE_ACTIONS = (ACTION_RAISE_SMALL, ACTION_RAISE_MEDIUM, ACTION_RAISE_LARGE)
+ALL_RAISE_ACTIONS = NON_ALL_IN_RAISE_ACTIONS + (ACTION_ALL_IN,)
+SMALL_RAISE_ACTIONS = (ACTION_RAISE_SMALL,)
+MEDIUM_RAISE_ACTIONS = (ACTION_RAISE_MEDIUM,)
+LARGE_RAISE_ACTIONS = (ACTION_RAISE_LARGE, ACTION_ALL_IN)
 
 DEEP_STACK_PREFLOP_ALL_IN_MAX_EFFECTIVE_BB = 40.0
 PREFLOP_OPEN_RAISE_TO_BB = {
-    ACTION_AGGRO_SMALL: 2.25,
-    ACTION_AGGRO_LARGE: 2.50,
+    ACTION_RAISE_SMALL: 2.25,
+    ACTION_RAISE_MEDIUM: 2.50,
+    ACTION_RAISE_LARGE: 3.00,
 }
 POSTFLOP_BET_POT_MULTIPLIERS = {
-    ACTION_AGGRO_SMALL: 0.50,
-    ACTION_AGGRO_LARGE: 1.00,
+    ACTION_RAISE_SMALL: 0.33,
+    ACTION_RAISE_MEDIUM: 0.66,
+    ACTION_RAISE_LARGE: 1.00,
 }
 FACING_BET_RAISE_TO_MULTIPLIERS = {
-    ACTION_AGGRO_SMALL: 2.50,
-    ACTION_AGGRO_LARGE: 3.50,
+    ACTION_RAISE_SMALL: 2.20,
+    ACTION_RAISE_MEDIUM: 2.80,
+    ACTION_RAISE_LARGE: 3.50,
 }
 
-POSITION_NAMES_V21 = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+ACTION_COUNT_V24 = ACTION_COUNT_V25
+ACTION_COUNT_V21 = ACTION_COUNT_V25
+ACTION_AGGRO_SMALL = ACTION_RAISE_SMALL
+ACTION_AGGRO_LARGE = ACTION_RAISE_LARGE
+ACTION_NAMES_V24 = ACTION_NAMES_V25
+ACTION_NAMES_V21 = ACTION_NAMES_V25
+VALIDATE_INFO_STATE_V24 = VALIDATE_INFO_STATE_V25
+VALIDATE_INFO_STATE_V21 = VALIDATE_INFO_STATE_V25
+
+POSITION_NAMES_V25 = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+POSITION_NAMES_V21 = POSITION_NAMES_V25
 RANK_ORDER = "23456789TJQKA"
 SUIT_ORDER = "cdhs"
 POSTFLOP_POSITION_RANK = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
 
-PER_OPPONENT_PROFILE_FEATURE_NAMES_V24 = [
+PER_OPPONENT_PROFILE_FEATURE_NAMES_V25 = [
     "vpip_pct",
     "pfr_pct",
     "three_bet_pct",
@@ -70,16 +80,24 @@ PER_OPPONENT_PROFILE_FEATURE_NAMES_V24 = [
     "aggression_freq_pct",
     "hands_confidence_norm",
 ]
-OPPONENT_PROFILE_PER_SLOT_DIM_V24 = len(PER_OPPONENT_PROFILE_FEATURE_NAMES_V24)
-OPPONENT_PROFILE_FEATURE_NAMES_V24 = [f"opp_{name}" for name in PER_OPPONENT_PROFILE_FEATURE_NAMES_V24]
-OPPONENT_PROFILE_DIM_V24 = len(OPPONENT_PROFILE_FEATURE_NAMES_V24)
-OPPONENT_PROFILE_DEFAULT_SLOT_V24 = tuple(0.0 for _ in range(OPPONENT_PROFILE_PER_SLOT_DIM_V24))
-OPPONENT_PROFILE_DEFAULT_V24 = tuple(0.0 for _ in range(OPPONENT_PROFILE_DIM_V24))
+OPPONENT_PROFILE_PER_SLOT_DIM_V25 = len(PER_OPPONENT_PROFILE_FEATURE_NAMES_V25)
+OPPONENT_PROFILE_FEATURE_NAMES_V25 = [f"opp_{name}" for name in PER_OPPONENT_PROFILE_FEATURE_NAMES_V25]
+OPPONENT_PROFILE_DIM_V25 = len(OPPONENT_PROFILE_FEATURE_NAMES_V25)
+OPPONENT_PROFILE_DEFAULT_SLOT_V25 = tuple(0.0 for _ in range(OPPONENT_PROFILE_PER_SLOT_DIM_V25))
+OPPONENT_PROFILE_DEFAULT_V25 = tuple(0.0 for _ in range(OPPONENT_PROFILE_DIM_V25))
+OPPONENT_PROFILE_PER_SLOT_DIM_V24 = OPPONENT_PROFILE_PER_SLOT_DIM_V25
+OPPONENT_PROFILE_FEATURE_NAMES_V24 = OPPONENT_PROFILE_FEATURE_NAMES_V25
+OPPONENT_PROFILE_DIM_V24 = OPPONENT_PROFILE_DIM_V25
+OPPONENT_PROFILE_DEFAULT_SLOT_V24 = OPPONENT_PROFILE_DEFAULT_SLOT_V25
+OPPONENT_PROFILE_DEFAULT_V24 = OPPONENT_PROFILE_DEFAULT_V25
 
-STATE_DIM_V24 = BASE_STATE_DIM_V24 + OPPONENT_PROFILE_DIM_V24
-STATE_DIM_V21 = STATE_DIM_V24
-PUBLIC_BELIEF_STATE_DIM_V24 = STATE_DIM_V24
-PRIVATE_INFO_STATE_INDICES_V24 = tuple()
+STATE_DIM_V25 = BASE_STATE_DIM_V25 + OPPONENT_PROFILE_DIM_V25
+STATE_DIM_V24 = STATE_DIM_V25
+STATE_DIM_V21 = STATE_DIM_V25
+PUBLIC_BELIEF_STATE_DIM_V25 = STATE_DIM_V25
+PUBLIC_BELIEF_STATE_DIM_V24 = STATE_DIM_V25
+PRIVATE_INFO_STATE_INDICES_V25 = tuple()
+PRIVATE_INFO_STATE_INDICES_V24 = PRIVATE_INFO_STATE_INDICES_V25
 
 STREET_SLICE_V24 = slice(0, 4)
 POSITION_SLICE_V24 = slice(4, 10)
@@ -95,7 +113,7 @@ HAND_CLASS_SLICE_V24 = slice(57, 65)
 BOARD_TEXTURE_SLICE_V24 = slice(65, 69)
 DRAW_FLAGS_SLICE_V24 = slice(69, 71)
 SCALAR_SLICE_V24 = slice(71, 80)
-OPPONENT_PROFILE_SLICE_V24 = slice(BASE_STATE_DIM_V24, STATE_DIM_V24)
+OPPONENT_PROFILE_SLICE_V24 = slice(BASE_STATE_DIM_V25, STATE_DIM_V25)
 
 IDX_LAST_AGGRESSOR_FLAG_V24 = 71
 IDX_IN_POSITION_FLAG_V24 = 72
@@ -120,7 +138,7 @@ HAND_CLASS_NAMES_V24 = (
 
 FEATURE_NAMES_V24 = (
     [f"street_{name}" for name in ("preflop", "flop", "turn", "river")]
-    + [f"pos_{name.lower()}" for name in POSITION_NAMES_V21]
+    + [f"pos_{name.lower()}" for name in POSITION_NAMES_V25]
     + [f"active_players_{count}" for count in range(1, 7)]
     + [f"players_behind_{count}" for count in range(6)]
     + [f"pot_bucket_{idx}" for idx in range(POT_BUCKET_SLICE_V24.stop - POT_BUCKET_SLICE_V24.start)]
@@ -143,7 +161,7 @@ FEATURE_NAMES_V24 = (
         "pot_size_norm",
         "facing_bet_flag",
     ]
-    + OPPONENT_PROFILE_FEATURE_NAMES_V24
+    + OPPONENT_PROFILE_FEATURE_NAMES_V25
 )
 FEATURE_NAMES_V21 = FEATURE_NAMES_V24
 FEATURE_INDEX_V24 = {name: idx for idx, name in enumerate(FEATURE_NAMES_V24)}
@@ -298,6 +316,11 @@ def abstract_raise_target(state, action_id: int, hand_ctx=None) -> Optional[int]
     street = int(getattr(hand_ctx, "current_street", 0))
     preflop_raises = int(getattr(hand_ctx, "preflop_raise_count", 0))
 
+    if int(action_id) == ACTION_ALL_IN:
+        if not _all_in_allowed(state, hand_ctx):
+            return None
+        return int(round(max_raise))
+
     if street == 0 and preflop_raises == 0:
         base_size_bb = PREFLOP_OPEN_RAISE_TO_BB.get(int(action_id))
         if base_size_bb is None:
@@ -308,14 +331,16 @@ def abstract_raise_target(state, action_id: int, hand_ctx=None) -> Optional[int]
         aggressor = getattr(hand_ctx, "preflop_last_raiser", None)
         in_position = _is_in_position(int(actor), aggressor)
         effective_stack_bb = _effective_stack_bb(state, int(actor), hand_ctx)
-        if int(action_id) == ACTION_AGGRO_LARGE and (
+        if int(action_id) == ACTION_RAISE_LARGE and (
             preflop_raises >= 2 or effective_stack_bb <= DEEP_STACK_PREFLOP_ALL_IN_MAX_EFFECTIVE_BB
         ):
             target = float(max_raise)
         else:
-            multiplier = 3.5 if in_position else 4.5
-            if int(action_id) == ACTION_AGGRO_LARGE:
-                multiplier += 0.75
+            multiplier = 3.0 if in_position else 3.5
+            if int(action_id) == ACTION_RAISE_MEDIUM:
+                multiplier += 0.5
+            elif int(action_id) == ACTION_RAISE_LARGE:
+                multiplier += 1.0
             target = highest_bet * multiplier
     elif to_call <= 1e-6:
         multiplier = POSTFLOP_BET_POT_MULTIPLIERS.get(int(action_id))
@@ -329,7 +354,7 @@ def abstract_raise_target(state, action_id: int, hand_ctx=None) -> Optional[int]
         target = highest_bet * multiplier
 
     target = max(min_raise, min(max_raise, float(target)))
-    if int(action_id) == ACTION_AGGRO_LARGE and street == 0:
+    if int(action_id) == ACTION_RAISE_LARGE and street == 0:
         effective_stack_bb = _effective_stack_bb(state, int(actor), hand_ctx)
         if effective_stack_bb <= DEEP_STACK_PREFLOP_ALL_IN_MAX_EFFECTIVE_BB and _all_in_allowed(state, hand_ctx):
             target = float(max_raise)
@@ -344,7 +369,7 @@ def _legal_raise_actions(state, hand_ctx=None) -> List[int]:
         return []
     actions: List[int] = []
     seen_targets = set()
-    for action_id in (ACTION_AGGRO_SMALL, ACTION_AGGRO_LARGE):
+    for action_id in ALL_RAISE_ACTIONS:
         target = abstract_raise_target(state, action_id, hand_ctx)
         if target is None or target in seen_targets:
             continue
@@ -355,14 +380,14 @@ def _legal_raise_actions(state, hand_ctx=None) -> List[int]:
 
 def summarize_legal_action_mask(legal_mask: Sequence[float]) -> np.ndarray:
     mask = np.asarray(legal_mask, dtype=np.float32).reshape(-1)
-    summary = np.zeros(5, dtype=np.float32)
+    summary = np.zeros(ACTION_COUNT_V25, dtype=np.float32)
     for idx in range(min(summary.shape[0], mask.shape[0])):
         summary[idx] = 1.0 if float(mask[idx]) > 0.5 else 0.0
     return summary
 
 
 def build_legal_action_mask(state, hero_seat: int, hand_ctx) -> np.ndarray:
-    mask = np.zeros(ACTION_COUNT_V21, dtype=np.float32)
+    mask = np.zeros(ACTION_COUNT_V25, dtype=np.float32)
     actor = getattr(state, "actor_index", None)
     if actor is None or int(actor) != int(hero_seat):
         return mask

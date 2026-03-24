@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from backend.poker_versions import ACTION_NAMES
 
+MAX_ACTION_ID = max(ACTION_NAMES.keys(), default=0)
+
 HAND_STRENGTH_CATEGORIES = {
     0: "Trash",
     1: "Marginal", 
@@ -112,9 +114,30 @@ class GameStateRequest(BaseModel):
     bot_position: int = Field(..., ge=0, le=5, description="The bot's position at the table")
     
     # Betting state
+    starting_stacks: Optional[list[int]] = Field(
+        default=None,
+        min_length=2,
+        max_length=6,
+        description="Per-player stack sizes at the start of the current hand.",
+    )
     current_bet: int = Field(default=0, ge=0, description="Current bet to call")
     big_blind: int = Field(default=10, gt=0, description="Big blind amount")
     current_player_idx: int = Field(default=0, ge=-1, le=5, description="Index in players array of the acting player")
+    street_raise_count: int = Field(default=0, ge=0, description="Number of raises on the current street")
+    preflop_raise_count: int = Field(default=0, ge=0, description="Total number of raises made preflop so far")
+    preflop_call_count: int = Field(default=0, ge=0, description="Total number of preflop calls facing a bet so far")
+    preflop_last_raiser: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=5,
+        description="Seat position of the most recent preflop raiser.",
+    )
+    last_aggressor: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=5,
+        description="Seat position of the most recent aggressor on any street.",
+    )
     
     # Model selection
     model_version: Optional[str] = Field(
@@ -128,30 +151,24 @@ class ActionResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "action": "RAISE_THREE_QUARTER_POT",
-                "action_id": 5,
-                "amount": 110,
+                "action": "RAISE_LARGE",
+                "action_id": 4,
+                "amount": 45,
                 "equity": 0.72,
                 "hand_strength_category": "Strong",
                 "q_values": {
                     "FOLD": -5.2,
                     "CHECK": 1.4,
                     "CALL": 3.1,
-                    "RAISE_QUARTER_POT": 4.6,
-                    "RAISE_HALF_POT": 5.2,
-                    "RAISE_THREE_QUARTER_POT": 5.8,
-                    "RAISE_POT": 5.1,
-                    "RAISE_125_POT": 4.8,
-                    "RAISE_150_POT": 4.3,
-                    "RAISE_200_POT": 3.9,
-                    "ALL_IN": 2.7
+                    "RAISE_SMALL": 4.6,
+                    "RAISE_LARGE": 5.8
                 }
             }
         }
     )
     
-    action: str = Field(..., description="Action name (e.g., 'RAISE_HALF_POT')")
-    action_id: int = Field(..., ge=0, le=10, description="Action ID (0-10)")
+    action: str = Field(..., description="Action name (e.g., 'RAISE_SMALL')")
+    action_id: int = Field(..., ge=0, le=MAX_ACTION_ID, description=f"Action ID (0-{MAX_ACTION_ID})")
     
     # Betting details
     amount: Optional[int] = Field(
@@ -185,7 +202,7 @@ class AppliedAction(BaseModel):
 
     action: Literal["fold", "check", "call", "raise_amt"]
     raise_amt: Optional[int] = Field(default=None, ge=0)
-    action_id: Optional[int] = Field(default=None, ge=0, le=10)
+    action_id: Optional[int] = Field(default=None, ge=0, le=MAX_ACTION_ID)
     equity: Optional[float] = Field(default=None, ge=0, le=1)
     hand_strength_category: Optional[str] = None
     q_values: Optional[dict[str, float]] = None
@@ -244,6 +261,15 @@ class HealthResponse(BaseModel):
     status: str = "healthy"
     model_loaded: bool = False
     available_models: list[str] = Field(default_factory=list)
+
+
+class ModelWarmupResponse(BaseModel):
+    """Response for explicit model warm-up requests."""
+
+    status: str = "ready"
+    version: str
+    model_loaded: bool = True
+    already_loaded: bool = False
 
 
 class ModelInfo(BaseModel):

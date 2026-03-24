@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
-import torch
 from pokerkit import Automation, Card, NoLimitTexasHoldem
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,11 +21,15 @@ for _path in (FEATURES_DIR, MODELS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from poker_state_v24 import (
+from poker_state_v25 import (
     ACTION_CALL,
     ACTION_CHECK,
-    ACTION_COUNT_V21,
+    ACTION_COUNT_V25,
     ACTION_FOLD,
+    ACTION_ALL_IN,
+    ACTION_RAISE_LARGE,
+    ACTION_RAISE_MEDIUM,
+    ACTION_RAISE_SMALL,
     ACTIVE_PLAYERS_SLICE_V24,
     ALL_RAISE_ACTIONS,
     BOARD_TEXTURE_SLICE_V24,
@@ -51,8 +54,7 @@ from poker_state_v24 import (
     flatten_cards_list,
     street_from_board_len,
 )
-from poker_model_v24 import PokerDeepCFRNet, masked_policy
-from preflop_blueprint_v24 import canonical_preflop_hand_key
+from preflop_blueprint_v25 import canonical_preflop_hand_key
 from tabular_policy_v24 import (
     TabularNode,
     TabularPolicySnapshot,
@@ -66,7 +68,7 @@ from tabular_policy_v24 import (
 )
 
 SYNTHETIC_OPPONENT_STYLES = ("nit", "overfolder", "overcaller", "over3better", "station", "maniac")
-RUNTIME_POLICY_DEFAULTS_V24 = {
+RUNTIME_POLICY_DEFAULTS_V25 = {
     "algorithm_name": "tabular_mccfr_6max",
     "evaluation_mode": "heuristics",
     "eval_hero_seat": 0,
@@ -75,6 +77,10 @@ RUNTIME_POLICY_DEFAULTS_V24 = {
     "current_iteration": 0,
     "parallel_rollouts": False,
     "max_checkpoint_pool": 32,
+    "runtime_subgame_resolving_enabled": False,
+    "runtime_subgame_resolving_hero_only": True,
+    "runtime_subgame_traversals": 32,
+    "runtime_subgame_use_average_policy": True,
 }
 POSTFLOP_CONDITION_STREET_KEYS = ("flop", "turn", "river")
 POSTFLOP_CONDITION_RATE_COUNT_KEYS = {
@@ -117,7 +123,7 @@ def _new_preflop_stats(num_players: int) -> Dict[str, List[int]]:
 
 
 def _new_action_histogram() -> np.ndarray:
-    return np.zeros(ACTION_COUNT_V21, dtype=np.int64)
+    return np.zeros(ACTION_COUNT_V25, dtype=np.int64)
 
 
 def _new_postflop_conditioned_counts() -> Dict[str, Dict[str, int]]:
@@ -138,7 +144,7 @@ def build_runtime_policy_config(config: Optional[object] = None) -> SimpleNamesp
         payload = dict(config)
     else:
         payload = {key: value for key, value in vars(config).items() if not str(key).startswith("_")}
-    merged = dict(RUNTIME_POLICY_DEFAULTS_V24)
+    merged = dict(RUNTIME_POLICY_DEFAULTS_V25)
     merged.update(payload)
     merged["parallel_rollouts"] = False
     return SimpleNamespace(**merged)
@@ -393,15 +399,8 @@ def _is_raise_action(action_id: int) -> bool:
     return int(action_id) in ALL_RAISE_ACTIONS
 
 
-def _small_raise_action(legal_mask: np.ndarray) -> Optional[int]:
-    for action_id in NON_ALL_IN_RAISE_ACTIONS:
-        if 0 <= int(action_id) < len(legal_mask) and float(legal_mask[int(action_id)]) > 0.5:
-            return int(action_id)
-    return None
-
-
-def _large_raise_action(legal_mask: np.ndarray) -> Optional[int]:
-    for action_id in reversed(NON_ALL_IN_RAISE_ACTIONS):
+def _preferred_raise_action(legal_mask: np.ndarray, preferred_actions: Sequence[int]) -> Optional[int]:
+    for action_id in preferred_actions:
         if 0 <= int(action_id) < len(legal_mask) and float(legal_mask[int(action_id)]) > 0.5:
             return int(action_id)
     return None
@@ -428,16 +427,27 @@ def _safe_prior_policy(state, actor: int, hand_ctx: HandContext, legal_mask: np.
     cls = int(summary["hand_class"])
     pot_odds = float(summary["pot_odds"])
     facing = bool(summary["facing_bet"] > 0.5)
-    policy = np.zeros(ACTION_COUNT_V21, dtype=np.float32)
-    small_raise = _small_raise_action(legal_mask)
-    large_raise = _large_raise_action(legal_mask)
+    policy = np.zeros(ACTION_COUNT_V25, dtype=np.float32)
+    small_raise = _preferred_raise_action(legal_mask, (ACTION_RAISE_SMALL,))
+    medium_raise = _preferred_raise_action(legal_mask, (ACTION_RAISE_MEDIUM, ACTION_RAISE_SMALL))
+    large_raise = _preferred_raise_action(legal_mask, (ACTION_RAISE_LARGE, ACTION_RAISE_MEDIUM))
+    all_in_raise = _preferred_raise_action(legal_mask, (ACTION_ALL_IN,))
     if int(summary["street"]) == 0:
         if facing:
-            if pre >= 0.82:
+            if pre >= 0.88:
+                if all_in_raise is not None:
+                    policy[int(all_in_raise)] += 0.25
                 if large_raise is not None:
                     policy[int(large_raise)] += 0.30
                 if float(legal_mask[ACTION_CALL]) > 0.5:
-                    policy[ACTION_CALL] += 0.70
+                    policy[ACTION_CALL] += 0.45
+            elif pre >= 0.72:
+                if large_raise is not None:
+                    policy[int(large_raise)] += 0.22
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.18
+                if float(legal_mask[ACTION_CALL]) > 0.5:
+                    policy[ACTION_CALL] += 0.60
             elif pre >= 0.48 or pot_odds <= 0.24:
                 if float(legal_mask[ACTION_CALL]) > 0.5:
                     policy[ACTION_CALL] += 0.68
@@ -449,14 +459,24 @@ def _safe_prior_policy(state, actor: int, hand_ctx: HandContext, legal_mask: np.
                 if float(legal_mask[ACTION_CALL]) > 0.5:
                     policy[ACTION_CALL] += 0.15
         else:
-            if pre >= 0.75 and small_raise is not None:
-                policy[int(small_raise)] += 0.70
+            if pre >= 0.82 and medium_raise is not None:
+                policy[int(medium_raise)] += 0.52
                 if large_raise is not None:
-                    policy[int(large_raise)] += 0.15
+                    policy[int(large_raise)] += 0.22
+                if small_raise is not None:
+                    policy[int(small_raise)] += 0.14
                 if float(legal_mask[ACTION_CHECK]) > 0.5:
-                    policy[ACTION_CHECK] += 0.15
+                    policy[ACTION_CHECK] += 0.12
+            elif pre >= 0.62 and medium_raise is not None:
+                policy[int(medium_raise)] += 0.48
+                if small_raise is not None:
+                    policy[int(small_raise)] += 0.20
+                if float(legal_mask[ACTION_CHECK]) > 0.5:
+                    policy[ACTION_CHECK] += 0.32
             elif pre >= 0.56 and small_raise is not None:
-                policy[int(small_raise)] += 0.68
+                policy[int(small_raise)] += 0.64
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.08
                 if float(legal_mask[ACTION_CHECK]) > 0.5:
                     policy[ACTION_CHECK] += 0.32
             else:
@@ -466,16 +486,31 @@ def _safe_prior_policy(state, actor: int, hand_ctx: HandContext, legal_mask: np.
                     policy[int(small_raise)] += 0.08
     else:
         if facing:
-            if cls >= 5:
+            if cls >= 6:
+                if all_in_raise is not None:
+                    policy[int(all_in_raise)] += 0.18
                 if large_raise is not None:
-                    policy[int(large_raise)] += 0.25
+                    policy[int(large_raise)] += 0.30
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.12
                 if float(legal_mask[ACTION_CALL]) > 0.5:
-                    policy[ACTION_CALL] += 0.75
+                    policy[ACTION_CALL] += 0.40
+            elif cls >= 4:
+                if large_raise is not None:
+                    policy[int(large_raise)] += 0.14
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.12
+                if float(legal_mask[ACTION_CALL]) > 0.5:
+                    policy[ACTION_CALL] += 0.58
+                if float(legal_mask[ACTION_FOLD]) > 0.5:
+                    policy[ACTION_FOLD] += 0.16
             elif cls >= 3:
                 if small_raise is not None:
-                    policy[int(small_raise)] += 0.10
+                    policy[int(small_raise)] += 0.08
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.06
                 if float(legal_mask[ACTION_CALL]) > 0.5:
-                    policy[ACTION_CALL] += 0.65
+                    policy[ACTION_CALL] += 0.61
                 if float(legal_mask[ACTION_FOLD]) > 0.5:
                     policy[ACTION_FOLD] += 0.25
             elif cls == 1 and pot_odds <= 0.26:
@@ -489,18 +524,33 @@ def _safe_prior_policy(state, actor: int, hand_ctx: HandContext, legal_mask: np.
                 if float(legal_mask[ACTION_CALL]) > 0.5:
                     policy[ACTION_CALL] += 0.20
         else:
-            if cls >= 5:
+            if cls >= 6:
+                if all_in_raise is not None:
+                    policy[int(all_in_raise)] += 0.08
                 if large_raise is not None:
-                    policy[int(large_raise)] += 0.40
+                    policy[int(large_raise)] += 0.34
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.18
                 if small_raise is not None:
-                    policy[int(small_raise)] += 0.30
+                    policy[int(small_raise)] += 0.12
                 if float(legal_mask[ACTION_CHECK]) > 0.5:
-                    policy[ACTION_CHECK] += 0.30
+                    policy[ACTION_CHECK] += 0.28
+            elif cls >= 4:
+                if large_raise is not None:
+                    policy[int(large_raise)] += 0.16
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.20
+                if small_raise is not None:
+                    policy[int(small_raise)] += 0.08
+                if float(legal_mask[ACTION_CHECK]) > 0.5:
+                    policy[ACTION_CHECK] += 0.56
             elif cls >= 2:
+                if medium_raise is not None:
+                    policy[int(medium_raise)] += 0.10
                 if small_raise is not None:
-                    policy[int(small_raise)] += 0.18
+                    policy[int(small_raise)] += 0.14
                 if float(legal_mask[ACTION_CHECK]) > 0.5:
-                    policy[ACTION_CHECK] += 0.82
+                    policy[ACTION_CHECK] += 0.76
             else:
                 if float(legal_mask[ACTION_CHECK]) > 0.5:
                     policy[ACTION_CHECK] += 0.92
@@ -514,16 +564,20 @@ def _heuristic_action(state, actor: int, hand_ctx: HandContext, rng: random.Rand
     return _sample_action(_safe_prior_policy(state, actor, hand_ctx, legal_mask), rng)
 
 
-def _synthetic_opponent_action(style: str, state, actor: int, hand_ctx: HandContext, rng: random.Random, legal_mask: Optional[np.ndarray] = None) -> int:
+def _synthetic_opponent_policy(style: str, state, actor: int, hand_ctx: HandContext, legal_mask: Optional[np.ndarray] = None) -> np.ndarray:
     legal_mask = build_legal_action_mask(state, actor, hand_ctx) if legal_mask is None else legal_mask
     policy = _safe_prior_policy(state, actor, hand_ctx, legal_mask)
     summary = _hand_summary(state, actor, hand_ctx)
     style = str(style or "nit").lower()
     if style == "maniac":
-        if _small_raise_action(legal_mask) is not None:
-            policy[int(_small_raise_action(legal_mask))] += 0.30
-        if _large_raise_action(legal_mask) is not None:
-            policy[int(_large_raise_action(legal_mask))] += 0.15
+        for action_id, boost in (
+            (_preferred_raise_action(legal_mask, (ACTION_RAISE_SMALL,)), 0.18),
+            (_preferred_raise_action(legal_mask, (ACTION_RAISE_MEDIUM,)), 0.22),
+            (_preferred_raise_action(legal_mask, (ACTION_RAISE_LARGE,)), 0.18),
+            (_preferred_raise_action(legal_mask, (ACTION_ALL_IN,)), 0.10),
+        ):
+            if action_id is not None:
+                policy[int(action_id)] += boost
         policy[ACTION_FOLD] *= 0.35
     elif style == "overfolder" and summary["facing_bet"] > 0.5:
         policy[ACTION_FOLD] += 0.35
@@ -531,11 +585,18 @@ def _synthetic_opponent_action(style: str, state, actor: int, hand_ctx: HandCont
     elif style == "station" and summary["facing_bet"] > 0.5:
         policy[ACTION_CALL] += 0.25
         policy[ACTION_FOLD] *= 0.55
-    elif style == "over3better" and int(summary["street"]) == 0 and _small_raise_action(legal_mask) is not None:
-        policy[int(_small_raise_action(legal_mask))] += 0.22
+    elif style == "over3better" and int(summary["street"]) == 0:
+        re_raise = _preferred_raise_action(legal_mask, (ACTION_RAISE_MEDIUM, ACTION_RAISE_LARGE))
+        if re_raise is not None:
+            policy[int(re_raise)] += 0.22
     elif style == "overcaller" and summary["facing_bet"] > 0.5:
         policy[ACTION_CALL] += 0.20
-    return _sample_action(normalize_masked_policy(policy, legal_mask), rng)
+    return normalize_masked_policy(policy, legal_mask)
+
+
+def _synthetic_opponent_action(style: str, state, actor: int, hand_ctx: HandContext, rng: random.Random, legal_mask: Optional[np.ndarray] = None) -> int:
+    policy = _synthetic_opponent_policy(style, state, actor, hand_ctx, legal_mask=legal_mask)
+    return _sample_action(policy, rng)
 
 
 def _record_preflop_action_stats(preflop_stats: Dict[str, List[int]], actor: int, hand_ctx, to_call: float, prior_preflop_raises: int, action_id: int) -> None:
@@ -647,7 +708,7 @@ def apply_abstract_action(state, actor: int, action_id: int, hand_ctx: HandConte
     actor = int(actor)
     requested = int(action_id)
     legal_mask = build_legal_action_mask(state, actor, hand_ctx)
-    valid = 0 <= requested < ACTION_COUNT_V21 and float(legal_mask[requested]) > 0.5
+    valid = 0 <= requested < ACTION_COUNT_V25 and float(legal_mask[requested]) > 0.5
     before_stack = float(state.stacks[actor])
     to_call = max(state.bets) - state.bets[actor]
     applied_raise = False
@@ -778,6 +839,25 @@ def _clone_branch_after_action(state, actor: int, action_id: int, hand_ctx: Hand
     return branch_state, branch_ctx
 
 
+def _clone_current_state_and_context(state, hand_ctx: HandContext, perf_dict: Optional[Dict[str, float]] = None):
+    metrics = perf_dict
+    if int(getattr(hand_ctx, "current_street", 0)) >= 1:
+        start = time.perf_counter()
+        branch_state, branch_ctx = _fresh_replay_state_and_context(hand_ctx)
+        for hist_actor, hist_action, _ in list(getattr(hand_ctx, "action_history", [])):
+            apply_abstract_action(branch_state, int(hist_actor), int(hist_action), branch_ctx, record_history=True)
+            _replay_pending_board_cards(branch_state, branch_ctx, hand_ctx.dealt_board_cards, hand_ctx.dealt_burn_cards)
+        if metrics is not None:
+            metrics["branch_clone_time"] += time.perf_counter() - start
+        return branch_state, branch_ctx
+    start = time.perf_counter()
+    branch_state = copy.deepcopy(state)
+    branch_ctx = copy.deepcopy(hand_ctx)
+    if metrics is not None:
+        metrics["branch_clone_time"] += time.perf_counter() - start
+    return branch_state, branch_ctx
+
+
 def _slice_bucket(vec: np.ndarray, slc: slice) -> int:
     bucket = np.asarray(vec[slc], dtype=np.float32)
     if bucket.size <= 0 or float(bucket.sum()) <= 1e-8:
@@ -838,7 +918,7 @@ def _apply_node_delta_payload(node_store: Dict[str, TabularNode], delta_payload:
     for infoset_key, payload in delta_payload.items():
         if not isinstance(payload, dict):
             continue
-        legal_mask = np.asarray(payload.get("legal_mask", np.zeros(ACTION_COUNT_V21, dtype=np.float32)), dtype=np.float32).reshape(-1)
+        legal_mask = np.asarray(payload.get("legal_mask", np.zeros(ACTION_COUNT_V25, dtype=np.float32)), dtype=np.float32).reshape(-1)
         node = node_store.get(str(infoset_key))
         if node is None:
             node = TabularNode.new(legal_mask)
@@ -921,18 +1001,56 @@ def _snapshot_policy(snapshot: Optional[TabularPolicySnapshot], state, actor: in
     return infoset_key, uniform_legal_policy(legal_mask), legal_mask
 
 
-def _aligned_state_vector_for_model(model: Optional[PokerDeepCFRNet], state_vec: np.ndarray) -> np.ndarray:
-    if model is None:
-        return np.asarray(state_vec, dtype=np.float32)
-    expected_dim = int(getattr(model, "state_dim", 0) or 0)
-    vec = np.asarray(state_vec, dtype=np.float32).reshape(-1)
-    if expected_dim <= 0 or vec.shape[0] == expected_dim:
-        return vec
-    if vec.shape[0] > expected_dim:
-        return vec[:expected_dim]
-    aligned = np.zeros(expected_dim, dtype=np.float32)
-    aligned[: vec.shape[0]] = vec
-    return aligned
+def _snapshot_policy_with_prior_fallback(snapshot: Optional[TabularPolicySnapshot], state, actor: int, hand_ctx: HandContext) -> tuple[str, np.ndarray, np.ndarray]:
+    infoset_key, policy, legal_mask = _snapshot_policy(snapshot, state, actor, hand_ctx)
+    if snapshot is None or not isinstance(snapshot, TabularPolicySnapshot):
+        return infoset_key, _safe_prior_policy(state, actor, hand_ctx, legal_mask), legal_mask
+    entry = snapshot.policy_table.get(infoset_key)
+    if entry is None:
+        return infoset_key, _safe_prior_policy(state, actor, hand_ctx, legal_mask), legal_mask
+    return infoset_key, policy, legal_mask
+
+
+def _policy_details_for_actor(
+    snapshot: Optional[TabularPolicySnapshot],
+    state,
+    actor: int,
+    hand_ctx: HandContext,
+    rng: random.Random,
+    config,
+    seat_snapshot_map: Optional[Dict[int, Optional[TabularPolicySnapshot]]] = None,
+    *,
+    allow_resolve: bool = True,
+) -> Dict[str, object]:
+    mode = str(getattr(config, "evaluation_mode", "heuristics") or "heuristics").lower()
+    hero_seat = int(getattr(config, "eval_hero_seat", 0))
+    if mode == "heuristics" and int(actor) != hero_seat:
+        legal_mask = build_legal_action_mask(state, actor, hand_ctx)
+        return {"legal_mask": legal_mask, "policy": _safe_prior_policy(state, actor, hand_ctx, legal_mask)}
+    if mode == "synthetic" or (mode in SYNTHETIC_OPPONENT_STYLES and int(actor) != hero_seat):
+        legal_mask = build_legal_action_mask(state, actor, hand_ctx)
+        style = str(getattr(config, "synthetic_opponent_style", "nit") or "nit") if mode == "synthetic" else mode
+        return {"legal_mask": legal_mask, "policy": _synthetic_opponent_policy(style, state, actor, hand_ctx, legal_mask=legal_mask)}
+
+    seat_snapshot = snapshot
+    if mode == "checkpoints" and seat_snapshot_map is not None and int(actor) in seat_snapshot_map:
+        seat_snapshot = seat_snapshot_map.get(int(actor))
+
+    resolving_enabled = bool(getattr(config, "runtime_subgame_resolving_enabled", False))
+    hero_only = bool(getattr(config, "runtime_subgame_resolving_hero_only", True))
+    if allow_resolve and resolving_enabled and (not hero_only or int(actor) == hero_seat):
+        resolved = _runtime_subgame_policy(seat_snapshot, state, actor, hand_ctx, rng, config, seat_snapshot_map=seat_snapshot_map)
+        if resolved is not None:
+            return resolved
+
+    _, policy, legal_mask = _snapshot_policy_with_prior_fallback(seat_snapshot, state, actor, hand_ctx)
+    return {"legal_mask": legal_mask, "policy": policy}
+
+
+def _select_policy_action(policy: np.ndarray, rng: random.Random, sample_action: bool) -> int:
+    if sample_action:
+        return _sample_action(policy, rng)
+    return int(np.argmax(np.asarray(policy, dtype=np.float32)))
 
 
 def _checkpoint_snapshot_by_seat(config, rng: random.Random, hero_seat: int) -> Dict[int, Optional[TabularPolicySnapshot]]:
@@ -982,7 +1100,7 @@ def _external_sampling_traversal(state, traverser: int, hand_ctx: HandContext, c
             branch_actions = [action for action in legal_actions if not _should_prune_action(node, action, config)]
             if not branch_actions:
                 branch_actions = list(legal_actions)
-            action_values = np.full(ACTION_COUNT_V21, 0.0, dtype=np.float32)
+            action_values = np.full(ACTION_COUNT_V25, 0.0, dtype=np.float32)
             node_value = 0.0
             for action_id in branch_actions:
                 branch_state, branch_ctx = _clone_branch_after_action(state, actor, action_id, hand_ctx, perf)
@@ -1053,29 +1171,144 @@ def _sample_training_rollout(state, traverser: int, hand_ctx: HandContext, confi
     return _safe_utility_bb(state, traverser, hand_ctx)
 
 
-def _choose_policy_action(snapshot: Optional[TabularPolicySnapshot], state, actor: int, hand_ctx: HandContext, rng: random.Random, config, seat_snapshot_map: Optional[Dict[int, Optional[TabularPolicySnapshot]]] = None, return_details: bool = False):
-    mode = str(getattr(config, "evaluation_mode", "heuristics") or "heuristics").lower()
-    if mode == "heuristics" and int(actor) != int(getattr(config, "eval_hero_seat", 0)):
-        legal_mask = build_legal_action_mask(state, actor, hand_ctx)
-        chosen_action = _heuristic_action(state, actor, hand_ctx, rng)
-        if not return_details:
-            return chosen_action
-        return chosen_action, {"legal_mask": legal_mask, "policy": _safe_prior_policy(state, actor, hand_ctx, legal_mask)}
-    if (mode == "synthetic" or mode in SYNTHETIC_OPPONENT_STYLES) and int(actor) != int(getattr(config, "eval_hero_seat", 0)):
-        legal_mask = build_legal_action_mask(state, actor, hand_ctx)
-        style = str(getattr(config, "synthetic_opponent_style", "nit") or "nit") if mode == "synthetic" else mode
-        chosen_action = _synthetic_opponent_action(style, state, actor, hand_ctx, rng, legal_mask=legal_mask)
-        if not return_details:
-            return chosen_action
-        return chosen_action, {"legal_mask": legal_mask, "policy": _safe_prior_policy(state, actor, hand_ctx, legal_mask)}
-    seat_snapshot = snapshot
-    if mode == "checkpoints" and seat_snapshot_map is not None and int(actor) in seat_snapshot_map:
-        seat_snapshot = seat_snapshot_map.get(int(actor))
-    _, policy, legal_mask = _snapshot_policy(seat_snapshot, state, actor, hand_ctx)
-    chosen_action = _sample_action(policy, rng)
+def _external_sampling_resolve_traversal(
+    state,
+    traverser: int,
+    hand_ctx: HandContext,
+    config,
+    rng: random.Random,
+    perf: Dict[str, float],
+    seat_snapshot_map: Optional[Dict[int, Optional[TabularPolicySnapshot]]] = None,
+) -> float:
+    while state.status:
+        start = time.perf_counter()
+        _advance_chance_nodes(state, hand_ctx)
+        perf["chance_time"] += time.perf_counter() - start
+        if not state.status:
+            break
+        actor = state.actor_index
+        if actor is None:
+            break
+        infoset_key, _, legal_mask = build_infoset_key(state, actor, hand_ctx)
+        legal_actions = _legal_actions_from_mask(legal_mask)
+        if not legal_actions:
+            break
+        if int(actor) == int(traverser):
+            start = time.perf_counter()
+            node = _lookup_live_node(config, infoset_key, legal_mask, create=True)
+            perf["traverser_state_time"] += time.perf_counter() - start
+            if node is None:
+                return _safe_utility_bb(state, traverser, hand_ctx)
+            sigma = regret_matching(node.regret_sum, legal_mask)
+            node.strategy_sum += sigma
+            branch_actions = [action for action in legal_actions if not _should_prune_action(node, action, config)]
+            if not branch_actions:
+                branch_actions = list(legal_actions)
+            action_values = np.full(ACTION_COUNT_V25, 0.0, dtype=np.float32)
+            node_value = 0.0
+            for action_id in branch_actions:
+                branch_state, branch_ctx = _clone_branch_after_action(state, actor, action_id, hand_ctx, perf)
+                child_rng = random.Random(rng.randrange(2**30))
+                action_value = _external_sampling_resolve_traversal(
+                    branch_state,
+                    traverser,
+                    branch_ctx,
+                    config,
+                    child_rng,
+                    perf,
+                    seat_snapshot_map=seat_snapshot_map,
+                )
+                action_values[int(action_id)] = float(action_value)
+                node_value += float(sigma[int(action_id)]) * float(action_value)
+            for action_id in branch_actions:
+                node.regret_sum[int(action_id)] += float(action_values[int(action_id)] - node_value)
+            node.visits += 1
+            _mark_touched_infoset(config, infoset_key)
+            return float(node_value)
+        details = _policy_details_for_actor(
+            getattr(config, "resolve_snapshot", None),
+            state,
+            actor,
+            hand_ctx,
+            rng,
+            config,
+            seat_snapshot_map=seat_snapshot_map,
+            allow_resolve=False,
+        )
+        chosen_action = _sample_action(np.asarray(details["policy"], dtype=np.float32), rng)
+        start = time.perf_counter()
+        apply_abstract_action(state, actor, chosen_action, hand_ctx)
+        perf["apply_time"] += time.perf_counter() - start
+    return _safe_utility_bb(state, traverser, hand_ctx)
+
+
+def _runtime_subgame_policy(
+    snapshot: Optional[TabularPolicySnapshot],
+    state,
+    actor: int,
+    hand_ctx: HandContext,
+    rng: random.Random,
+    config,
+    seat_snapshot_map: Optional[Dict[int, Optional[TabularPolicySnapshot]]] = None,
+) -> Optional[Dict[str, object]]:
+    traversals = max(0, int(getattr(config, "runtime_subgame_traversals", 0)))
+    if traversals <= 0:
+        return None
+    infoset_key, _, legal_mask = build_infoset_key(state, actor, hand_ctx)
+    resolve_payload = {key: value for key, value in vars(config).items() if not str(key).startswith("_")}
+    resolve_payload["runtime_subgame_resolving_enabled"] = False
+    resolve_config = build_runtime_policy_config(resolve_payload)
+    resolve_config.evaluation_mode = getattr(config, "evaluation_mode", "self_play")
+    resolve_config.eval_hero_seat = int(actor)
+    resolve_config.live_node_store = {}
+    resolve_config.base_node_store = {}
+    resolve_config.local_touched_infosets = set()
+    resolve_config.resolve_snapshot = snapshot if isinstance(snapshot, TabularPolicySnapshot) else None
+    perf = _new_perf_breakdown()
+    for _ in range(traversals):
+        branch_state, branch_ctx = _clone_current_state_and_context(state, hand_ctx, perf)
+        child_rng = random.Random(rng.randrange(2**30))
+        _external_sampling_resolve_traversal(
+            branch_state,
+            int(actor),
+            branch_ctx,
+            resolve_config,
+            child_rng,
+            perf,
+            seat_snapshot_map=seat_snapshot_map,
+        )
+    root_node = _lookup_live_node(resolve_config, infoset_key, legal_mask, create=False)
+    if root_node is None or int(root_node.visits) <= 0:
+        return None
+    if bool(getattr(config, "runtime_subgame_use_average_policy", True)):
+        policy = average_policy(root_node.strategy_sum, legal_mask, regret_sum=root_node.regret_sum)
+    else:
+        policy = regret_matching(root_node.regret_sum, legal_mask)
+    return {
+        "legal_mask": legal_mask,
+        "policy": policy,
+        "resolved": True,
+        "resolve_traversals": traversals,
+        "root_visits": int(root_node.visits),
+    }
+
+
+def _choose_policy_action(
+    snapshot: Optional[TabularPolicySnapshot],
+    state,
+    actor: int,
+    hand_ctx: HandContext,
+    rng: random.Random,
+    config,
+    seat_snapshot_map: Optional[Dict[int, Optional[TabularPolicySnapshot]]] = None,
+    return_details: bool = False,
+    sample_action: bool = True,
+):
+    details = _policy_details_for_actor(snapshot, state, actor, hand_ctx, rng, config, seat_snapshot_map=seat_snapshot_map, allow_resolve=True)
+    chosen_action = _select_policy_action(np.asarray(details["policy"], dtype=np.float32), rng, sample_action=sample_action)
     if not return_details:
         return chosen_action
-    return chosen_action, {"legal_mask": legal_mask, "policy": policy}
+    return chosen_action, details
 
 
 def _policy_action_for_snapshot(
@@ -1088,35 +1321,9 @@ def _policy_action_for_snapshot(
     opponent_profiles_by_seat=None,
     config=None,
     return_details: bool = False,
+    sample_action: bool = True,
 ):
-    del opponent_profile
-    if isinstance(snapshot, PokerDeepCFRNet):
-        state_vec, legal_mask = encode_info_state(
-            state,
-            actor,
-            hand_ctx,
-            return_legal_mask=True,
-            opponent_profiles_by_seat=opponent_profiles_by_seat,
-        )
-        state_vec = _aligned_state_vector_for_model(snapshot, state_vec)
-        with torch.no_grad():
-            logits = (
-                snapshot.forward_strategy(torch.as_tensor(state_vec, dtype=torch.float32).unsqueeze(0))
-                .squeeze(0)
-                .detach()
-                .cpu()
-                .numpy()
-            )
-        policy = masked_policy(logits, legal_mask)
-        chosen_action = _sample_action(policy, rng)
-        if not return_details:
-            return chosen_action
-        return chosen_action, {
-            "state_vec": state_vec,
-            "legal_mask": legal_mask,
-            "policy": policy,
-            "guidance": {},
-        }
+    del opponent_profile, opponent_profiles_by_seat
 
     if config is None:
         runtime_config = build_runtime_policy_config({"evaluation_mode": "self_play"})
@@ -1136,6 +1343,7 @@ def _policy_action_for_snapshot(
         rng,
         runtime_config,
         return_details=return_details,
+        sample_action=sample_action,
     )
 
 
@@ -1150,7 +1358,7 @@ def run_traversal(hand_seed: int, traverser_seat: int, actor_snapshot: Optional[
     result.preflop_stats = _new_preflop_stats(getattr(config, "num_players", 6))
     _external_sampling_traversal(state, int(traverser_seat), hand_ctx, config, rng, result, perf)
 
-    monitor_interval = max(1, int(getattr(config, "training_monitor_interval_traversals", 8)))
+    monitor_interval = max(1, int(getattr(config, "training_monitor_interval_traversals", 1)))
     if int(hand_seed) % monitor_interval == 0:
         metrics_rng = random.Random(int(hand_seed) ^ 0x5F3759DF)
         metrics_state, metrics_ctx = _create_state_and_context(metrics_rng, config)

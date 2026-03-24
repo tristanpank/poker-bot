@@ -13,14 +13,14 @@ ACTION_CHECK = 1
 ACTION_CALL = 2
 ACTION_RAISE_HALF_POT = 3
 ACTION_RAISE_POT_OR_ALL_IN = 4
+ACTION_AGGRO_SMALL = 3
+ACTION_AGGRO_LARGE = 4
 
-ACTION_RAISE_QUARTER_POT = 3
-ACTION_RAISE_THREE_QUARTER_POT = 5
-ACTION_RAISE_POT = 6
-ACTION_RAISE_125_POT = 7
-ACTION_RAISE_150_POT = 8
-ACTION_RAISE_200_POT = 9
-ACTION_ALL_IN = 10
+ACTION_RAISE_33_POT = ACTION_AGGRO_SMALL
+ACTION_RAISE_66_POT = ACTION_AGGRO_SMALL
+ACTION_RAISE_POT = ACTION_AGGRO_LARGE
+ACTION_RAISE_133_POT = ACTION_AGGRO_LARGE
+ACTION_ALL_IN = ACTION_AGGRO_LARGE
 
 ACTION_NAMES_V21 = {
     0: "FOLD",
@@ -34,36 +34,64 @@ ACTION_NAMES_V24 = {
     0: "FOLD",
     1: "CHECK",
     2: "CALL",
-    3: "RAISE_QUARTER_POT",
-    4: "RAISE_HALF_POT",
-    5: "RAISE_THREE_QUARTER_POT",
-    6: "RAISE_POT",
-    7: "RAISE_125_POT",
-    8: "RAISE_150_POT",
-    9: "RAISE_200_POT",
-    10: "ALL_IN",
+    3: "RAISE_SMALL",
+    4: "RAISE_LARGE",
+}
+
+ACTION_NAMES_V25 = {
+    0: "FOLD",
+    1: "CHECK",
+    2: "CALL",
+    3: "RAISE_SMALL",
+    4: "RAISE_MEDIUM",
+    5: "RAISE_LARGE",
+    6: "ALL_IN",
 }
 
 ACTION_NAMES = ACTION_NAMES_V24
 
 V24_NON_ALL_IN_RAISE_ACTIONS = (
-    ACTION_RAISE_QUARTER_POT,
-    ACTION_RAISE_HALF_POT,
-    ACTION_RAISE_THREE_QUARTER_POT,
-    ACTION_RAISE_POT,
-    ACTION_RAISE_125_POT,
-    ACTION_RAISE_150_POT,
-    ACTION_RAISE_200_POT,
+    ACTION_AGGRO_SMALL,
+    ACTION_AGGRO_LARGE,
 )
 
-V24_RAISE_MULTIPLIERS = {
-    ACTION_RAISE_QUARTER_POT: 0.25,
-    ACTION_RAISE_HALF_POT: 0.50,
-    ACTION_RAISE_THREE_QUARTER_POT: 0.75,
-    ACTION_RAISE_POT: 1.00,
-    ACTION_RAISE_125_POT: 1.25,
-    ACTION_RAISE_150_POT: 1.50,
-    ACTION_RAISE_200_POT: 2.00,
+V24_PREFLOP_OPEN_RAISE_TO_BB = {
+    ACTION_AGGRO_SMALL: 2.25,
+    ACTION_AGGRO_LARGE: 2.50,
+}
+
+V24_POSTFLOP_BET_POT_MULTIPLIERS = {
+    ACTION_AGGRO_SMALL: 0.50,
+    ACTION_AGGRO_LARGE: 1.00,
+}
+
+V24_FACING_BET_RAISE_TO_MULTIPLIERS = {
+    ACTION_AGGRO_SMALL: 2.50,
+    ACTION_AGGRO_LARGE: 3.50,
+}
+
+V25_NON_ALL_IN_RAISE_ACTIONS = (
+    3,
+    4,
+    5,
+)
+
+V25_PREFLOP_OPEN_RAISE_TO_BB = {
+    3: 2.25,
+    4: 2.50,
+    5: 3.00,
+}
+
+V25_POSTFLOP_BET_POT_MULTIPLIERS = {
+    3: 0.33,
+    4: 0.66,
+    5: 1.00,
+}
+
+V25_FACING_BET_RAISE_TO_MULTIPLIERS = {
+    3: 2.20,
+    4: 2.80,
+    5: 3.50,
 }
 
 
@@ -94,10 +122,19 @@ DEEP_CFR_V23_SPEC = PokerVersionSpec(
 
 DEEP_CFR_V24_SPEC = PokerVersionSpec(
     version_floor=24,
-    state_dim=153,
-    action_dim=11,
+    state_dim=91,
+    action_dim=5,
     action_names=ACTION_NAMES_V24,
-    opponent_profile_dim=55,
+    opponent_profile_dim=11,
+    summarized_legal_features=True,
+)
+
+DEEP_CFR_V25_SPEC = PokerVersionSpec(
+    version_floor=25,
+    state_dim=91,
+    action_dim=7,
+    action_names=ACTION_NAMES_V25,
+    opponent_profile_dim=11,
     summarized_legal_features=True,
 )
 
@@ -125,6 +162,8 @@ def version_to_int(version: str | None) -> int:
 
 def get_version_spec(version: str | None) -> PokerVersionSpec:
     version_num = version_to_int(version)
+    if version_num >= 25:
+        return DEEP_CFR_V25_SPEC
     if version_num >= 24:
         return DEEP_CFR_V24_SPEC
     if version_num >= 23:

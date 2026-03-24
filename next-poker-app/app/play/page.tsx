@@ -9,7 +9,7 @@ import CardSelector from './components/CardSelector';
 import PlayPhase from './components/PlayPhase';
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
-const MODEL_VERSION = 'v21';
+const MODEL_VERSION = 'v24';
 
 type Card = { rank: string; suit: string };
 type PlayerState = {
@@ -45,6 +45,11 @@ type HandState = {
     pot: number;
     currentBet: number;
     currentPlayerIdx: number;
+    streetRaiseCount: number;
+    preflopRaiseCount: number;
+    preflopCallCount: number;
+    preflopLastRaiser: number | null;
+    lastAggressor: number | null;
     botResponse: BotResponse | null;
     street: 'preflop' | 'flop' | 'turn' | 'river';
     isLoading: boolean;
@@ -70,9 +75,15 @@ type BackendGameState = {
     pot: number;
     players: PlayerState[];
     bot_position: number;
+    starting_stacks?: number[] | null;
     current_bet: number;
     big_blind: number;
     current_player_idx: number;
+    street_raise_count?: number | null;
+    preflop_raise_count?: number | null;
+    preflop_call_count?: number | null;
+    preflop_last_raiser?: number | null;
+    last_aggressor?: number | null;
     model_version?: string | null;
 };
 type BackendStepRequest = {
@@ -137,6 +148,11 @@ const EMPTY_HAND: HandState = {
     pot: 0,
     currentBet: 0,
     currentPlayerIdx: 0,
+    streetRaiseCount: 0,
+    preflopRaiseCount: 0,
+    preflopCallCount: 0,
+    preflopLastRaiser: null,
+    lastAggressor: null,
     botResponse: null,
     street: 'preflop',
     isLoading: false,
@@ -199,9 +215,16 @@ function toBackendGameState(hand: HandState, bigBlind: number): BackendGameState
             has_acted: p.has_acted,
         })),
         bot_position: hand.botPosition,
+        starting_stacks: hand.startingStacks,
         current_bet: hand.currentBet,
         big_blind: bigBlind,
         current_player_idx: hand.currentPlayerIdx,
+        street_raise_count: hand.streetRaiseCount,
+        preflop_raise_count: hand.preflopRaiseCount,
+        preflop_call_count: hand.preflopCallCount,
+        preflop_last_raiser: hand.preflopLastRaiser,
+        last_aggressor: hand.lastAggressor,
+        model_version: MODEL_VERSION,
     };
 }
 
@@ -215,10 +238,15 @@ function mapBackendGameState(gameState: BackendGameState, prev: HandState): Hand
         holeCards,
         communityCards,
         players: gameState.players,
-        startingStacks: prev.startingStacks,
+        startingStacks: gameState.starting_stacks ?? prev.startingStacks,
         pot: gameState.pot,
         currentBet: gameState.current_bet,
         currentPlayerIdx: gameState.current_player_idx,
+        streetRaiseCount: gameState.street_raise_count ?? prev.streetRaiseCount,
+        preflopRaiseCount: gameState.preflop_raise_count ?? prev.preflopRaiseCount,
+        preflopCallCount: gameState.preflop_call_count ?? prev.preflopCallCount,
+        preflopLastRaiser: gameState.preflop_last_raiser ?? prev.preflopLastRaiser,
+        lastAggressor: gameState.last_aggressor ?? prev.lastAggressor,
         street: getStreetFromBoardCount(communityCards.length),
     };
 }
@@ -237,8 +265,8 @@ function mapBackendStateToNextHand(gameState: BackendGameState): HandState {
         ...EMPTY_HAND,
         botPosition: gameState.bot_position,
         players,
-        startingStacks: players.map((player) => player.stack),
-        currentPlayerIdx: players.findIndex((player) => player.is_active),
+        startingStacks: gameState.starting_stacks ?? players.map((player) => player.stack),
+        currentPlayerIdx: gameState.current_player_idx,
         holeCards: botPlayer?.hole_cards ?? [],
     };
 }
@@ -295,7 +323,6 @@ export default function PlayPage() {
     const legalRequestSeq = useRef(0);
     const nextHandTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const autoResolveSingleLeftRef = useRef(false);
-
     useEffect(() => () => {
         if (nextHandTimerRef.current) {
             clearTimeout(nextHandTimerRef.current);
@@ -440,7 +467,7 @@ export default function PlayPage() {
                 };
 
                 if (n > 2) {
-                    const sbIdx = firstActivePlayerFrom(players, 1);
+                    const sbIdx = firstActivePlayerFrom(players, 0);
                     bbIdx = firstActivePlayerFrom(players, (sbIdx + 1) % n);
                     postBlind(sbIdx, smallBlind);
                     postBlind(bbIdx, bigBlind);
@@ -461,6 +488,11 @@ export default function PlayPage() {
                     currentBet,
                     players,
                     currentPlayerIdx: firstToAct,
+                    streetRaiseCount: 0,
+                    preflopRaiseCount: 0,
+                    preflopCallCount: 0,
+                    preflopLastRaiser: null,
+                    lastAggressor: null,
                     botResponse: null,
                 }));
                 setIsShowdownMode(false);
@@ -486,7 +518,9 @@ export default function PlayPage() {
 
         const street = getStreetFromBoardCount(hand.communityCards.length);
         const players = hand.players.map((p) => ({ ...p, bet: 0, has_acted: false }));
-        const firstToAct = firstActivePlayerFrom(players, 1);
+        const firstToAct = players.length === 2
+            ? firstActivePlayerFrom(players, 1)
+            : firstActivePlayerFrom(players, 0);
 
         setHand((prev) => ({
             ...prev,
@@ -494,6 +528,7 @@ export default function PlayPage() {
             players,
             currentBet: 0,
             currentPlayerIdx: firstToAct,
+            streetRaiseCount: 0,
             botResponse: null,
         }));
         setIsShowdownMode(false);
@@ -848,6 +883,11 @@ export default function PlayPage() {
                         players,
                         startingStacks: players.map((p) => p.stack),
                         currentPlayerIdx: 0,
+                        streetRaiseCount: 0,
+                        preflopRaiseCount: 0,
+                        preflopCallCount: 0,
+                        preflopLastRaiser: null,
+                        lastAggressor: null,
                     }));
                     setPhase('deal-hole');
                     setPickingFor('hole');

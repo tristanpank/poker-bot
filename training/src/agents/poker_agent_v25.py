@@ -18,8 +18,8 @@ for _path in (FEATURES_DIR, MODELS_DIR, TRAINERS_DIR, WORKERS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from poker_trainer_v24 import DeepCFRTrainerV24, SYNTHETIC_OPPONENT_STYLES
-from poker_state_v24 import ACTION_NAMES_V24
+from poker_trainer_v25 import DeepCFRTrainerV25, SYNTHETIC_OPPONENT_STYLES
+from poker_state_v25 import ACTION_NAMES_V25
 
 MATPLOTLIB_AVAILABLE = False
 MATPLOTLIB_ERROR = None
@@ -49,7 +49,7 @@ except Exception:
     IMAGE_CAPTURE_AVAILABLE = False
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL_VERSION = "v24"
+MODEL_VERSION = "v25"
 MODEL_LABEL = MODEL_VERSION.upper()
 DEFAULT_CHECKPOINT_FILENAME = f"poker_agent_{MODEL_VERSION}_tabular_mccfr.pt"
 DEFAULT_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "models", DEFAULT_CHECKPOINT_FILENAME)
@@ -59,7 +59,7 @@ DARK_BG = "#1e1e2e"
 DARK_FG = "#cdd6f4"
 DARK_GRID = "#45475a"
 ACCENT_COLORS = ["#f38ba8", "#a6e3a1", "#89b4fa", "#fab387", "#cba6f7", "#94e2d5", "#f9e2af"]
-ACTION_NAMES = list(ACTION_NAMES_V24)
+ACTION_NAMES = list(ACTION_NAMES_V25)
 POSITION_NAMES = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
 RANK_LABELS = list("AKQJT98765432")
 EVAL_SCOPE_LABELS = ["Overall"] + POSITION_NAMES
@@ -170,7 +170,7 @@ class TrainingGUI(tk.Tk):
         self.configure(bg=DARK_BG)
         self.train_thread: Optional[threading.Thread] = None
 
-        self.trainer = DeepCFRTrainerV24()
+        self.trainer = DeepCFRTrainerV25()
         self.training_running = False
         self.stop_requested = False
         self.pause_requested = False
@@ -1463,12 +1463,13 @@ class TrainingGUI(tk.Tk):
         self.ax_bb100.grid(True, color=DARK_GRID, alpha=0.3, linewidth=0.5)
         self.ax_bb100.set_title("BB/100 Over Time", color=DARK_FG, fontsize=10)
         if gs["bb100_history"]:
-            data = gs["bb100_history"]
+            data = np.asarray(list(gs["bb100_history"]), dtype=np.float32)
             self.ax_bb100.plot(data, color="#a6e3a1", linewidth=1, alpha=0.4)
             if len(data) > 10:
                 window = min(50, max(2, len(data) // 3))
-                smoothed = np.convolve(data, np.ones(window) / window, mode="valid")
-                self.ax_bb100.plot(range(window - 1, len(data)), smoothed, color="#a6e3a1", linewidth=2)
+                smoothed = np.convolve(data, np.ones(window, dtype=np.float32) / float(window), mode="valid")
+                smooth_x = range(window - 1, window - 1 + len(smoothed))
+                self.ax_bb100.plot(smooth_x, smoothed, color="#a6e3a1", linewidth=2)
             self.ax_bb100.axhline(y=0, color="#585b70", linewidth=1, linestyle="--")
         self.ax_bb100.tick_params(colors=DARK_FG, labelsize=8)
         for spine in self.ax_bb100.spines.values():
@@ -1480,20 +1481,22 @@ class TrainingGUI(tk.Tk):
         self.ax_loss.set_title("Infoset Growth", color=DARK_FG, fontsize=10)
 
         if gs["loss_history"]:
-            data_infosets = gs["loss_history"]
+            data_infosets = np.asarray(list(gs["loss_history"]), dtype=np.float32)
             self.ax_loss.plot(data_infosets, color="#f38ba8", linewidth=1, alpha=0.4, label="Infosets")
             if len(data_infosets) > 10:
                 window = min(50, max(2, len(data_infosets) // 3))
-                smoothed = np.convolve(data_infosets, np.ones(window) / window, mode="valid")
-                self.ax_loss.plot(range(window - 1, len(data_infosets)), smoothed, color="#f38ba8", linewidth=2)
+                smoothed = np.convolve(data_infosets, np.ones(window, dtype=np.float32) / float(window), mode="valid")
+                smooth_x = range(window - 1, window - 1 + len(smoothed))
+                self.ax_loss.plot(smooth_x, smoothed, color="#f38ba8", linewidth=2)
 
         if gs["aux_loss_history"]:
-            data_pool = gs["aux_loss_history"]
+            data_pool = np.asarray(list(gs["aux_loss_history"]), dtype=np.float32)
             self.ax_loss.plot(data_pool, color="#89b4fa", linewidth=1, alpha=0.35, label="Pool")
             if len(data_pool) > 10:
                 window = min(50, max(2, len(data_pool) // 3))
-                smoothed = np.convolve(data_pool, np.ones(window) / window, mode="valid")
-                self.ax_loss.plot(range(window - 1, len(data_pool)), smoothed, color="#89b4fa", linewidth=2)
+                smoothed = np.convolve(data_pool, np.ones(window, dtype=np.float32) / float(window), mode="valid")
+                smooth_x = range(window - 1, window - 1 + len(smoothed))
+                self.ax_loss.plot(smooth_x, smoothed, color="#89b4fa", linewidth=2)
         if gs["loss_history"] or gs["aux_loss_history"]:
             self.ax_loss.legend(
                 loc="upper right",
@@ -1511,21 +1514,22 @@ class TrainingGUI(tk.Tk):
         self.ax_actions.set_facecolor("#181825")
         self.ax_actions.grid(True, color=DARK_GRID, alpha=0.3, linewidth=0.5)
         self.ax_actions.set_title("Postflop Action Distribution", color=DARK_FG, fontsize=10)
-        hist = gs["action_history"]
-        if hist[0]:
-            n = len(hist[0])
-            x = range(n)
-            stacks = [hist[i] for i in range(len(ACTION_NAMES))]
-            self.ax_actions.stackplot(x, *stacks, colors=_action_palette(), labels=ACTION_NAMES, alpha=0.8)
-            if n < 100:
-                self.ax_actions.legend(
-                    loc="upper right",
-                    fontsize=6,
-                    framealpha=0.5,
-                    facecolor=DARK_BG,
-                    edgecolor=DARK_GRID,
-                    labelcolor=DARK_FG,
-                )
+        hist = {i: list(gs["action_history"].get(i, [])) for i in range(len(ACTION_NAMES))}
+        if hist and hist[0]:
+            n = min(len(series) for series in hist.values()) if hist else 0
+            if n > 0:
+                x = range(n)
+                stacks = [hist[i][:n] for i in range(len(ACTION_NAMES))]
+                self.ax_actions.stackplot(x, *stacks, colors=_action_palette(), labels=ACTION_NAMES, alpha=0.8)
+                if n < 100:
+                    self.ax_actions.legend(
+                        loc="upper right",
+                        fontsize=6,
+                        framealpha=0.5,
+                        facecolor=DARK_BG,
+                        edgecolor=DARK_GRID,
+                        labelcolor=DARK_FG,
+                    )
         self.ax_actions.tick_params(colors=DARK_FG, labelsize=8)
         for spine in self.ax_actions.spines.values():
             spine.set_color(DARK_GRID)

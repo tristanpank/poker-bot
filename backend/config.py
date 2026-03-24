@@ -7,6 +7,7 @@ Uses pydantic-settings for environment variable support.
 import re
 from pathlib import Path
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.poker_versions import version_to_int
@@ -38,6 +39,17 @@ class Settings(BaseSettings):
     # CORS Settings (for frontend integration)
     cors_origins: list[str] = ["*"]
 
+    @field_validator("debug", mode="before")
+    @classmethod
+    def _coerce_debug(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production", "0", "false", "no", "off"}:
+                return False
+            if normalized in {"debug", "dev", "development", "1", "true", "yes", "on"}:
+                return True
+        return value
+
     def _checkpoint_dirs(self) -> list[Path]:
         dirs = [self.model_checkpoint_dir, self.legacy_model_checkpoint_dir]
         unique: list[Path] = []
@@ -53,6 +65,8 @@ class Settings(BaseSettings):
 
         # Try different naming conventions
         possible_names = [
+            f"poker_agent_v{version_lower}_tabular_mccfr.pt",
+            f"poker_agent_v{version_lower}_tabular_mccfr.pth",
             f"poker_agent_v{version_lower}_deepcfr.pt",
             f"poker_agent_v{version_lower}_deepcfr.pth",
             f"poker_agent_v{version_lower}.pt",
@@ -72,7 +86,10 @@ class Settings(BaseSettings):
 
     def get_available_models(self) -> list[str]:
         """List available model versions based on checkpoint files."""
-        version_pattern = re.compile(r"poker_agent_v(\d+)(?:_deepcfr)?\.(?:pt|pth)$", re.IGNORECASE)
+        version_pattern = re.compile(
+            r"poker_agent_v(\d+)(?:_(?:deepcfr|tabular_mccfr))?\.(?:pt|pth)$",
+            re.IGNORECASE,
+        )
         versions: set[str] = set()
 
         for directory in self._checkpoint_dirs():

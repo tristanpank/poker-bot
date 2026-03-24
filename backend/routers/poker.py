@@ -14,11 +14,12 @@ from backend.models.schemas import (
     HealthResponse,
     LegalActionsResponse,
     ModelInfo,
+    ModelWarmupResponse,
     PokerStepRequest,
     PokerStepResponse,
     HAND_STRENGTH_CATEGORIES,
 )
-from backend.poker_versions import get_action_names, get_version_spec
+from backend.poker_versions import get_action_names, get_version_spec, version_to_int
 from backend.services.game_service import get_game_service, GameService, compute_hand_strength_category
 
 
@@ -63,6 +64,39 @@ async def list_models() -> list[ModelInfo]:
         ))
     
     return models
+
+
+@router.post("/warmup", response_model=ModelWarmupResponse)
+async def warmup_model(version: str | None = None) -> ModelWarmupResponse:
+    """
+    Explicitly load a model into memory so the first real action request is fast.
+    """
+    settings = get_settings()
+    target_version = str(version or settings.model_version).lower()
+
+    try:
+        from backend.services.model_service import get_model_service
+
+        model_service = get_model_service()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model service unavailable: {str(e)}",
+        ) from e
+
+    try:
+        already_loaded = model_service.is_loaded(target_version)
+        model_service.load_model(target_version)
+        return ModelWarmupResponse(
+            status="ready",
+            version=target_version,
+            model_loaded=True,
+            already_loaded=already_loaded,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Warmup error: {str(e)}")
 
 
 @router.post("/legal", response_model=LegalActionsResponse)
@@ -220,12 +254,18 @@ async def get_action(
                 detail=f"Model service unavailable: {str(e)}",
             ) from e
         
-        # Get model's action
-        action_id, q_values = model_service.get_action(
-            observation, 
-            legal_actions,
-            version=version
-        )
+        if version_to_int(version) >= 25:
+            action_id, q_values = game_service.get_runtime_action_for_actor(
+                game_state,
+                game_state.current_player_idx,
+                version=version,
+            )
+        else:
+            action_id, q_values = model_service.get_action(
+                observation,
+                legal_actions,
+                version=version,
+            )
         
         # Calculate raise amount if applicable
         amount = game_service.calculate_raise_amount(action_id, game_state, version=version)
