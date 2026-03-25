@@ -11,7 +11,7 @@ import ResumePrompt from './components/ResumePrompt';
 import WebcamStatus from './components/WebcamStatus';
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
-const MODEL_VERSION = 'v21';
+const MODEL_VERSION = 'v24';
 const SESSION_COOKIE_NAME = 'poker_session_id';
 const SESSION_COOKIE_MAX_AGE = 86400; // 24 hours
 
@@ -1120,7 +1120,7 @@ export default function PlayPage() {
                     canUndo={history.length > 0}
                     onUndo={undo}
                 />
-                <div className="px-4 pb-4">
+                <div className="px-2 pb-2">
                     <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
                 </div>
             </>
@@ -1162,7 +1162,7 @@ export default function PlayPage() {
                 >
                     <CardSelector {...commonCardSelectorProps} />
                 </DealHoleCards>
-                <div className="px-4 pb-4">
+                <div className="px-2 pb-2">
                     <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
                 </div>
             </>
@@ -1221,7 +1221,7 @@ export default function PlayPage() {
                 >
                     <CardSelector {...commonCardSelectorProps} />
                 </PlayPhase>
-                <div className="px-4 pb-4">
+                <div className="px-2 pb-2">
                     <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
                 </div>
             </>
