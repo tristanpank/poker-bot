@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import get_settings
 from backend.routers.cv import router as cv_router
 from backend.routers.session import router as session_router
+from backend.routers.webcam import router as webcam_router
 
 _poker_router = None
 _get_model_service: Callable[[], Any] | None = None
@@ -133,6 +134,7 @@ def create_app() -> FastAPI:
         app.include_router(_poker_router)
     app.include_router(cv_router)
     app.include_router(session_router)
+    app.include_router(webcam_router)
     
     # Root endpoint
     @app.get("/")

@@ -2,10 +2,13 @@
 Session service for managing game state persistence in Redis.
 
 Provides async Redis operations for saving, loading, and deleting
-game sessions keyed by client-generated session IDs.
+game sessions keyed by client-generated session IDs, as well as
+webcam session management for opponent bluff-data connections.
 """
 
 import json
+import secrets
+import string
 from typing import Any, Optional
 
 import redis.asyncio as aioredis
@@ -81,3 +84,142 @@ async def session_exists(session_id: str) -> bool:
     """Check whether a session exists in Redis."""
     client = await get_redis()
     return bool(await client.exists(_session_key(session_id)))
+
+
+# ---------------------------------------------------------------------------
+# Webcam session management
+# ---------------------------------------------------------------------------
+
+_CODE_LENGTH = 6
+_CODE_ALPHABET = string.ascii_uppercase + string.digits
+_CODE_TTL_SECONDS = 3600  # 1 hour
+
+
+def _webcam_code_key(code: str) -> str:
+    """Redis key that maps a join code to its session_id."""
+    return f"poker:webcam:code:{code.upper()}"
+
+
+def _webcam_session_key(session_id: str) -> str:
+    """Redis key for the webcam session data tied to a game session."""
+    return f"poker:webcam:session:{session_id}"
+
+
+def _generate_code() -> str:
+    """Generate a random 6-character alphanumeric code."""
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
+
+
+async def generate_webcam_code(session_id: str) -> str:
+    """
+    Create a short join code that maps to *session_id*.
+
+    The code is stored in Redis with a 1-hour TTL and can be used by
+    opponents to discover the session they should connect to.
+    """
+    client = await get_redis()
+    code = _generate_code()
+
+    # Retry if the code already exists (extremely unlikely with 36^6 space)
+    for _ in range(5):
+        if not await client.exists(_webcam_code_key(code)):
+            break
+        code = _generate_code()
+
+    payload = json.dumps({"session_id": session_id})
+    await client.set(_webcam_code_key(code), payload, ex=_CODE_TTL_SECONDS)
+
+    # Ensure the webcam session key exists (idempotent)
+    settings = get_settings()
+    wkey = _webcam_session_key(session_id)
+    if not await client.exists(wkey):
+        await client.set(wkey, json.dumps({"opponents": {}}), ex=settings.session_ttl_seconds)
+
+    return code
+
+
+async def lookup_webcam_code(code: str) -> Optional[str]:
+    """
+    Return the session_id associated with *code*, or ``None`` if the
+    code is invalid or expired.
+    """
+    client = await get_redis()
+    raw = await client.get(_webcam_code_key(code.upper()))
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    return data.get("session_id")
+
+
+async def join_webcam_session(
+    session_id: str, player_position: int
+) -> str:
+    """
+    Register an opponent at *player_position* in the webcam session.
+
+    Returns a unique ``cv_session_id`` that the opponent should use when
+    streaming frames to the CV pipeline.
+
+    Raises ``ValueError`` if the position is already taken.
+    """
+    client = await get_redis()
+    settings = get_settings()
+    wkey = _webcam_session_key(session_id)
+
+    raw = await client.get(wkey)
+    if raw is None:
+        data: dict[str, Any] = {"opponents": {}}
+    else:
+        data = json.loads(raw)
+
+    pos_str = str(player_position)
+    if pos_str in data["opponents"] and data["opponents"][pos_str].get("connected"):
+        raise ValueError(f"Player position {player_position} is already connected")
+
+    cv_session_id = f"{session_id}__p{player_position}"
+    data["opponents"][pos_str] = {
+        "connected": True,
+        "cv_session_id": cv_session_id,
+    }
+
+    await client.set(wkey, json.dumps(data), ex=settings.session_ttl_seconds)
+    return cv_session_id
+
+
+async def disconnect_webcam(session_id: str, player_position: int) -> None:
+    """Mark an opponent at *player_position* as disconnected."""
+    client = await get_redis()
+    settings = get_settings()
+    wkey = _webcam_session_key(session_id)
+
+    raw = await client.get(wkey)
+    if raw is None:
+        return
+
+    data = json.loads(raw)
+    pos_str = str(player_position)
+    if pos_str in data["opponents"]:
+        data["opponents"][pos_str]["connected"] = False
+        await client.set(wkey, json.dumps(data), ex=settings.session_ttl_seconds)
+
+
+async def get_webcam_status(session_id: str) -> dict[str, Any]:
+    """
+    Return the current webcam connection status for all opponents in
+    the given session.
+
+    Returns a dict like::
+
+        {
+            "opponents": {
+                "2": {"connected": true, "cv_session_id": "..."},
+                ...
+            }
+        }
+    """
+    client = await get_redis()
+    wkey = _webcam_session_key(session_id)
+    raw = await client.get(wkey)
+    if raw is None:
+        return {"opponents": {}}
+    return json.loads(raw)

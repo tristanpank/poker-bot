@@ -8,6 +8,7 @@ import DealHoleCards from './components/DealHoleCards';
 import CardSelector from './components/CardSelector';
 import PlayPhase from './components/PlayPhase';
 import ResumePrompt from './components/ResumePrompt';
+import WebcamStatus from './components/WebcamStatus';
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
 const MODEL_VERSION = 'v21';
@@ -1095,29 +1096,34 @@ export default function PlayPage() {
 
     if (phase === 'deal-position') {
         return (
-            <DealPosition
-                tableSize={tableSize}
-                onSelectSeat={(i) => {
-                    pushHistory('Set position');
-                    const players = initPlayers(tableSize, sessionStacks[0] ?? buyIn, i);
-                    setHand((prev) => ({
-                        ...prev,
-                        botPosition: i,
-                        players,
-                        startingStacks: players.map((p) => p.stack),
-                        currentPlayerIdx: 0,
-                        streetRaiseCount: 0,
-                        preflopRaiseCount: 0,
-                        preflopCallCount: 0,
-                        preflopLastRaiser: null,
-                        lastAggressor: null,
-                    }));
-                    setPhase('deal-hole');
-                    setPickingFor('hole');
-                }}
-                canUndo={history.length > 0}
-                onUndo={undo}
-            />
+            <>
+                <DealPosition
+                    tableSize={tableSize}
+                    onSelectSeat={(i) => {
+                        pushHistory('Set position');
+                        const players = initPlayers(tableSize, sessionStacks[0] ?? buyIn, i);
+                        setHand((prev) => ({
+                            ...prev,
+                            botPosition: i,
+                            players,
+                            startingStacks: players.map((p) => p.stack),
+                            currentPlayerIdx: 0,
+                            streetRaiseCount: 0,
+                            preflopRaiseCount: 0,
+                            preflopCallCount: 0,
+                            preflopLastRaiser: null,
+                            lastAggressor: null,
+                        }));
+                        setPhase('deal-hole');
+                        setPickingFor('hole');
+                    }}
+                    canUndo={history.length > 0}
+                    onUndo={undo}
+                />
+                <div className="px-4 pb-4">
+                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                </div>
+            </>
         );
     }
 
@@ -1146,15 +1152,20 @@ export default function PlayPage() {
 
     if (phase === 'deal-hole') {
         return (
-            <DealHoleCards
-                botPosition={hand.botPosition}
-                holeCards={hand.holeCards}
-                players={hand.players}
-                canUndo={history.length > 0}
-                onUndo={undo}
-            >
-                <CardSelector {...commonCardSelectorProps} />
-            </DealHoleCards>
+            <>
+                <DealHoleCards
+                    botPosition={hand.botPosition}
+                    holeCards={hand.holeCards}
+                    players={hand.players}
+                    canUndo={history.length > 0}
+                    onUndo={undo}
+                >
+                    <CardSelector {...commonCardSelectorProps} />
+                </DealHoleCards>
+                <div className="px-4 pb-4">
+                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                </div>
+            </>
         );
     }
 
@@ -1168,47 +1179,52 @@ export default function PlayPage() {
             )
         );
         return (
-            <PlayPhase
-                pot={hand.pot}
-                currentBet={hand.currentBet}
-                bigBlind={bigBlind}
-                botPosition={hand.botPosition}
-                holeCards={hand.holeCards}
-                communityCards={hand.communityCards}
-                street={hand.street}
-                players={hand.players}
-                currentPlayerIdx={hand.currentPlayerIdx}
-                isLoading={hand.isLoading}
-                botResponse={hand.botResponse}
-                showRaiseInput={showRaiseInput}
-                setShowRaiseInput={setShowRaiseInput}
-                raiseInput={raiseInput}
-                setRaiseInput={setRaiseInput}
-                onOpenCommunityPicker={() => {
-                    if (!canOpenCommunityPicker) return;
-                    pushHistory('Open card picker');
-                    setPickingFor('community');
-                }}
-                onQueryBot={() => queryBot(hand)}
-                onRecordAction={recordOpponentAction}
-                onUndo={undo}
-                canUndo={history.length > 0}
-                undoLabel={history[history.length - 1]?.label}
-                legalActions={legalActions}
-                showdownMode={isShowdownMode}
-                showdownEntries={showdownEntries}
-                currentShowdownPlayerIndex={currentShowdownEntry?.playerIndex ?? null}
-                showdownCanResolve={showdownCanResolve}
-                isResolvingShowdown={isResolvingShowdown}
-                showdownError={showdownError}
-                showdownResult={showdownResult}
-                resultFlash={resultFlash}
-                onMuckShowdown={muckCurrentShowdownPlayer}
-                onClearShowdown={clearCurrentShowdownPlayer}
-                onResolveShowdown={resolveHand}
-            >
-                <CardSelector {...commonCardSelectorProps} />
-            </PlayPhase>
+            <>
+                <PlayPhase
+                    pot={hand.pot}
+                    currentBet={hand.currentBet}
+                    bigBlind={bigBlind}
+                    botPosition={hand.botPosition}
+                    holeCards={hand.holeCards}
+                    communityCards={hand.communityCards}
+                    street={hand.street}
+                    players={hand.players}
+                    currentPlayerIdx={hand.currentPlayerIdx}
+                    isLoading={hand.isLoading}
+                    botResponse={hand.botResponse}
+                    showRaiseInput={showRaiseInput}
+                    setShowRaiseInput={setShowRaiseInput}
+                    raiseInput={raiseInput}
+                    setRaiseInput={setRaiseInput}
+                    onOpenCommunityPicker={() => {
+                        if (!canOpenCommunityPicker) return;
+                        pushHistory('Open card picker');
+                        setPickingFor('community');
+                    }}
+                    onQueryBot={() => queryBot(hand)}
+                    onRecordAction={recordOpponentAction}
+                    onUndo={undo}
+                    canUndo={history.length > 0}
+                    undoLabel={history[history.length - 1]?.label}
+                    legalActions={legalActions}
+                    showdownMode={isShowdownMode}
+                    showdownEntries={showdownEntries}
+                    currentShowdownPlayerIndex={currentShowdownEntry?.playerIndex ?? null}
+                    showdownCanResolve={showdownCanResolve}
+                    isResolvingShowdown={isResolvingShowdown}
+                    showdownError={showdownError}
+                    showdownResult={showdownResult}
+                    resultFlash={resultFlash}
+                    onMuckShowdown={muckCurrentShowdownPlayer}
+                    onClearShowdown={clearCurrentShowdownPlayer}
+                    onResolveShowdown={resolveHand}
+                >
+                    <CardSelector {...commonCardSelectorProps} />
+                </PlayPhase>
+                <div className="px-4 pb-4">
+                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                </div>
+            </>
         );
     }
 
