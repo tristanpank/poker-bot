@@ -105,6 +105,17 @@ def _webcam_session_key(session_id: str) -> str:
     return f"poker:webcam:session:{session_id}"
 
 
+def _webcam_metrics_key(cv_session_id: str) -> str:
+    """Redis key for the latest CV metrics of a webcam session."""
+    return f"poker:webcam:metrics:{cv_session_id}"
+
+
+async def save_webcam_metrics(cv_session_id: str, metrics_json: str) -> None:
+    """Save the latest CV analysis metrics for a webcam session (short TTL)."""
+    client = await get_redis()
+    await client.set(_webcam_metrics_key(cv_session_id), metrics_json, ex=10)
+
+
 def _generate_code() -> str:
     """Generate a random 6-character alphanumeric code."""
     return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
@@ -203,6 +214,23 @@ async def disconnect_webcam(session_id: str, player_position: int) -> None:
         await client.set(wkey, json.dumps(data), ex=settings.session_ttl_seconds)
 
 
+async def reconnect_webcam(session_id: str, player_position: int) -> None:
+    """Mark a previously disconnected opponent at *player_position* as connected again."""
+    client = await get_redis()
+    settings = get_settings()
+    wkey = _webcam_session_key(session_id)
+
+    raw = await client.get(wkey)
+    if raw is None:
+        return
+
+    data = json.loads(raw)
+    pos_str = str(player_position)
+    if pos_str in data["opponents"]:
+        data["opponents"][pos_str]["connected"] = True
+        await client.set(wkey, json.dumps(data), ex=settings.session_ttl_seconds)
+
+
 async def get_webcam_status(session_id: str) -> dict[str, Any]:
     """
     Return the current webcam connection status for all opponents in
@@ -222,4 +250,15 @@ async def get_webcam_status(session_id: str) -> dict[str, Any]:
     raw = await client.get(wkey)
     if raw is None:
         return {"opponents": {}}
-    return json.loads(raw)
+    
+    data = json.loads(raw)
+    
+    # Fetch metrics for all connected opponents
+    for pos_str, opp in data.get("opponents", {}).items():
+        if opp.get("connected") and "cv_session_id" in opp:
+            mkey = _webcam_metrics_key(opp["cv_session_id"])
+            mraw = await client.get(mkey)
+            if mraw is not None:
+                opp["metrics"] = json.loads(mraw)
+                
+    return data

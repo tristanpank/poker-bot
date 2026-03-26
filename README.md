@@ -210,6 +210,23 @@ The primary ingest path. The frontend opens a WebRTC peer connection directly to
 
 The backend responds to each decoded frame with the full `CvMetrics` JSON (same schema as `/cv/analyze` responses).
 
+## Redis Data Flow & Webcam Metrics
+
+The poker bot utilizes Redis to maintain game states and synchronize live webcam computer vision metrics between streaming players and the main game client.
+
+### Redis Keys
+- `poker:session:{session_id}`: Persistent game state tracking for the main poker session.
+- `poker:webcam:session:{session_id}`: Stores a dictionary of the session's active opponents mapped by seat position, tracking whether they are connected and assigning them a unique `cv_session_id`.
+- `poker:webcam:code:{code}`: A temporary mapping (1-hour TTL) that maps a 6-character join code to a specific `session_id`.
+- `poker:webcam:metrics:{cv_session_id}`: Stores the most recently serialized `CvMetrics` JSON produced by the computer vision pipeline. This key has a short 10-second TTL and is continually refreshed by the WebRTC ingest service.
+
+### Metrics Flow
+1. **Initiation**: The main Play page hits `POST /session/webcam/generate-code` to generate a code mapping to the current `session_id`.
+2. **Joining**: An opponent enters the code on the Join page, calling `POST /session/webcam/join` to get a designated `cv_session_id`.
+3. **WebRTC Stream**: The opponent begins a WebRTC session, streaming video tracks directly to the backend `WebRtcIngestService`.
+4. **Analysis & Persistence**: The backend `CvService` processes every frame, and the ingest service immediately writes the resulting JSON metrics into the `poker:webcam:metrics:{cv_session_id}` Redis key.
+5. **Consumption**: The Play page polls `GET /session/webcam/status/{session_id}` which iterates over the connected opponents, fetches each of their active metric keys from Redis, and bundles the live CV analysis back to the client. This allows the poker bot (and UI) to consume real-time bluffing data without interrupting the game logic.
+
 ## Frontend
 
 The Next.js app (`next-poker-app/`) provides a real-time deception-proxy dashboard:

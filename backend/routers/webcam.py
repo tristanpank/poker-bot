@@ -15,6 +15,7 @@ from backend.services.session_service import (
     lookup_webcam_code,
     join_webcam_session,
     disconnect_webcam,
+    reconnect_webcam,
     get_webcam_status,
 )
 
@@ -46,6 +47,12 @@ class JoinResponse(BaseModel):
 
 class DisconnectRequest(BaseModel):
     """Request to disconnect an opponent from a webcam session."""
+    session_id: str = Field(..., min_length=1)
+    player_position: int = Field(..., ge=1, le=5)
+
+
+class ReconnectRequest(BaseModel):
+    """Request to reconnect an opponent to a webcam session."""
     session_id: str = Field(..., min_length=1)
     player_position: int = Field(..., ge=1, le=5)
 
@@ -88,3 +95,10 @@ async def disconnect(request: DisconnectRequest) -> dict[str, str]:
     """Mark an opponent as disconnected from the webcam session."""
     await disconnect_webcam(request.session_id, request.player_position)
     return {"status": "disconnected"}
+
+
+@router.post("/reconnect", status_code=200)
+async def reconnect(request: ReconnectRequest) -> dict[str, str]:
+    """Mark an opponent as reconnected to the webcam session."""
+    await reconnect_webcam(request.session_id, request.player_position)
+    return {"status": "reconnected"}

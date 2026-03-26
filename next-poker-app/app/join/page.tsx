@@ -5,10 +5,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 const BACKEND =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
 
-const W = 256;
-const H = 144;
-const ANALYSIS_FRAME_MS = 100; // ~10 fps for opponent streams (lighter than test page)
-
 type JoinState = 'idle' | 'joined' | 'streaming';
 
 export default function JoinPage() {
@@ -20,18 +16,19 @@ export default function JoinPage() {
   const [cvSessionId, setCvSessionId] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
-  const rafRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const metaIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeRef = useRef(false);
-  const requestInFlightRef = useRef(false);
 
   // Clean up on unmount
   useEffect(() => {
     return () => {
       activeRef.current = false;
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      if (metaIntervalRef.current) clearInterval(metaIntervalRef.current);
+      if (dcRef.current) dcRef.current.close();
+      if (pcRef.current) pcRef.current.close();
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, []);
@@ -68,6 +65,14 @@ export default function JoinPage() {
     if (!cvSessionId || !sessionId) return;
     setError(null);
 
+    if (joinState === 'joined') {
+      await fetch(`${BACKEND}/session/webcam/reconnect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
+      }).catch(() => undefined);
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -88,51 +93,50 @@ export default function JoinPage() {
       activeRef.current = true;
       setJoinState('streaming');
 
-      const loop = (ts: number) => {
-        if (!activeRef.current) return;
+      // Setup WebRTC
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      pcRef.current = pc;
 
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-        if (video && canvas && video.readyState >= 2 && video.videoWidth > 0) {
-          if (canvas.width !== W) canvas.width = W;
-          if (canvas.height !== H) canvas.height = H;
+      const dc = pc.createDataChannel('metadata');
+      dcRef.current = dc;
 
-          if (!ctxRef.current) {
-            ctxRef.current = canvas.getContext('2d', { willReadFrequently: true });
+      dc.onopen = () => {
+        let frameId = 0;
+        metaIntervalRef.current = setInterval(() => {
+          if (dc.readyState === 'open' && activeRef.current) {
+            dc.send(JSON.stringify({
+              sessionId: cvSessionId,
+              frameId: frameId++,
+              captureTs: Date.now(),
+              streamFps: 15
+            }));
           }
-
-          const ctx = ctxRef.current;
-          if (ctx && !requestInFlightRef.current) {
-            ctx.drawImage(video, 0, 0, W, H);
-            const frame = ctx.getImageData(0, 0, W, H);
-            const timestamp = Date.now();
-
-            const params = new URLSearchParams({
-              sessionId: cvSessionId!,
-              timestamp: String(timestamp),
-              width: String(W),
-              height: String(H),
-              streamFps: '10',
-            });
-
-            requestInFlightRef.current = true;
-            void fetch(`${BACKEND}/cv/analyze-raw?${params.toString()}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream' },
-              body: frame.data,
-            })
-              .catch(() => undefined)
-              .finally(() => {
-                requestInFlightRef.current = false;
-              });
-          }
-        }
-
-        rafRef.current = requestAnimationFrame(loop);
+        }, 100);
       };
 
-      rafRef.current = requestAnimationFrame(loop);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const res = await fetch(`${BACKEND}/cv/webrtc/offer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdp: offer.sdp,
+          type: offer.type,
+          session_id: cvSessionId
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error('Failed to negotiate WebRTC connection');
+      }
+
+      const answer = await res.json();
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
     } catch (err) {
       setError(
         err instanceof Error ? `Camera error: ${err.message}` : 'Unable to access camera.'
@@ -142,15 +146,21 @@ export default function JoinPage() {
 
   const stopWebcam = useCallback(async () => {
     activeRef.current = false;
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
+    if (metaIntervalRef.current) {
+      clearInterval(metaIntervalRef.current);
+      metaIntervalRef.current = null;
+    }
+    if (dcRef.current) {
+      dcRef.current.close();
+      dcRef.current = null;
+    }
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
     }
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
-    ctxRef.current = null;
-    requestInFlightRef.current = false;
 
     // Notify backend of disconnect
     if (sessionId) {
@@ -293,8 +303,6 @@ export default function JoinPage() {
             )}
           </section>
         )}
-
-        <canvas ref={canvasRef} className="hidden" />
       </main>
     </div>
   );

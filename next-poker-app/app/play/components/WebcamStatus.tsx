@@ -9,6 +9,13 @@ const POLL_INTERVAL_MS = 3000;
 type OpponentStatus = {
   connected: boolean;
   cv_session_id: string;
+  metrics?: {
+    bluffLevel: string;
+    bluffRisk: number;
+    emotion: string;
+    stress: number;
+    pulseBpm: number | null;
+  };
 };
 
 type WebcamStatusData = {
@@ -143,12 +150,22 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
                     : 'bg-slate-800/40 border border-slate-700/20 text-slate-500'
                     }`}
                 >
-                  <div className="flex flex-col items-center gap-0.5">
-                    <div
-                      className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-slate-600'
-                        }`}
-                    />
-                    <span>P{pos}</span>
+                  <div className="flex flex-col items-center justify-center gap-0.5 min-h-[40px]">
+                    <div className="flex items-center gap-1">
+                      <div
+                        className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-slate-600'
+                          }`}
+                      />
+                      <span>P{pos}</span>
+                    </div>
+                    {isConnected && opponent?.metrics && (
+                      <div className="mt-1 flex flex-col items-center text-[9px] leading-tight opacity-90">
+                        <span className="text-white font-bold uppercase tracking-wider">{opponent.metrics.bluffLevel}</span>
+                        <span className={opponent.metrics.bluffRisk > 60 ? 'text-rose-400' : 'text-emerald-300'}>
+                          {opponent.metrics.bluffRisk}% Risk
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
               );

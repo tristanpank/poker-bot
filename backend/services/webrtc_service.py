@@ -17,6 +17,7 @@ import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from backend.services.cv_service import CvService
+from backend.services.session_service import save_webcam_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -167,9 +168,13 @@ class WebRtcIngestService:
                 )
 
                 # Send CV metrics back to the frontend via the DataChannel.
+                metrics_json = metrics.model_dump_json(by_alias=True)
                 dc = state.datachannel
                 if dc is not None and dc.readyState == "open":
-                    dc.send(metrics.model_dump_json(by_alias=True))
+                    dc.send(metrics_json)
+
+                # Persist metrics to Redis for the Play page to poll
+                asyncio.create_task(save_webcam_metrics(session_id, metrics_json))
 
                 consecutive_errors = 0
 
