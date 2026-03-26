@@ -17,4 +17,5 @@ redis
 
 # Testing
 pytest
+pytest-asyncio
 httpx

@@ -254,6 +254,14 @@ See [training/CHANGELOG.md](training/CHANGELOG.md) for detailed version history.
 
 ## Running Tests
 
+You can run the full test suite locally if you have installed dependencies inside a virtual environment:
+
 ```bash
 pytest backend/tests/
+```
+
+Alternatively, you can run the entire testing suite seamlessly through Docker (ensuring a completely sterile environment):
+
+```bash
+docker compose run --rm backend pytest backend/tests/
 ```

@@ -13,3 +13,5 @@ torch
 
 # Testing
 httpx
+pytest
+pytest-asyncio
