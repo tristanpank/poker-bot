@@ -13,7 +13,9 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 aiortc
+redis
 
 # Testing
 pytest
+pytest-asyncio
 httpx

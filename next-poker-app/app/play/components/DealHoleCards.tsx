@@ -35,45 +35,44 @@ type DealHoleCardsProps = {
 
 export default function DealHoleCards({ botPosition, holeCards, players, canUndo, onUndo, children }: DealHoleCardsProps) {
     return (
-        <div className="flex-1 flex flex-col gap-6 p-6 min-h-[100dvh]">
+        <div className="flex-1 flex flex-col gap-2 p-3">
             <div className="text-center animate-slide-up" style={{ animationDelay: '100ms', animationFillMode: 'forwards' }}>
-                <h1 className="text-2xl font-bold text-[var(--color-text-primary)] mb-1">Deal Hole Cards</h1>
-                <p className="text-[var(--color-text-secondary)] text-xs">Bot is at seat {botPosition + 1}</p>
+                <h1 className="text-xl font-bold text-[var(--color-text-primary)]">Deal Hole Cards</h1>
+                <p className="text-[var(--color-text-secondary)] text-[10px]">Bot is at seat {botPosition + 1}</p>
             </div>
 
-            <div className="flex justify-center gap-3">
+            <div className="flex justify-center gap-2">
                 {[0, 1].map((i) => holeCards[i] ? (
-                    <div key={i} className={`card-mini suit-${holeCards[i].suit}`}>
+                    <div key={i} className={`card-mini suit-${holeCards[i].suit} scale-90`}>
                         <span className="card-rank">{holeCards[i].rank}</span>
                         <span className="card-suit">{suitSym(holeCards[i].suit)}</span>
                     </div>
                 ) : (
-                    <div key={i} className="card-mini card-placeholder">
+                    <div key={i} className="card-mini card-placeholder scale-90">
                         <span className="text-lg">?</span>
                     </div>
                 ))}
             </div>
 
-            <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-2xl p-4">
-                <div className="flex justify-between items-center mb-3">
-                    <p className="text-xs text-[var(--color-text-secondary)] uppercase tracking-wider font-semibold">Table</p>
-                    <p className="text-xs text-[var(--color-text-secondary)]">Select bot cards for this seat</p>
+            <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-xl p-3">
+                <div className="flex justify-between items-center mb-1.5">
+                    <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold">Table</p>
                 </div>
-                <div className="flex flex-col gap-2">
+                <div className="flex flex-col gap-1.5">
                     {players.map((player, idx) => (
                         <div
                             key={idx}
-                            className={`rounded-xl border px-3 py-2 ${player.is_bot ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'}`}
+                            className={`rounded-lg border px-3 py-1.5 ${player.is_bot ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'}`}
                         >
                             <div className="flex items-center justify-between">
-                                <span className="text-sm font-semibold text-[var(--color-text-primary)]">
+                                <span className="text-xs font-semibold text-[var(--color-text-primary)]">
                                     {getPlayerName(player, players.length)}
                                 </span>
-                                <span className="text-xs text-[var(--color-text-secondary)]">
+                                <span className="text-[10px] text-[var(--color-text-secondary)]">
                                     Seat {player.position + 1}
                                 </span>
                             </div>
-                            <div className="text-xs text-[var(--color-text-secondary)] mt-1">
+                            <div className="text-[10px] text-[var(--color-text-secondary)] mt-0.5">
                                 Stack: <span className="text-[var(--color-text-primary)] font-semibold">{player.stack}</span>
                             </div>
                         </div>
@@ -81,11 +80,13 @@ export default function DealHoleCards({ botPosition, holeCards, players, canUndo
                 </div>
             </section>
 
-            {children}
+            <div className="flex-1 flex flex-col min-h-0">
+                {children}
+            </div>
 
-            <div className="flex justify-center">
+            <div className="flex justify-center mt-auto py-1">
                 {canUndo && (
-                    <button onClick={onUndo} className="px-4 py-2 rounded-xl text-sm font-semibold bg-slate-800 text-slate-300 border border-slate-600 hover:bg-slate-700 active:scale-95 transition-all">
+                    <button onClick={onUndo} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 border border-slate-600">
                         Undo
                     </button>
                 )}

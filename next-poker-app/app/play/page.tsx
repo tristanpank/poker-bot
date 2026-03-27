@@ -7,9 +7,34 @@ import DealPosition from './components/DealPosition';
 import DealHoleCards from './components/DealHoleCards';
 import CardSelector from './components/CardSelector';
 import PlayPhase from './components/PlayPhase';
+import ResumePrompt from './components/ResumePrompt';
+import WebcamStatus from './components/WebcamStatus';
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
 const MODEL_VERSION = 'v24';
+const SESSION_COOKIE_NAME = 'poker_session_id';
+const SESSION_COOKIE_MAX_AGE = 86400; // 24 hours
+
+// ---------------------------------------------------------------------------
+// Cookie helpers
+// ---------------------------------------------------------------------------
+function getSessionCookie(): string | null {
+    if (typeof document === 'undefined') return null;
+    const match = document.cookie.match(new RegExp(`(?:^|; )${SESSION_COOKIE_NAME}=([^;]*)`));
+    return match ? decodeURIComponent(match[1]) : null;
+}
+
+function setSessionCookie(id: string): void {
+    document.cookie = `${SESSION_COOKIE_NAME}=${encodeURIComponent(id)}; path=/; max-age=${SESSION_COOKIE_MAX_AGE}; SameSite=Lax`;
+}
+
+function clearSessionCookie(): void {
+    document.cookie = `${SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax`;
+}
+
+function generateSessionId(): string {
+    return crypto.randomUUID();
+}
 
 type Card = { rank: string; suit: string };
 type PlayerState = {
@@ -26,7 +51,7 @@ type BotResponse = {
     action_id: number | null;
     amount: number | null;
 };
-type Phase = 'setup-size' | 'setup-details' | 'deal-position' | 'deal-hole' | 'play';
+type Phase = 'resume-prompt' | 'setup-size' | 'setup-details' | 'deal-position' | 'deal-hole' | 'play';
 type LegalActionState = {
     canFold: boolean;
     canCheck: boolean;
@@ -291,7 +316,6 @@ async function parseError(res: Response): Promise<string> {
 
 export default function PlayPage() {
     const [mounted, setMounted] = useState(false);
-    useEffect(() => setMounted(true), []);
 
     const [tableSize, setTableSize] = useState(6);
     const [smallBlind, setSmallBlind] = useState(1);
@@ -300,8 +324,13 @@ export default function PlayPage() {
     const [sessionStacks, setSessionStacks] = useState<number[]>([]);
     const [sessionProfit, setSessionProfit] = useState(0);
 
-    const [phase, setPhase] = useState<Phase>('setup-size');
+    const [phase, setPhase] = useState<Phase>('resume-prompt');
     const [hand, setHand] = useState<HandState>(EMPTY_HAND);
+
+    // Session state
+    const [sessionId, setSessionId] = useState<string | null>(null);
+    const [resumeSessionData, setResumeSessionData] = useState<Record<string, unknown> | null>(null);
+    const [isCheckingSession, setIsCheckingSession] = useState(true);
 
     const [pickingFor, setPickingFor] = useState<'hole' | 'community' | 'showdown' | null>(null);
     const [pendingRank, setPendingRank] = useState<string | null>(null);
@@ -328,6 +357,147 @@ export default function PlayPage() {
             clearTimeout(nextHandTimerRef.current);
             nextHandTimerRef.current = null;
         }
+    }, []);
+
+    // ---------------------------------------------------------------------------
+    // Session persistence helpers
+    // ---------------------------------------------------------------------------
+    const saveSession = useCallback(async (overrides?: {
+        phase?: Phase;
+        hand?: HandState;
+        sessionStacks?: number[];
+        sessionProfit?: number;
+    }) => {
+        const sid = sessionId ?? getSessionCookie();
+        if (!sid) return;
+        const payload = {
+            tableSize,
+            smallBlind,
+            bigBlind,
+            buyIn,
+            phase: overrides?.phase ?? phase,
+            hand: overrides?.hand ?? hand,
+            sessionStacks: overrides?.sessionStacks ?? sessionStacks,
+            sessionProfit: overrides?.sessionProfit ?? sessionProfit,
+            modelVersion: MODEL_VERSION,
+        };
+        try {
+            await fetch(`${BACKEND}/session/${sid}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+        } catch (err) {
+            console.error('Session save failed:', err);
+        }
+    }, [sessionId, tableSize, smallBlind, bigBlind, buyIn, phase, hand, sessionStacks, sessionProfit]);
+
+    const createSession = useCallback(async (): Promise<string> => {
+        const sid = generateSessionId();
+        setSessionCookie(sid);
+        setSessionId(sid);
+        try {
+            await fetch(`${BACKEND}/session`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sid,
+                    data: {
+                        tableSize,
+                        smallBlind,
+                        bigBlind,
+                        buyIn,
+                        phase: 'setup-size',
+                        hand: EMPTY_HAND,
+                        sessionStacks: [],
+                        sessionProfit: 0,
+                        modelVersion: MODEL_VERSION,
+                    },
+                }),
+            });
+        } catch (err) {
+            console.error('Session create failed:', err);
+        }
+        return sid;
+    }, [bigBlind, buyIn, smallBlind, tableSize]);
+
+    const deleteCurrentSession = useCallback(async () => {
+        const sid = sessionId ?? getSessionCookie();
+        if (!sid) return;
+        clearSessionCookie();
+        setSessionId(null);
+        try {
+            await fetch(`${BACKEND}/session/${sid}`, { method: 'DELETE' });
+        } catch (err) {
+            console.error('Session delete failed:', err);
+        }
+    }, [sessionId]);
+
+    // Check for existing session on mount
+    useEffect(() => {
+        const checkSession = async () => {
+            const cookie = getSessionCookie();
+            if (!cookie) {
+                setIsCheckingSession(false);
+                setPhase('setup-size');
+                setMounted(true);
+                return;
+            }
+            try {
+                const res = await fetch(`${BACKEND}/session/${cookie}`);
+                if (res.ok) {
+                    const { data } = await res.json();
+                    setSessionId(cookie);
+                    setResumeSessionData(data);
+                    setIsCheckingSession(false);
+                    setMounted(true);
+                    return;
+                }
+            } catch (err) {
+                console.error('Session check failed:', err);
+            }
+            // Cookie exists but session not found in Redis — clean up
+            clearSessionCookie();
+            setIsCheckingSession(false);
+            setPhase('setup-size');
+            setMounted(true);
+        };
+        checkSession();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const resumeFromSession = useCallback((data: Record<string, unknown>) => {
+        const d = data as {
+            tableSize: number;
+            smallBlind: number;
+            bigBlind: number;
+            buyIn: number;
+            phase: Phase;
+            hand: HandState;
+            sessionStacks: number[];
+            sessionProfit: number;
+        };
+        setTableSize(d.tableSize);
+        setSmallBlind(d.smallBlind);
+        setBigBlind(d.bigBlind);
+        setBuyIn(d.buyIn);
+        setSessionStacks(d.sessionStacks);
+        setSessionProfit(d.sessionProfit);
+        setHand(d.hand);
+        // If they were mid-hand in the play phase, restore to deal-hole to let them re-enter cards
+        // since hole cards are selected via the card picker UI
+        if (d.phase === 'play' || d.phase === 'deal-hole') {
+            setPhase('deal-hole');
+            setPickingFor('hole');
+            // Reset hole cards so they re-pick (they might have changed between sessions)
+            setHand(prev => ({ ...prev, holeCards: [] }));
+        } else if (d.phase === 'deal-position') {
+            setPhase('deal-position');
+        } else {
+            // For setup phases, just go straight to setup-details so they can start a new hand
+            setPhase('setup-details');
+        }
+        setResumeSessionData(null);
     }, []);
 
     const usedCards = useCallback((): Set<string> => {
@@ -429,18 +599,20 @@ export default function PlayPage() {
         setHand((prev) => ({ ...prev, isLoading: true }));
         try {
             const data = await stepAction(currentHand, { actor: 'bot', model_version: MODEL_VERSION });
-            setHand((prev) => ({
-                ...mapBackendGameState(data.game_state, prev),
+            const updatedHand: HandState = {
+                ...mapBackendGameState(data.game_state, currentHand),
                 isLoading: false,
                 botResponse: mapAppliedActionToBotResponse(data.applied_action),
-            }));
+            };
+            setHand(updatedHand);
             setLegalActions(mapBackendLegalActions(data.legal_actions));
+            void saveSession({ hand: updatedHand });
         } catch (err) {
             console.error('Bot step failed:', err);
             setHand((prev) => ({ ...prev, isLoading: false }));
             await fetchLegalActions(currentHand, true);
         }
-    }, [fetchLegalActions, stepAction]);
+    }, [fetchLegalActions, saveSession, stepAction]);
 
     const selectCard = useCallback((rank: string, suit: string) => {
         const card: Card = { rank, suit };
@@ -566,11 +738,13 @@ export default function PlayPage() {
                 action: backendAction,
                 raise_amt: backendRaiseAmt,
             });
-            setHand((prev) => ({
-                ...mapBackendGameState(data.game_state, prev),
+            const updatedHand: HandState = {
+                ...mapBackendGameState(data.game_state, hand),
                 isLoading: false,
-            }));
+            };
+            setHand(updatedHand);
             setLegalActions(mapBackendLegalActions(data.legal_actions));
+            void saveSession({ hand: updatedHand });
         } catch (err) {
             console.error('Opponent step failed:', err);
             setHand((prev) => ({ ...prev, isLoading: false }));
@@ -579,7 +753,7 @@ export default function PlayPage() {
             setShowRaiseInput(false);
             setRaiseInput('');
         }
-    }, [fetchLegalActions, hand, legalActions.canCall, pushHistory, stepAction]);
+    }, [fetchLegalActions, hand, legalActions.canCall, pushHistory, saveSession, stepAction]);
 
     const beginShowdown = useCallback(() => {
         const entries = hand.players
@@ -663,12 +837,15 @@ export default function PlayPage() {
             const nextHand = mapBackendStateToNextHand(data.next_game_state);
             const nextBotStack = nextHand.players.find((player) => player.is_bot)?.stack ?? 0;
 
-            setSessionProfit((prev) => prev + data.delta);
-            setSessionStacks((prev) => {
-                const next = [...prev];
+            const newProfit = sessionProfit + data.delta;
+            const newStacks = (() => {
+                const next = [...sessionStacks];
                 next[0] = nextBotStack;
                 return next.length > 0 ? next : [nextBotStack];
-            });
+            })();
+
+            setSessionProfit(newProfit);
+            setSessionStacks(newStacks);
 
             setHistory([]);
             setHand(nextHand);
@@ -686,8 +863,15 @@ export default function PlayPage() {
             setResultFlash(null);
             autoResolveSingleLeftRef.current = false;
             nextHandTimerRef.current = null;
+
+            void saveSession({
+                phase: 'deal-hole',
+                hand: nextHand,
+                sessionStacks: newStacks,
+                sessionProfit: newProfit,
+            });
         }, 1000);
-    }, []);
+    }, [saveSession, sessionProfit, sessionStacks]);
 
     const resolveHand = useCallback(async () => {
         if (isResolvingShowdown) return;
@@ -783,7 +967,14 @@ export default function PlayPage() {
         setIsShowdownMode(false);
         setLegalActions(EMPTY_LEGAL_ACTIONS);
         setResultFlash(null);
-    }, [buyIn, sessionStacks, tableSize]);
+
+        // Ensure session exists
+        if (!sessionId && !getSessionCookie()) {
+            void createSession();
+        } else {
+            void saveSession({ phase: 'deal-position' });
+        }
+    }, [buyIn, createSession, saveSession, sessionId, sessionStacks, tableSize]);
 
     useEffect(() => {
         if (phase !== 'play' || hand.isLoading || pickingFor !== null) return;
@@ -832,6 +1023,38 @@ export default function PlayPage() {
 
     if (!mounted) return null;
 
+    if (phase === 'resume-prompt') {
+        const sessionInfo = resumeSessionData ? {
+            tableSize: (resumeSessionData.tableSize as number) ?? 6,
+            smallBlind: (resumeSessionData.smallBlind as number) ?? 1,
+            bigBlind: (resumeSessionData.bigBlind as number) ?? 2,
+            buyIn: (resumeSessionData.buyIn as number) ?? 200,
+            phase: (resumeSessionData.phase as string) ?? 'setup-size',
+            sessionProfit: (resumeSessionData.sessionProfit as number) ?? 0,
+            botStack: (() => {
+                const h = resumeSessionData.hand as HandState | undefined;
+                return h?.players?.find((p) => p.is_bot)?.stack ?? (resumeSessionData.buyIn as number) ?? 200;
+            })(),
+        } : null;
+
+        return (
+            <ResumePrompt
+                sessionInfo={sessionInfo!}
+                isLoading={isCheckingSession || !resumeSessionData}
+                onResume={() => {
+                    if (resumeSessionData) {
+                        resumeFromSession(resumeSessionData);
+                    }
+                }}
+                onStartFresh={async () => {
+                    await deleteCurrentSession();
+                    setResumeSessionData(null);
+                    setPhase('setup-size');
+                }}
+            />
+        );
+    }
+
     if (phase === 'setup-size') {
         return (
             <SetupSize
@@ -865,6 +1088,7 @@ export default function PlayPage() {
                     setSessionStacks([]);
                     setSessionProfit(0);
                     setPhase('setup-size');
+                    void deleteCurrentSession();
                 }}
             />
         );
@@ -872,29 +1096,34 @@ export default function PlayPage() {
 
     if (phase === 'deal-position') {
         return (
-            <DealPosition
-                tableSize={tableSize}
-                onSelectSeat={(i) => {
-                    pushHistory('Set position');
-                    const players = initPlayers(tableSize, sessionStacks[0] ?? buyIn, i);
-                    setHand((prev) => ({
-                        ...prev,
-                        botPosition: i,
-                        players,
-                        startingStacks: players.map((p) => p.stack),
-                        currentPlayerIdx: 0,
-                        streetRaiseCount: 0,
-                        preflopRaiseCount: 0,
-                        preflopCallCount: 0,
-                        preflopLastRaiser: null,
-                        lastAggressor: null,
-                    }));
-                    setPhase('deal-hole');
-                    setPickingFor('hole');
-                }}
-                canUndo={history.length > 0}
-                onUndo={undo}
-            />
+            <>
+                <DealPosition
+                    tableSize={tableSize}
+                    onSelectSeat={(i) => {
+                        pushHistory('Set position');
+                        const players = initPlayers(tableSize, sessionStacks[0] ?? buyIn, i);
+                        setHand((prev) => ({
+                            ...prev,
+                            botPosition: i,
+                            players,
+                            startingStacks: players.map((p) => p.stack),
+                            currentPlayerIdx: 0,
+                            streetRaiseCount: 0,
+                            preflopRaiseCount: 0,
+                            preflopCallCount: 0,
+                            preflopLastRaiser: null,
+                            lastAggressor: null,
+                        }));
+                        setPhase('deal-hole');
+                        setPickingFor('hole');
+                    }}
+                    canUndo={history.length > 0}
+                    onUndo={undo}
+                />
+                <div className="px-2 pb-2">
+                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                </div>
+            </>
         );
     }
 
@@ -923,15 +1152,20 @@ export default function PlayPage() {
 
     if (phase === 'deal-hole') {
         return (
-            <DealHoleCards
-                botPosition={hand.botPosition}
-                holeCards={hand.holeCards}
-                players={hand.players}
-                canUndo={history.length > 0}
-                onUndo={undo}
-            >
-                <CardSelector {...commonCardSelectorProps} />
-            </DealHoleCards>
+            <>
+                <DealHoleCards
+                    botPosition={hand.botPosition}
+                    holeCards={hand.holeCards}
+                    players={hand.players}
+                    canUndo={history.length > 0}
+                    onUndo={undo}
+                >
+                    <CardSelector {...commonCardSelectorProps} />
+                </DealHoleCards>
+                <div className="px-2 pb-2">
+                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                </div>
+            </>
         );
     }
 
@@ -945,47 +1179,52 @@ export default function PlayPage() {
             )
         );
         return (
-            <PlayPhase
-                pot={hand.pot}
-                currentBet={hand.currentBet}
-                bigBlind={bigBlind}
-                botPosition={hand.botPosition}
-                holeCards={hand.holeCards}
-                communityCards={hand.communityCards}
-                street={hand.street}
-                players={hand.players}
-                currentPlayerIdx={hand.currentPlayerIdx}
-                isLoading={hand.isLoading}
-                botResponse={hand.botResponse}
-                showRaiseInput={showRaiseInput}
-                setShowRaiseInput={setShowRaiseInput}
-                raiseInput={raiseInput}
-                setRaiseInput={setRaiseInput}
-                onOpenCommunityPicker={() => {
-                    if (!canOpenCommunityPicker) return;
-                    pushHistory('Open card picker');
-                    setPickingFor('community');
-                }}
-                onQueryBot={() => queryBot(hand)}
-                onRecordAction={recordOpponentAction}
-                onUndo={undo}
-                canUndo={history.length > 0}
-                undoLabel={history[history.length - 1]?.label}
-                legalActions={legalActions}
-                showdownMode={isShowdownMode}
-                showdownEntries={showdownEntries}
-                currentShowdownPlayerIndex={currentShowdownEntry?.playerIndex ?? null}
-                showdownCanResolve={showdownCanResolve}
-                isResolvingShowdown={isResolvingShowdown}
-                showdownError={showdownError}
-                showdownResult={showdownResult}
-                resultFlash={resultFlash}
-                onMuckShowdown={muckCurrentShowdownPlayer}
-                onClearShowdown={clearCurrentShowdownPlayer}
-                onResolveShowdown={resolveHand}
-            >
-                <CardSelector {...commonCardSelectorProps} />
-            </PlayPhase>
+            <>
+                <PlayPhase
+                    pot={hand.pot}
+                    currentBet={hand.currentBet}
+                    bigBlind={bigBlind}
+                    botPosition={hand.botPosition}
+                    holeCards={hand.holeCards}
+                    communityCards={hand.communityCards}
+                    street={hand.street}
+                    players={hand.players}
+                    currentPlayerIdx={hand.currentPlayerIdx}
+                    isLoading={hand.isLoading}
+                    botResponse={hand.botResponse}
+                    showRaiseInput={showRaiseInput}
+                    setShowRaiseInput={setShowRaiseInput}
+                    raiseInput={raiseInput}
+                    setRaiseInput={setRaiseInput}
+                    onOpenCommunityPicker={() => {
+                        if (!canOpenCommunityPicker) return;
+                        pushHistory('Open card picker');
+                        setPickingFor('community');
+                    }}
+                    onQueryBot={() => queryBot(hand)}
+                    onRecordAction={recordOpponentAction}
+                    onUndo={undo}
+                    canUndo={history.length > 0}
+                    undoLabel={history[history.length - 1]?.label}
+                    legalActions={legalActions}
+                    showdownMode={isShowdownMode}
+                    showdownEntries={showdownEntries}
+                    currentShowdownPlayerIndex={currentShowdownEntry?.playerIndex ?? null}
+                    showdownCanResolve={showdownCanResolve}
+                    isResolvingShowdown={isResolvingShowdown}
+                    showdownError={showdownError}
+                    showdownResult={showdownResult}
+                    resultFlash={resultFlash}
+                    onMuckShowdown={muckCurrentShowdownPlayer}
+                    onClearShowdown={clearCurrentShowdownPlayer}
+                    onResolveShowdown={resolveHand}
+                >
+                    <CardSelector {...commonCardSelectorProps} />
+                </PlayPhase>
+                <div className="px-2 pb-2">
+                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                </div>
+            </>
         );
     }
 
