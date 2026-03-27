@@ -3,7 +3,8 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    network_mode: "host"
+    ports:
+      - "8000:8000"
     volumes:
       # Mount backend source for hot-reload during development
       - ./backend:/app/backend
@@ -16,7 +17,7 @@ services:
     environment:
       - ENABLE_POKER_ROUTER=1
       - ENABLE_POKER_PRELOAD=0
-      - REDIS_URL=redis://127.0.0.1:6379
+      - REDIS_URL=redis://redis:6379
     # --reload watches for file changes and auto-restarts uvicorn
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     restart: unless-stopped
@@ -25,7 +26,8 @@ services:
 
   redis:
     image: redis:7-alpine
-    network_mode: "host"
+    ports:
+      - "6379:6379"
     volumes:
       - redis-data:/data
     restart: unless-stopped

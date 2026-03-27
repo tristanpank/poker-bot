@@ -109,6 +109,7 @@ docker compose up --build backend
 
 - **Hot Reloading**: The `backend/` directory is mounted into the container via volumes, so changes you make locally will auto-restart the server inside Docker.
 - **Baked-in Models**: Trained models, checkpoints, and feature definitions are baked directly into the image to ensure the container is self-contained and ready to run.
+- **Ports**: The backend is published at `http://localhost:8000` and Redis is published at `localhost:6379` for local development.
 
 ### 3 – Monitoring
 ```bash
