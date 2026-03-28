@@ -61,6 +61,7 @@ def test_cv_analyze_returns_metrics() -> None:
     assert "bluffRisk" in metrics
     assert "analysisFps" in metrics
     assert "streamFps" in metrics
+    assert metrics["analysisSource"] == "theali29/Lie-Detector"
     assert metrics["streamFps"] == 24.2
 
 
@@ -120,6 +121,7 @@ def test_cv_analyze_raw_returns_metrics() -> None:
 
     data = response.json()
     assert "metrics" in data
+    assert data["metrics"]["analysisSource"] == "theali29/Lie-Detector"
     assert data["metrics"]["streamFps"] == 27.7
 
 

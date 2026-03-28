@@ -4,6 +4,9 @@ uvicorn[standard]
 pydantic-settings
 pokerkit
 numpy
+opencv-python
+mediapipe==0.10.18
+scipy
 redis[hiredis]
 aiortc
 

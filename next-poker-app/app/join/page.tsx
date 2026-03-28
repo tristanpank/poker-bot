@@ -3,6 +3,7 @@
 import { useCallback, useState } from 'react';
 import { useEffect } from 'react';
 
+import { getDefaultPlayerName, getSeatLabel, getTablePosition } from '../lib/tablePositions';
 import { useCvWebRtcStream } from '../lib/useCvWebRtcStream';
 
 const BACKEND =
@@ -10,10 +11,15 @@ const BACKEND =
 const JOIN_PAGE_STATE_KEY = 'poker.join.page.state';
 const SESSION_STATUS_POLL_INTERVAL_MS = 3000;
 
+function buildSeatAvailability(tableSize: number, botPosition: number | null): boolean[] {
+  return Array.from({ length: tableSize }, (_, seat) => seat !== botPosition);
+}
+
 type JoinState = 'idle' | 'joined' | 'streaming';
 type PersistedJoinPageState = {
   code: string;
   playerPosition: number;
+  playerName: string;
   sessionId: string | null;
   cvSessionId: string | null;
   joinState: JoinState;
@@ -27,13 +33,17 @@ type WebcamSessionStatus = {
     {
       connected: boolean;
       cv_session_id: string;
+      player_name?: string;
     }
   >;
+  tableSize?: number | null;
+  botPosition?: number | null;
 };
 
 export default function JoinPage() {
   const [code, setCode] = useState('');
   const [playerPosition, setPlayerPosition] = useState(1);
+  const [playerName, setPlayerName] = useState('');
   const [joinState, setJoinState] = useState<JoinState>('idle');
   const [joinError, setJoinError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -41,7 +51,9 @@ export default function JoinPage() {
   const [isJoining, setIsJoining] = useState(false);
   const [isStartingWebcam, setIsStartingWebcam] = useState(false);
   const [isStoppingWebcam, setIsStoppingWebcam] = useState(false);
-  const [availableSeats, setAvailableSeats] = useState<boolean[]>([true, true, true, true, true]);
+  const [tableSize, setTableSize] = useState(6);
+  const [botPosition, setBotPosition] = useState<number | null>(null);
+  const [availableSeats, setAvailableSeats] = useState<boolean[]>(() => buildSeatAvailability(6, null));
   const [isLoadingSeatStatus, setIsLoadingSeatStatus] = useState(false);
 
   const {
@@ -58,15 +70,20 @@ export default function JoinPage() {
 
   const error = joinError ?? streamError;
   const trimmedCode = code.trim().toUpperCase();
+  const trimmedPlayerName = playerName.trim();
+  const resolvedPlayerName = trimmedPlayerName || getDefaultPlayerName(playerPosition);
   const hasCompleteCode = trimmedCode.length === 6;
-  const isSeatTaken = useCallback((position: number) => !availableSeats[position - 1], [availableSeats]);
+  const hasSeatMap = botPosition !== null;
+  const isSeatTaken = useCallback((position: number) => !availableSeats[position], [availableSeats]);
   const hasAnyAvailableSeat = availableSeats.some(Boolean);
+  const selectableSeats = Array.from({ length: tableSize }, (_, seat) => seat).filter((seat) => seat !== botPosition);
 
   const notifyDisconnect = useCallback(
-    (targetSessionId: string, targetPlayerPosition: number, keepalive = false) => {
+    (targetSessionId: string, targetPlayerPosition: number, targetCvSessionId: string | null, keepalive = false) => {
       const body = JSON.stringify({
         session_id: targetSessionId,
         player_position: targetPlayerPosition,
+        cv_session_id: targetCvSessionId,
       });
 
       if (keepalive && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
@@ -113,11 +130,12 @@ export default function JoinPage() {
       const saved = JSON.parse(raw) as PersistedJoinPageState;
       setCode(saved.code ?? '');
       setPlayerPosition(saved.playerPosition ?? 1);
+      setPlayerName(saved.playerName ?? '');
       setSessionId(saved.sessionId ?? null);
       setCvSessionId(saved.cvSessionId ?? null);
 
       if (saved.sessionId && saved.cvSessionId && saved.joinState !== 'idle') {
-        notifyDisconnect(saved.sessionId, saved.playerPosition ?? 1);
+        notifyDisconnect(saved.sessionId, saved.playerPosition ?? 1, saved.cvSessionId ?? null);
         // A browser refresh destroys the active camera/WebRTC objects, so we
         // restore the page into the joined state and let the user restart the
         // webcam without re-joining the table position.
@@ -141,12 +159,13 @@ export default function JoinPage() {
     const nextState: PersistedJoinPageState = {
       code,
       playerPosition,
+      playerName,
       sessionId,
       cvSessionId,
       joinState: isStreaming ? 'streaming' : 'joined',
     };
     window.sessionStorage.setItem(JOIN_PAGE_STATE_KEY, JSON.stringify(nextState));
-  }, [code, cvSessionId, isStreaming, joinState, playerPosition, sessionId]);
+  }, [code, cvSessionId, isStreaming, joinState, playerName, playerPosition, sessionId]);
 
   useEffect(() => {
     if (!sessionId || joinState === 'idle') {
@@ -161,6 +180,24 @@ export default function JoinPage() {
         }
 
         const data = (await res.json()) as WebcamSessionStatus;
+        if (typeof data.tableSize === 'number' && data.tableSize >= 2 && data.tableSize <= 6) {
+          setTableSize(data.tableSize);
+        }
+        if (typeof data.botPosition === 'number' && data.botPosition >= 0 && data.botPosition < 6) {
+          setBotPosition(data.botPosition);
+        }
+        if (cvSessionId) {
+          const currentOpponent = Object.entries(data.opponents).find(([, opponent]) => opponent.cv_session_id === cvSessionId);
+          if (currentOpponent) {
+            const nextPosition = Number(currentOpponent[0]);
+            if (Number.isInteger(nextPosition) && nextPosition >= 0 && nextPosition < Math.max(2, tableSize)) {
+              setPlayerPosition(nextPosition);
+            }
+            if (currentOpponent[1].player_name?.trim()) {
+              setPlayerName(currentOpponent[1].player_name.trim());
+            }
+          }
+        }
         if (!data.sessionActive) {
           await resetToIdle('The host ended this game. Rejoin with the new table code.');
         }
@@ -177,7 +214,7 @@ export default function JoinPage() {
     return () => {
       window.clearInterval(pollId);
     };
-  }, [joinState, resetToIdle, sessionId]);
+  }, [cvSessionId, joinState, resetToIdle, sessionId, tableSize]);
 
   useEffect(() => {
     if (!sessionId || joinState === 'idle') {
@@ -185,7 +222,7 @@ export default function JoinPage() {
     }
 
     const handlePageHide = () => {
-      notifyDisconnect(sessionId, playerPosition, true);
+      notifyDisconnect(sessionId, playerPosition, cvSessionId, true);
     };
 
     window.addEventListener('pagehide', handlePageHide);
@@ -195,11 +232,11 @@ export default function JoinPage() {
       window.removeEventListener('pagehide', handlePageHide);
       window.removeEventListener('beforeunload', handlePageHide);
     };
-  }, [joinState, notifyDisconnect, playerPosition, sessionId]);
+  }, [cvSessionId, joinState, notifyDisconnect, playerPosition, sessionId]);
 
   useEffect(() => {
     if (joinState !== 'idle' || !hasCompleteCode) {
-      setAvailableSeats([true, true, true, true, true]);
+      setAvailableSeats(buildSeatAvailability(tableSize, botPosition));
       setIsLoadingSeatStatus(false);
       return;
     }
@@ -218,9 +255,15 @@ export default function JoinPage() {
         }
 
         const data = (await res.json()) as WebcamSessionStatus;
-        const nextAvailableSeats = [true, true, true, true, true];
+        const nextTableSize = typeof data.tableSize === 'number' && data.tableSize >= 2 && data.tableSize <= 6
+          ? data.tableSize
+          : 6;
+        const nextBotPosition = typeof data.botPosition === 'number' && data.botPosition >= 0 && data.botPosition < nextTableSize
+          ? data.botPosition
+          : null;
+        const nextAvailableSeats = buildSeatAvailability(nextTableSize, nextBotPosition);
         for (const [position, opponent] of Object.entries(data.opponents)) {
-          const seatIndex = Number(position) - 1;
+          const seatIndex = Number(position);
           if (
             Number.isInteger(seatIndex) &&
             seatIndex >= 0 &&
@@ -232,11 +275,15 @@ export default function JoinPage() {
         }
 
         if (!cancelled) {
+          setTableSize(nextTableSize);
+          setBotPosition(nextBotPosition);
           setAvailableSeats(nextAvailableSeats);
         }
       } catch {
         if (!cancelled) {
-          setAvailableSeats([true, true, true, true, true]);
+          setTableSize(6);
+          setBotPosition(null);
+          setAvailableSeats(buildSeatAvailability(6, null));
         }
       } finally {
         if (!cancelled) {
@@ -254,18 +301,18 @@ export default function JoinPage() {
       cancelled = true;
       window.clearInterval(pollId);
     };
-  }, [hasCompleteCode, joinState, trimmedCode]);
+  }, [botPosition, hasCompleteCode, joinState, tableSize, trimmedCode]);
 
   useEffect(() => {
     if (joinState !== 'idle' || !isSeatTaken(playerPosition)) {
       return;
     }
 
-    const nextAvailablePosition = availableSeats.findIndex(Boolean);
+    const nextAvailablePosition = availableSeats.findIndex((isAvailable, seat) => isAvailable && seat !== botPosition);
     if (nextAvailablePosition >= 0) {
-      setPlayerPosition(nextAvailablePosition + 1);
+      setPlayerPosition(nextAvailablePosition);
     }
-  }, [availableSeats, isSeatTaken, joinState, playerPosition]);
+  }, [availableSeats, botPosition, isSeatTaken, joinState, playerPosition]);
 
   const handleJoin = useCallback(async () => {
     setJoinError(null);
@@ -275,7 +322,12 @@ export default function JoinPage() {
     }
 
     if (isSeatTaken(playerPosition)) {
-      setJoinError(`Player ${playerPosition} is already taken. Choose an available seat.`);
+      setJoinError(`${getSeatLabel(playerPosition)} is already taken. Choose an available seat.`);
+      return;
+    }
+
+    if (!hasSeatMap) {
+      setJoinError('Waiting for the host to finish assigning the table seats.');
       return;
     }
 
@@ -284,7 +336,11 @@ export default function JoinPage() {
       const res = await fetch(`${BACKEND}/session/webcam/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: trimmedCode, player_position: playerPosition }),
+        body: JSON.stringify({
+          code: trimmedCode,
+          player_position: playerPosition,
+          player_name: trimmedPlayerName || null,
+        }),
       });
 
       if (!res.ok) {
@@ -295,13 +351,14 @@ export default function JoinPage() {
       const data = await res.json();
       setSessionId(data.session_id);
       setCvSessionId(data.cv_session_id);
+      setPlayerName(data.player_name ?? resolvedPlayerName);
       setJoinState('joined');
     } catch (err) {
       setJoinError(err instanceof Error ? err.message : 'Failed to join session.');
     } finally {
       setIsJoining(false);
     }
-  }, [isSeatTaken, playerPosition, trimmedCode]);
+  }, [hasSeatMap, isSeatTaken, playerPosition, resolvedPlayerName, trimmedCode, trimmedPlayerName]);
 
   const startWebcam = useCallback(async () => {
     if (!cvSessionId || !sessionId) return;
@@ -313,7 +370,11 @@ export default function JoinPage() {
         void fetch(`${BACKEND}/session/webcam/reconnect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
+          body: JSON.stringify({
+            session_id: sessionId,
+            player_position: playerPosition,
+            cv_session_id: cvSessionId,
+          }),
         }).catch(() => undefined);
       }
 
@@ -332,14 +393,14 @@ export default function JoinPage() {
       await stopStream();
 
       if (sessionId) {
-        notifyDisconnect(sessionId, playerPosition);
+        notifyDisconnect(sessionId, playerPosition, cvSessionId);
       }
 
       setJoinState('joined');
     } finally {
       setIsStoppingWebcam(false);
     }
-  }, [notifyDisconnect, playerPosition, sessionId, stopStream]);
+  }, [cvSessionId, notifyDisconnect, playerPosition, sessionId, stopStream]);
 
   const leaveSession = useCallback(async () => {
     await stopWebcam();
@@ -430,16 +491,34 @@ export default function JoinPage() {
 
             <div>
               <label className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1.5 block">
-                Your Position (relative to bot)
+                Your Name (Optional)
               </label>
-              <div className="grid grid-cols-5 gap-2">
-                {[1, 2, 3, 4, 5].map((pos) => {
+              <input
+                type="text"
+                maxLength={60}
+                value={playerName}
+                onChange={(e) => {
+                  setPlayerName(e.target.value);
+                  setJoinError(null);
+                }}
+                disabled={isJoining}
+                placeholder={getDefaultPlayerName(playerPosition)}
+                className="w-full rounded-xl border border-slate-600/50 bg-slate-800/80 px-4 py-3 text-sm font-medium text-white placeholder:text-slate-500 focus:border-emerald-500/50 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all"
+              />
+            </div>
+
+            <div>
+              <label className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1.5 block">
+                Your Seat
+              </label>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {selectableSeats.map((pos) => {
                   const taken = hasCompleteCode && isSeatTaken(pos);
                   return (
                     <button
                       key={pos}
                       onClick={() => setPlayerPosition(pos)}
-                      disabled={isJoining || taken}
+                      disabled={isJoining || taken || !hasSeatMap}
                       className={`rounded-xl py-3 text-sm font-semibold transition-all ${
                         taken
                           ? 'bg-slate-900/80 text-slate-500 border border-slate-700/40 cursor-not-allowed opacity-60'
@@ -448,17 +527,29 @@ export default function JoinPage() {
                             : 'bg-slate-800/80 text-slate-300 border border-slate-600/30 hover:bg-slate-700/80 hover:border-slate-500/40'
                       }`}
                     >
-                      P{pos}
+                      <div className="flex flex-col items-center gap-0.5">
+                        <span>{getSeatLabel(pos)}</span>
+                        <span className="text-[10px] uppercase tracking-wide opacity-80">
+                          {getTablePosition(pos, tableSize)}
+                        </span>
+                      </div>
                     </button>
                   );
                 })}
               </div>
+              {hasSeatMap && botPosition !== null && (
+                <p className="mt-2 text-xs text-slate-500">
+                  Bot seat: <span className="text-slate-300">{getSeatLabel(botPosition)} ({getTablePosition(botPosition, tableSize)})</span>
+                </p>
+              )}
               {hasCompleteCode && (
                 <p className="mt-2 text-xs text-slate-500">
                   {isLoadingSeatStatus
                     ? 'Checking available seats...'
-                    : hasAnyAvailableSeat
-                      ? 'Taken seats are greyed out.'
+                    : !hasSeatMap
+                      ? 'Waiting for the host to choose the bot seat so the table seats can be labeled correctly.'
+                      : hasAnyAvailableSeat
+                        ? 'Seat labels match the real table. Taken seats are greyed out.'
                       : 'All seats are currently taken.'}
                 </p>
               )}
@@ -466,7 +557,7 @@ export default function JoinPage() {
 
             <button
               onClick={handleJoin}
-              disabled={!hasCompleteCode || isJoining || isLoadingSeatStatus || isSeatTaken(playerPosition) || !hasAnyAvailableSeat}
+              disabled={!hasCompleteCode || isJoining || isLoadingSeatStatus || isSeatTaken(playerPosition) || !hasAnyAvailableSeat || !hasSeatMap}
               className="mt-1 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 px-6 py-3.5 text-sm font-semibold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-400 hover:to-emerald-500 hover:shadow-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
             >
               {isJoining ? 'Joining...' : 'Join Session'}
@@ -485,9 +576,11 @@ export default function JoinPage() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-xs text-slate-400 font-medium">
-                  Connected as <span className="text-emerald-400 font-semibold">Player {playerPosition}</span>
+                  Connected as <span className="text-emerald-400 font-semibold">{resolvedPlayerName}</span>
                 </p>
-                <p className="text-xs text-slate-500 mt-0.5">Session: {sessionId?.slice(0, 8)}...</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {getSeatLabel(playerPosition)} ({getTablePosition(playerPosition, tableSize)}) • Session: {sessionId?.slice(0, 8)}...
+                </p>
               </div>
               <span
                 className={`rounded-full px-3 py-1 text-xs font-semibold ${statusClass}`}

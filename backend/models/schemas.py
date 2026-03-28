@@ -55,6 +55,23 @@ class PlayerState(BaseModel):
     has_acted: bool = Field(default=False, description="Whether player has acted in this betting round")
 
 
+class PlayerCvRead(BaseModel):
+    """Per-player CV summary over acting windows in the current hand/orbit."""
+
+    position: int = Field(..., ge=0, le=5)
+    current_window_started_at_ms: Optional[int] = Field(default=None, ge=0)
+    last_window_started_at_ms: Optional[int] = Field(default=None, ge=0)
+    last_window_ended_at_ms: Optional[int] = Field(default=None, ge=0)
+    last_window_avg_bluff_delta: Optional[float] = Field(default=None, ge=-100, le=100)
+    last_window_max_bluff_delta: Optional[float] = Field(default=None, ge=-100, le=100)
+    last_window_sample_count: int = Field(default=0, ge=0)
+    orbit_avg_bluff_delta: Optional[float] = Field(default=None, ge=-100, le=100)
+    orbit_max_bluff_delta: Optional[float] = Field(default=None, ge=-100, le=100)
+    orbit_window_count: int = Field(default=0, ge=0)
+    orbit_sample_count: int = Field(default=0, ge=0)
+    was_aggressor_this_pot: bool = Field(default=False)
+
+
 class GameStateRequest(BaseModel):
     """Complete game state for requesting bot action."""
     model_config = ConfigDict(
@@ -138,6 +155,14 @@ class GameStateRequest(BaseModel):
         le=5,
         description="Seat position of the most recent aggressor on any street.",
     )
+    cv_reads: dict[str, PlayerCvRead] = Field(
+        default_factory=dict,
+        description="Per-player CV acting-window summaries for the current hand/orbit.",
+    )
+    pot_aggressors: list[int] = Field(
+        default_factory=list,
+        description="Seat positions that have taken an aggressive action during the current pot.",
+    )
     
     # Model selection
     model_version: Optional[str] = Field(
@@ -206,6 +231,13 @@ class AppliedAction(BaseModel):
     equity: Optional[float] = Field(default=None, ge=0, le=1)
     hand_strength_category: Optional[str] = None
     q_values: Optional[dict[str, float]] = None
+    original_action: Optional[Literal["fold", "check", "call", "raise_amt"]] = None
+    original_raise_amt: Optional[int] = Field(default=None, ge=0)
+    original_action_id: Optional[int] = Field(default=None, ge=0, le=MAX_ACTION_ID)
+    original_q_values: Optional[dict[str, float]] = None
+    cv_influence_applied: bool = False
+    cv_act_max: Optional[float] = Field(default=None, ge=-100, le=100)
+    cv_bluff_risk_level: Optional[Literal["low", "watch", "elevated"]] = None
 
 
 class PokerStepRequest(BaseModel):
@@ -331,6 +363,7 @@ class CvMetrics(BaseModel):
     analysis_fps: float = Field(..., alias="analysisFps", ge=0)
     stream_fps: float = Field(..., alias="streamFps", ge=0)
     updated_at: str = Field(..., alias="updatedAt")
+    analysis_source: str = Field(..., alias="analysisSource", min_length=1)
 
 
 class CvAnalyzeResponse(BaseModel):

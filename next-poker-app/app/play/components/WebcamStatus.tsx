@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { getTablePosition } from '../../lib/tablePositions';
 
 const BACKEND =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
@@ -9,6 +10,7 @@ const POLL_INTERVAL_MS = 3000;
 type OpponentStatus = {
   connected: boolean;
   cv_session_id: string;
+  player_name?: string;
   metrics?: {
     bluffLevel: string;
     bluffRisk: number;
@@ -19,15 +21,18 @@ type OpponentStatus = {
 };
 
 type WebcamStatusData = {
+  tableSize?: number | null;
+  botPosition?: number | null;
   opponents: Record<string, OpponentStatus>;
 };
 
 type WebcamStatusProps = {
   sessionId: string | null;
   tableSize: number;
+  botPosition: number | null;
 };
 
-export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps) {
+export default function WebcamStatus({ sessionId, tableSize, botPosition }: WebcamStatusProps) {
   const [code, setCode] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [statusData, setStatusData] = useState<WebcamStatusData>({ opponents: {} });
@@ -60,7 +65,7 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
   }, [sessionId, code]);
 
   const generateCode = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId || botPosition === null) return;
     setIsGenerating(true);
     setError(null);
 
@@ -80,7 +85,7 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
     } finally {
       setIsGenerating(false);
     }
-  }, [sessionId]);
+  }, [botPosition, sessionId]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -90,8 +95,10 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
       return;
     }
 
-    void generateCode();
-  }, [generateCode, sessionId]);
+    if (botPosition !== null) {
+      void generateCode();
+    }
+  }, [botPosition, generateCode, sessionId]);
 
   const copyCode = useCallback(async () => {
     if (!code) return;
@@ -104,9 +111,11 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
     }
   }, [code]);
 
-  // Positions 1..tableSize-1 (bot is position 0)
-  const opponentPositions = Array.from({ length: tableSize - 1 }, (_, i) => i + 1);
-
+  const resolvedTableSize = tableSize;
+  const resolvedBotPosition = botPosition ?? (typeof statusData.botPosition === 'number' ? statusData.botPosition : null);
+  const opponentPositions = Array.from({ length: resolvedTableSize }, (_, seat) => seat).filter(
+    (seat) => seat !== resolvedBotPosition,
+  );
   const connectedCount = Object.values(statusData.opponents).filter((o) => o.connected).length;
 
   return (
@@ -117,7 +126,7 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
         </h3>
         {code && (
           <span className="text-[10px] text-slate-600">
-            {connectedCount}/{tableSize - 1} connected
+            {connectedCount}/{opponentPositions.length} connected
           </span>
         )}
       </div>
@@ -125,13 +134,19 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
       {!code ? (
         <button
           onClick={generateCode}
-          disabled={isGenerating || !sessionId}
+          disabled={isGenerating || !sessionId || botPosition === null}
           className="w-full rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-blue-500/15 transition-all hover:bg-blue-400 disabled:opacity-40"
         >
-          {isGenerating ? 'Loading Code...' : 'Generate Code'}
+          {isGenerating ? 'Loading Code...' : botPosition === null ? 'Choose Bot Seat First' : 'Generate Code'}
         </button>
       ) : (
         <>
+          {resolvedBotPosition !== null && (
+            <p className="text-[10px] text-slate-500">
+              Bot position: <span className="text-slate-300">{getTablePosition(resolvedBotPosition, resolvedTableSize)}</span>
+            </p>
+          )}
+
           {/* Code display */}
           <div className="flex items-center gap-1.5">
             <div className="flex-1 rounded-lg bg-slate-800/80 border border-slate-600/30 py-2 text-center">
@@ -148,10 +163,11 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
           </div>
 
           {/* Player connection grid - more compact */}
-          <div className="grid grid-cols-5 gap-1.5">
+          <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
             {opponentPositions.map((pos) => {
               const opponent = statusData.opponents[String(pos)];
               const isConnected = opponent?.connected ?? false;
+              const displayName = opponent?.player_name ?? `Player ${pos + 1}`;
 
               return (
                 <div
@@ -159,16 +175,15 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
                   className={`rounded-lg py-1.5 px-0.5 text-center text-[10px] font-semibold transition-all ${isConnected
                     ? 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-400'
                     : 'bg-slate-800/40 border border-slate-700/20 text-slate-500'
-                    }`}
+                  }`}
                 >
-                  <div className="flex flex-col items-center justify-center gap-0.5 min-h-[40px]">
-                    <div className="flex items-center gap-1">
-                      <div
-                        className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-slate-600'
-                          }`}
-                      />
-                      <span>P{pos}</span>
-                    </div>
+                  <div className="flex flex-col items-center justify-center gap-0.5 min-h-[58px]">
+                    <div
+                      className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-slate-600'
+                        }`}
+                    />
+                    <span className="text-[11px] uppercase tracking-wide opacity-90">{getTablePosition(pos, resolvedTableSize)}</span>
+                    <span className="max-w-full truncate px-1 text-[9px] text-slate-200">{displayName}</span>
                     {isConnected && opponent?.metrics && (
                       <div className="mt-1 flex flex-col items-center text-[9px] leading-tight opacity-90">
                         <span className="text-white font-bold uppercase tracking-wider">{opponent.metrics.bluffLevel}</span>
@@ -183,6 +198,11 @@ export default function WebcamStatus({ sessionId, tableSize }: WebcamStatusProps
             })}
           </div>
         </>
+      )}
+      {!code && botPosition === null && (
+        <p className="text-[10px] text-slate-500 text-center">
+          Pick the bot&apos;s real table seat before sharing the join code.
+        </p>
       )}
       {error && (
         <p className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300 text-center">

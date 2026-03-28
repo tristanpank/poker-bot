@@ -100,14 +100,15 @@ export default function TestPage() {
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-8">
         <section className="flex flex-col gap-3 rounded-2xl border border-slate-700 bg-slate-900/60 p-6 shadow-xl shadow-slate-950/30">
           <h1 className="text-2xl font-semibold tracking-tight">
-            WebRTC Bluff Signal + Lightweight POS CV
+            WebRTC Bluff Signal + Upstream Detector Metrics
           </h1>
           <p className="max-w-3xl text-sm text-slate-300">
             This page uses the exact same WebRTC CV client logic as the real join
             page, but shows the full metrics dashboard for debugging.
           </p>
           <p className="max-w-3xl text-xs text-slate-400">
-            Heuristic only: visual cues are not a reliable lie detector.
+            Behavioral metrics on this page are sourced from the upstream{" "}
+            <span className="font-mono">theali29/Lie-Detector</span> pipeline.
           </p>
           <p className="max-w-3xl text-xs text-slate-400">
             Capture negotiated (shared client): {captureInfo}
@@ -271,7 +272,7 @@ export default function TestPage() {
 
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard
-              label="Pulse (POS)"
+              label="Pulse"
               value={numberLabel(metrics.pulseBpm, " BPM")}
             />
             <MetricCard
@@ -355,6 +356,7 @@ export default function TestPage() {
             <MetricCard label="Analysis FPS" value={`${metrics.analysisFps}`} />
             <MetricCard label="Stream FPS" value={`${metrics.streamFps}`} />
             <MetricCard label="Last update" value={metrics.updatedAt} />
+            <MetricCard label="Analysis source" value={metrics.analysisSource} />
           </div>
 
           <BluffPressureChart points={bluffHistory} windowMs={BLUFF_WINDOW_MS} />

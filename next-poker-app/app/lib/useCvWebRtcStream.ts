@@ -26,6 +26,7 @@ export type VisionMetrics = {
   analysisFps: number;
   streamFps: number;
   updatedAt: string;
+  analysisSource: string;
 };
 
 export type BluffPoint = {
@@ -128,6 +129,7 @@ export const INITIAL_VISION_METRICS: VisionMetrics = {
   analysisFps: 0,
   streamFps: 0,
   updatedAt: '--',
+  analysisSource: '--',
 };
 
 const INITIAL_BACKEND_WEBRTC_STATUS: BackendWebRtcStatus = {

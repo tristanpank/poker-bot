@@ -1,8 +1,33 @@
 import React from 'react';
+import { getTablePosition } from '../../lib/tablePositions';
 
 type Card = { rank: string; suit: string };
 type PlayerState = { position: number; stack: number; bet: number; hole_cards: Card[] | null; is_bot: boolean; is_active: boolean; has_acted: boolean };
-type BotResponse = { action: string; action_id: number | null; amount: number | null };
+type PlayerCvRead = {
+    position: number;
+    currentWindowStartedAtMs: number | null;
+    lastWindowStartedAtMs: number | null;
+    lastWindowEndedAtMs: number | null;
+    lastWindowAvgBluffDelta: number | null;
+    lastWindowMaxBluffDelta: number | null;
+    lastWindowSampleCount: number;
+    orbitAvgBluffDelta: number | null;
+    orbitMaxBluffDelta: number | null;
+    orbitWindowCount: number;
+    orbitSampleCount: number;
+    wasAggressorThisPot: boolean;
+};
+type BotResponse = {
+    action: string;
+    action_id: number | null;
+    amount: number | null;
+    originalAction: string | null;
+    originalActionId: number | null;
+    originalAmount: number | null;
+    cvInfluenceApplied: boolean;
+    cvActMax: number | null;
+    cvBluffRiskLevel: 'low' | 'watch' | 'elevated' | null;
+};
 type LegalActionState = {
     canFold: boolean;
     canCheck: boolean;
@@ -35,25 +60,13 @@ const ACTION_COLORS: Record<string, string> = {
     raise_amt: 'text-emerald-300',
 };
 
-const seatRoleByPlayers: Record<number, string[]> = {
-    2: ['SB/BTN', 'BB'],
-    3: ['SB', 'BB', 'BTN'],
-    4: ['SB', 'BB', 'UTG', 'BTN'],
-    5: ['SB', 'BB', 'UTG', 'CO', 'BTN'],
-    6: ['SB', 'BB', 'UTG', 'MP', 'CO', 'BTN'],
-};
-
 const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
 
-function getSeatRole(position: number, numPlayers: number): string {
-    const roles = seatRoleByPlayers[numPlayers] ?? seatRoleByPlayers[6];
-    return roles[position] ?? `Seat ${position + 1}`;
-}
-
-function getPlayerName(player: PlayerState, numPlayers: number): string {
-    const role = getSeatRole(player.position, numPlayers);
+function getPlayerName(player: PlayerState, numPlayers: number, playerNames: Record<string, string>): string {
+    const role = getTablePosition(player.position, numPlayers);
     if (player.is_bot) return `Bot (${role})`;
-    return `Player ${player.position + 1} (${role})`;
+    const customName = playerNames[String(player.position)]?.trim();
+    return `${customName || `Player ${player.position + 1}`} (${role})`;
 }
 
 function normalizeAction(action: string): string {
@@ -67,6 +80,50 @@ function displayAction(action: string): string {
     return normalized.toUpperCase();
 }
 
+function formatSignedDelta(value: number | null | undefined): string {
+    if (value === null || value === undefined || Number.isNaN(value)) {
+        return '--';
+    }
+    return `${value >= 0 ? '+' : ''}${value.toFixed(1)}`;
+}
+
+function formatRiskLevel(level: 'watch' | 'elevated' | null): string {
+    if (level === 'elevated') return 'Elevated';
+    if (level === 'watch') return 'Watch';
+    return 'Low';
+}
+
+function formatActionSummary(action: string | null | undefined, amount: number | null | undefined): string {
+    if (!action) {
+        return '--';
+    }
+    const label = displayAction(action);
+    if (normalizeAction(action) === 'raise_amt' && amount != null) {
+        return `${label} ${amount}`;
+    }
+    return label;
+}
+
+function getRecommendationNote(botResponse: BotResponse): string {
+    if (botResponse.cvBluffRiskLevel == null || botResponse.cvBluffRiskLevel === 'low') {
+        return 'No bluff detected.';
+    }
+    if (!botResponse.cvInfluenceApplied) {
+        return 'Bluff pressure reviewed; original action kept.';
+    }
+    const changed = (
+        botResponse.originalAction !== null
+        && (
+            botResponse.originalAction !== botResponse.action
+            || botResponse.originalAmount !== botResponse.amount
+        )
+    );
+    if (changed) {
+        return 'Elevated bluff pressure changed the recommendation.';
+    }
+    return 'Elevated bluff pressure reviewed; action stayed the same.';
+}
+
 type PlayPhaseProps = {
     pot: number;
     currentBet: number;
@@ -76,7 +133,10 @@ type PlayPhaseProps = {
     communityCards: Card[];
     street: 'preflop' | 'flop' | 'turn' | 'river';
     players: PlayerState[];
+    playerNames: Record<string, string>;
     currentPlayerIdx: number;
+    cvReads: Record<string, PlayerCvRead>;
+    potAggressors: number[];
     isLoading: boolean;
     botResponse: BotResponse | null;
     showRaiseInput: boolean;
@@ -113,7 +173,10 @@ export default function PlayPhase({
     communityCards,
     street,
     players,
+    playerNames,
     currentPlayerIdx,
+    cvReads,
+    potAggressors,
     isLoading,
     botResponse,
     showRaiseInput,
@@ -143,6 +206,7 @@ export default function PlayPhase({
     const currentPlayer = players[currentPlayerIdx];
     const isBotTurn = currentPlayer?.is_bot ?? false;
     const botPlayer = players.find((p) => p.is_bot);
+    const potAggressorPositions = new Set(potAggressors);
     const raiseMin = legalActions.minRaiseTo ?? 0;
     const raiseMax = legalActions.maxRaiseTo ?? 0;
     const raiseValue = Number(raiseInput);
@@ -157,6 +221,7 @@ export default function PlayPhase({
             || (street === 'turn' && communityCards.length === 4)
         )
     );
+    const recommendationNote = botResponse ? getRecommendationNote(botResponse) : null;
 
     return (
         <div className="flex-1 flex flex-col">
@@ -181,12 +246,16 @@ export default function PlayPhase({
                         <span className="text-[10px] text-[var(--color-text-secondary)] font-medium">Bet</span>
                         <span className="text-sm font-bold text-[var(--color-text-primary)]">{currentBet}</span>
                     </div>
+                    <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-[var(--color-text-secondary)] font-medium">BB</span>
+                        <span className="text-sm font-bold text-[var(--color-text-primary)]">{bigBlind}</span>
+                    </div>
                 </div>
             </header>
 
             <main className="flex-1 p-2 flex flex-col gap-2 pb-2">
                 <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-xl p-2.5">
-                    <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-1.5">Bot&apos;s Hand (Seat {botPosition + 1})</p>
+                    <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-1.5">Bot&apos;s Hand ({getTablePosition(botPosition, players.length)})</p>
                     <div className="flex gap-1.5">
                         {holeCards.map((c, i) => (
                             <div key={i} className={`card-mini suit-${c.suit} scale-90 origin-left`}>
@@ -231,29 +300,51 @@ export default function PlayPhase({
                     </div>
                     <div className="flex flex-col gap-1.5">
                         {players.map((player, idx) => (
-                            <div
-                                key={idx}
-                                className={`rounded-lg border px-3 py-1.5 ${idx === currentPlayerIdx ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'} ${!player.is_active ? 'opacity-60' : ''}`}
-                            >
-                                <div className="flex items-center justify-between">
-                                    <span className="text-xs font-semibold text-[var(--color-text-primary)]">
-                                        {getPlayerName(player, players.length)}
-                                    </span>
-                                    <span className="text-[10px] text-[var(--color-text-secondary)]">
-                                        {player.is_active ? 'Active' : 'Folded'}
-                                    </span>
-                                </div>
-                                <div className="text-[10px] text-[var(--color-text-secondary)] mt-0.5">
-                                    Stack: <span className="text-[var(--color-text-primary)] font-semibold">{player.stack}</span> | Bet: <span className="text-[var(--color-text-primary)] font-semibold">{player.bet}</span>
-                                </div>
-                            </div>
+                            (() => {
+                                const read = cvReads[String(player.position)];
+                                const wasPotAggressor = potAggressorPositions.has(player.position) || read?.wasAggressorThisPot;
+                                const shouldShowRead = (
+                                    isBotTurn
+                                    && !player.is_bot
+                                    && (player.is_active || wasPotAggressor)
+                                    && read?.lastWindowMaxBluffDelta != null
+                                );
+
+                                return (
+                                    <div
+                                        key={idx}
+                                        className={`rounded-lg border px-3 py-1.5 ${idx === currentPlayerIdx ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'} ${!player.is_active ? 'opacity-60' : ''}`}
+                                    >
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-xs font-semibold text-[var(--color-text-primary)]">
+                                                {getPlayerName(player, players.length, playerNames)}
+                                            </span>
+                                            <span className="text-[10px] text-[var(--color-text-secondary)]">
+                                                {player.is_active ? 'Active' : 'Folded'}
+                                            </span>
+                                        </div>
+                                        <div className="text-[10px] text-[var(--color-text-secondary)] mt-0.5">
+                                            Stack: <span className="text-[var(--color-text-primary)] font-semibold">{player.stack}</span> | Bet: <span className="text-[var(--color-text-primary)] font-semibold">{player.bet}</span>
+                                        </div>
+                                        {shouldShowRead && (
+                                            <div className="mt-1.5 flex flex-wrap gap-1">
+                                                {read?.lastWindowMaxBluffDelta != null && (
+                                                    <span className="rounded-full border border-slate-400/30 bg-slate-200/5 px-2 py-0.5 text-[10px] font-semibold text-slate-200">
+                                                        Act Max {formatSignedDelta(read.lastWindowMaxBluffDelta)}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })()
                         ))}
                     </div>
 
                     {!showdownMode && (
                         <div className="mt-2">
                             <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-1.5">
-                                {currentPlayerIdx === -1 ? 'Betting Round Complete' : (isBotTurn ? 'Bot Turn' : `Acting: ${currentPlayer ? getPlayerName(currentPlayer, players.length) : ''}`)}
+                                {currentPlayerIdx === -1 ? 'Betting Round Complete' : (isBotTurn ? 'Bot Turn' : `Acting: ${currentPlayer ? getPlayerName(currentPlayer, players.length, playerNames) : ''}`)}
                             </p>
 
                             {currentPlayerIdx !== -1 && (isBotTurn ? (
@@ -333,6 +424,21 @@ export default function PlayPhase({
                         {botResponse.amount !== null && botResponse.amount !== undefined && (
                             <p className="text-sm font-semibold text-[var(--color-text-primary)] mt-1">Amount: {botResponse.amount}</p>
                         )}
+                        {recommendationNote && (
+                            <p className={`mt-1 text-xs ${botResponse.cvBluffRiskLevel == null || botResponse.cvBluffRiskLevel === 'low' ? 'text-slate-400' : 'text-slate-200'}`}>
+                                {recommendationNote}
+                            </p>
+                        )}
+                        {botResponse.cvBluffRiskLevel != null && botResponse.cvBluffRiskLevel !== 'low' && botResponse.cvActMax != null && (
+                            <p className="mt-1 text-[11px] font-medium text-[var(--color-text-secondary)]">
+                                Act Max {formatSignedDelta(botResponse.cvActMax)} | Bluff risk {formatRiskLevel(botResponse.cvBluffRiskLevel)}
+                            </p>
+                        )}
+                        {botResponse.originalAction && (
+                            <p className="mt-1 text-[11px] font-medium text-[var(--color-text-secondary)]">
+                                Original agent action: {formatActionSummary(botResponse.originalAction, botResponse.originalAmount)}
+                            </p>
+                        )}
                     </section>
                 )}
 
@@ -342,7 +448,9 @@ export default function PlayPhase({
                         <div className="flex flex-col gap-1.5">
                             {showdownEntries.map((entry, idx) => {
                                 const player = players[entry.playerIndex];
-                                const name = player ? getPlayerName(player, players.length) : `Player ${entry.position + 1}`;
+                                const name = player
+                                    ? getPlayerName(player, players.length, playerNames)
+                                    : `${playerNames[String(entry.position)]?.trim() || `Player ${entry.position + 1}`} (${getTablePosition(entry.position, players.length)})`;
                                 const isCurrent = entry.playerIndex === currentShowdownPlayerIndex;
                                 return (
                                     <div
@@ -385,6 +493,12 @@ export default function PlayPhase({
                                 <p className="text-sm font-bold text-[var(--color-text-primary)]">
                                     {showdownResult.result.toUpperCase()} {showdownResult.amount}
                                 </p>
+                            </div>
+                        )}
+
+                        {showdownError && (
+                            <div className="mt-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200">
+                                {showdownError}
                             </div>
                         )}
 
