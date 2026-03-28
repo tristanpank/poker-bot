@@ -1,13 +1,35 @@
 'use client';
 
 import { useCallback, useState } from 'react';
+import { useEffect } from 'react';
 
 import { useCvWebRtcStream } from '../lib/useCvWebRtcStream';
 
 const BACKEND =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
+const JOIN_PAGE_STATE_KEY = 'poker.join.page.state';
+const SESSION_STATUS_POLL_INTERVAL_MS = 3000;
 
 type JoinState = 'idle' | 'joined' | 'streaming';
+type PersistedJoinPageState = {
+  code: string;
+  playerPosition: number;
+  sessionId: string | null;
+  cvSessionId: string | null;
+  joinState: JoinState;
+};
+
+type WebcamSessionStatus = {
+  sessionActive: boolean;
+  session_id?: string;
+  opponents: Record<
+    string,
+    {
+      connected: boolean;
+      cv_session_id: string;
+    }
+  >;
+};
 
 export default function JoinPage() {
   const [code, setCode] = useState('');
@@ -19,6 +41,8 @@ export default function JoinPage() {
   const [isJoining, setIsJoining] = useState(false);
   const [isStartingWebcam, setIsStartingWebcam] = useState(false);
   const [isStoppingWebcam, setIsStoppingWebcam] = useState(false);
+  const [availableSeats, setAvailableSeats] = useState<boolean[]>([true, true, true, true, true]);
+  const [isLoadingSeatStatus, setIsLoadingSeatStatus] = useState(false);
 
   const {
     videoRef,
@@ -33,11 +57,225 @@ export default function JoinPage() {
   });
 
   const error = joinError ?? streamError;
+  const trimmedCode = code.trim().toUpperCase();
+  const hasCompleteCode = trimmedCode.length === 6;
+  const isSeatTaken = useCallback((position: number) => !availableSeats[position - 1], [availableSeats]);
+  const hasAnyAvailableSeat = availableSeats.some(Boolean);
+
+  const notifyDisconnect = useCallback(
+    (targetSessionId: string, targetPlayerPosition: number, keepalive = false) => {
+      const body = JSON.stringify({
+        session_id: targetSessionId,
+        player_position: targetPlayerPosition,
+      });
+
+      if (keepalive && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        const payload = new Blob([body], { type: 'application/json' });
+        navigator.sendBeacon(`${BACKEND}/session/webcam/disconnect`, payload);
+        return;
+      }
+
+      void fetch(`${BACKEND}/session/webcam/disconnect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive,
+      }).catch(() => undefined);
+    },
+    [],
+  );
+
+  const resetToIdle = useCallback(
+    async (message: string) => {
+      await stopStream();
+      setJoinError(message);
+      setSessionId(null);
+      setCvSessionId(null);
+      setJoinState('idle');
+      if (typeof window !== 'undefined') {
+        window.sessionStorage.removeItem(JOIN_PAGE_STATE_KEY);
+      }
+    },
+    [stopStream],
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      const raw = window.sessionStorage.getItem(JOIN_PAGE_STATE_KEY);
+      if (!raw) {
+        return;
+      }
+
+      const saved = JSON.parse(raw) as PersistedJoinPageState;
+      setCode(saved.code ?? '');
+      setPlayerPosition(saved.playerPosition ?? 1);
+      setSessionId(saved.sessionId ?? null);
+      setCvSessionId(saved.cvSessionId ?? null);
+
+      if (saved.sessionId && saved.cvSessionId && saved.joinState !== 'idle') {
+        notifyDisconnect(saved.sessionId, saved.playerPosition ?? 1);
+        // A browser refresh destroys the active camera/WebRTC objects, so we
+        // restore the page into the joined state and let the user restart the
+        // webcam without re-joining the table position.
+        setJoinState('joined');
+      }
+    } catch {
+      window.sessionStorage.removeItem(JOIN_PAGE_STATE_KEY);
+    }
+  }, [notifyDisconnect]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (!sessionId || !cvSessionId || joinState === 'idle') {
+      window.sessionStorage.removeItem(JOIN_PAGE_STATE_KEY);
+      return;
+    }
+
+    const nextState: PersistedJoinPageState = {
+      code,
+      playerPosition,
+      sessionId,
+      cvSessionId,
+      joinState: isStreaming ? 'streaming' : 'joined',
+    };
+    window.sessionStorage.setItem(JOIN_PAGE_STATE_KEY, JSON.stringify(nextState));
+  }, [code, cvSessionId, isStreaming, joinState, playerPosition, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || joinState === 'idle') {
+      return;
+    }
+
+    const pollStatus = async () => {
+      try {
+        const res = await fetch(`${BACKEND}/session/webcam/status/${sessionId}`);
+        if (!res.ok) {
+          return;
+        }
+
+        const data = (await res.json()) as WebcamSessionStatus;
+        if (!data.sessionActive) {
+          await resetToIdle('The host ended this game. Rejoin with the new table code.');
+        }
+      } catch {
+        // Ignore transient polling failures and keep the current UI state.
+      }
+    };
+
+    void pollStatus();
+    const pollId = window.setInterval(() => {
+      void pollStatus();
+    }, SESSION_STATUS_POLL_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(pollId);
+    };
+  }, [joinState, resetToIdle, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || joinState === 'idle') {
+      return;
+    }
+
+    const handlePageHide = () => {
+      notifyDisconnect(sessionId, playerPosition, true);
+    };
+
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('beforeunload', handlePageHide);
+
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', handlePageHide);
+    };
+  }, [joinState, notifyDisconnect, playerPosition, sessionId]);
+
+  useEffect(() => {
+    if (joinState !== 'idle' || !hasCompleteCode) {
+      setAvailableSeats([true, true, true, true, true]);
+      setIsLoadingSeatStatus(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadSeatStatus = async () => {
+      setIsLoadingSeatStatus(true);
+      try {
+        const res = await fetch(`${BACKEND}/session/webcam/status-by-code/${trimmedCode}`);
+        if (!res.ok) {
+          if (!cancelled) {
+            setAvailableSeats([true, true, true, true, true]);
+          }
+          return;
+        }
+
+        const data = (await res.json()) as WebcamSessionStatus;
+        const nextAvailableSeats = [true, true, true, true, true];
+        for (const [position, opponent] of Object.entries(data.opponents)) {
+          const seatIndex = Number(position) - 1;
+          if (
+            Number.isInteger(seatIndex) &&
+            seatIndex >= 0 &&
+            seatIndex < nextAvailableSeats.length &&
+            opponent.connected
+          ) {
+            nextAvailableSeats[seatIndex] = false;
+          }
+        }
+
+        if (!cancelled) {
+          setAvailableSeats(nextAvailableSeats);
+        }
+      } catch {
+        if (!cancelled) {
+          setAvailableSeats([true, true, true, true, true]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingSeatStatus(false);
+        }
+      }
+    };
+
+    void loadSeatStatus();
+    const pollId = window.setInterval(() => {
+      void loadSeatStatus();
+    }, SESSION_STATUS_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollId);
+    };
+  }, [hasCompleteCode, joinState, trimmedCode]);
+
+  useEffect(() => {
+    if (joinState !== 'idle' || !isSeatTaken(playerPosition)) {
+      return;
+    }
+
+    const nextAvailablePosition = availableSeats.findIndex(Boolean);
+    if (nextAvailablePosition >= 0) {
+      setPlayerPosition(nextAvailablePosition + 1);
+    }
+  }, [availableSeats, isSeatTaken, joinState, playerPosition]);
 
   const handleJoin = useCallback(async () => {
     setJoinError(null);
-    if (!code.trim()) {
+    if (!trimmedCode) {
       setJoinError('Please enter a join code.');
+      return;
+    }
+
+    if (isSeatTaken(playerPosition)) {
+      setJoinError(`Player ${playerPosition} is already taken. Choose an available seat.`);
       return;
     }
 
@@ -46,7 +284,7 @@ export default function JoinPage() {
       const res = await fetch(`${BACKEND}/session/webcam/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: code.trim().toUpperCase(), player_position: playerPosition }),
+        body: JSON.stringify({ code: trimmedCode, player_position: playerPosition }),
       });
 
       if (!res.ok) {
@@ -63,7 +301,7 @@ export default function JoinPage() {
     } finally {
       setIsJoining(false);
     }
-  }, [code, playerPosition]);
+  }, [isSeatTaken, playerPosition, trimmedCode]);
 
   const startWebcam = useCallback(async () => {
     if (!cvSessionId || !sessionId) return;
@@ -94,18 +332,25 @@ export default function JoinPage() {
       await stopStream();
 
       if (sessionId) {
-        await fetch(`${BACKEND}/session/webcam/disconnect`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
-        }).catch(() => undefined);
+        notifyDisconnect(sessionId, playerPosition);
       }
 
       setJoinState('joined');
     } finally {
       setIsStoppingWebcam(false);
     }
-  }, [playerPosition, sessionId, stopStream]);
+  }, [notifyDisconnect, playerPosition, sessionId, stopStream]);
+
+  const leaveSession = useCallback(async () => {
+    await stopWebcam();
+    setJoinError(null);
+    setSessionId(null);
+    setCvSessionId(null);
+    setJoinState('idle');
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.removeItem(JOIN_PAGE_STATE_KEY);
+    }
+  }, [stopWebcam]);
 
   const statusLabel = isJoining
     ? 'Joining...'
@@ -173,7 +418,10 @@ export default function JoinPage() {
                 type="text"
                 maxLength={6}
                 value={code}
-                onChange={(e) => setCode(e.target.value.toUpperCase())}
+                onChange={(e) => {
+                  setCode(e.target.value.toUpperCase());
+                  setJoinError(null);
+                }}
                 disabled={isJoining}
                 placeholder="ABC123"
                 className="w-full rounded-xl border border-slate-600/50 bg-slate-800/80 px-4 py-3 text-center text-2xl font-mono font-bold tracking-[0.3em] text-white placeholder:text-slate-600 focus:border-emerald-500/50 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all"
@@ -185,25 +433,40 @@ export default function JoinPage() {
                 Your Position (relative to bot)
               </label>
               <div className="grid grid-cols-5 gap-2">
-                {[1, 2, 3, 4, 5].map((pos) => (
-                  <button
-                    key={pos}
-                    onClick={() => setPlayerPosition(pos)}
-                    disabled={isJoining}
-                    className={`rounded-xl py-3 text-sm font-semibold transition-all ${playerPosition === pos
-                        ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
-                        : 'bg-slate-800/80 text-slate-300 border border-slate-600/30 hover:bg-slate-700/80 hover:border-slate-500/40'
+                {[1, 2, 3, 4, 5].map((pos) => {
+                  const taken = hasCompleteCode && isSeatTaken(pos);
+                  return (
+                    <button
+                      key={pos}
+                      onClick={() => setPlayerPosition(pos)}
+                      disabled={isJoining || taken}
+                      className={`rounded-xl py-3 text-sm font-semibold transition-all ${
+                        taken
+                          ? 'bg-slate-900/80 text-slate-500 border border-slate-700/40 cursor-not-allowed opacity-60'
+                          : playerPosition === pos
+                            ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
+                            : 'bg-slate-800/80 text-slate-300 border border-slate-600/30 hover:bg-slate-700/80 hover:border-slate-500/40'
                       }`}
-                  >
-                    P{pos}
-                  </button>
-                ))}
+                    >
+                      P{pos}
+                    </button>
+                  );
+                })}
               </div>
+              {hasCompleteCode && (
+                <p className="mt-2 text-xs text-slate-500">
+                  {isLoadingSeatStatus
+                    ? 'Checking available seats...'
+                    : hasAnyAvailableSeat
+                      ? 'Taken seats are greyed out.'
+                      : 'All seats are currently taken.'}
+                </p>
+              )}
             </div>
 
             <button
               onClick={handleJoin}
-              disabled={code.trim().length < 6 || isJoining}
+              disabled={!hasCompleteCode || isJoining || isLoadingSeatStatus || isSeatTaken(playerPosition) || !hasAnyAvailableSeat}
               className="mt-1 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 px-6 py-3.5 text-sm font-semibold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-400 hover:to-emerald-500 hover:shadow-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
             >
               {isJoining ? 'Joining...' : 'Join Session'}
@@ -263,6 +526,16 @@ export default function JoinPage() {
                 </button>
               )}
             </div>
+
+            {!isStreaming && (
+              <button
+                onClick={leaveSession}
+                disabled={isBusy}
+                className="rounded-xl border border-slate-600/40 bg-slate-800/60 px-4 py-3 text-sm font-semibold text-slate-200 transition-all hover:bg-slate-700/70 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Leave Session
+              </button>
+            )}
 
             {error && (
               <p className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300 text-center">

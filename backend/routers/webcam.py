@@ -90,6 +90,18 @@ async def status(session_id: str) -> dict[str, Any]:
     return await get_webcam_status(session_id)
 
 
+@router.get("/status-by-code/{code}")
+async def status_by_code(code: str) -> dict[str, Any]:
+    """Return webcam connection status for the session behind a join code."""
+    session_id = await lookup_webcam_code(code)
+    if session_id is None:
+        raise HTTPException(status_code=404, detail="Invalid or expired code")
+
+    status = await get_webcam_status(session_id)
+    status["session_id"] = session_id
+    return status
+
+
 @router.post("/disconnect", status_code=200)
 async def disconnect(request: DisconnectRequest) -> dict[str, str]:
     """Mark an opponent as disconnected from the webcam session."""

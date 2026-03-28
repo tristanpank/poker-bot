@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Literal
@@ -84,6 +85,7 @@ class CvSessionState:
     pulse_baseline: Optional[float] = None
     prev_stress: Optional[float] = None
     last_analysis_ts: Optional[int] = None
+    last_analysis_monotonic_ms: Optional[float] = None
     roi_center_x: Optional[float] = None
     roi_center_y: Optional[float] = None
     roi_width: Optional[float] = None
@@ -458,12 +460,12 @@ class CvService:
             baseline_strength = 0.0
 
         analysis_fps = 0.0
-        if session.last_analysis_ts is not None:
-            dt = timestamp - session.last_analysis_ts
+        analysis_now_ms = time.perf_counter() * 1000.0
+        if session.last_analysis_monotonic_ms is not None:
+            dt = analysis_now_ms - session.last_analysis_monotonic_ms
             if dt > 0:
                 analysis_fps = 1000.0 / dt
-        if stream_fps > 0:
-            analysis_fps = min(analysis_fps, stream_fps + 0.5)
+        session.last_analysis_monotonic_ms = analysis_now_ms
         session.last_analysis_ts = timestamp
 
         return CvMetrics(

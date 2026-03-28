@@ -348,6 +348,7 @@ export default function PlayPage() {
     const [isResolvingShowdown, setIsResolvingShowdown] = useState(false);
     const [isShowdownMode, setIsShowdownMode] = useState(false);
     const [resultFlash, setResultFlash] = useState<ResultFlash | null>(null);
+    const [isEndingGame, setIsEndingGame] = useState(false);
 
     const legalRequestSeq = useRef(0);
     const nextHandTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -432,6 +433,37 @@ export default function PlayPage() {
             console.error('Session delete failed:', err);
         }
     }, [sessionId]);
+
+    const endCurrentGame = useCallback(async () => {
+        setIsEndingGame(true);
+        try {
+            if (nextHandTimerRef.current) {
+                clearTimeout(nextHandTimerRef.current);
+                nextHandTimerRef.current = null;
+            }
+            autoResolveSingleLeftRef.current = false;
+            setResumeSessionData(null);
+            setSessionStacks([]);
+            setSessionProfit(0);
+            setHistory([]);
+            setHand(EMPTY_HAND);
+            setPickingFor(null);
+            setPendingRank(null);
+            setRaiseInput('');
+            setShowRaiseInput(false);
+            setLegalActions(EMPTY_LEGAL_ACTIONS);
+            setShowdownEntries([]);
+            setShowdownResult(null);
+            setShowdownError(null);
+            setIsResolvingShowdown(false);
+            setIsShowdownMode(false);
+            setResultFlash(null);
+            setPhase('setup-size');
+            await deleteCurrentSession();
+        } finally {
+            setIsEndingGame(false);
+        }
+    }, [deleteCurrentSession]);
 
     // Check for existing session on mount
     useEffect(() => {
@@ -1020,6 +1052,21 @@ export default function PlayPage() {
     }, [currentShowdownEntry, isShowdownMode]);
 
     const showdownCanResolve = showdownEntries.every((entry) => entry.mucked || entry.cards.length === 2);
+    const showEndGameButton = phase !== 'resume-prompt' && phase !== 'setup-size'
+        && (sessionId !== null || getSessionCookie() !== null || sessionStacks.length > 0);
+    const endGameButton = showEndGameButton ? (
+        <div className="fixed right-4 top-4 z-50">
+            <button
+                onClick={() => {
+                    void endCurrentGame();
+                }}
+                disabled={isEndingGame}
+                className="rounded-xl border border-rose-500/40 bg-slate-950/85 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-rose-200 shadow-lg shadow-black/30 backdrop-blur transition-all hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+                {isEndingGame ? 'Ending Game...' : 'End Game'}
+            </button>
+        </div>
+    ) : null;
 
     if (!mounted) return null;
 
@@ -1067,36 +1114,37 @@ export default function PlayPage() {
 
     if (phase === 'setup-details') {
         return (
-            <SetupDetails
-                hasSession={sessionStacks.length > 0}
-                sessionStacks={sessionStacks}
-                sessionProfit={sessionProfit}
-                smallBlind={smallBlind}
-                setSmallBlind={setSmallBlind}
-                bigBlind={bigBlind}
-                setBigBlind={setBigBlind}
-                buyIn={buyIn}
-                setBuyIn={setBuyIn}
-                onBack={() => setPhase('setup-size')}
-                onStart={() => {
-                    if (sessionStacks.length === 0) {
-                        setSessionStacks(Array(tableSize).fill(buyIn));
-                    }
-                    startNewHand();
-                }}
-                onEnd={() => {
-                    setSessionStacks([]);
-                    setSessionProfit(0);
-                    setPhase('setup-size');
-                    void deleteCurrentSession();
-                }}
-            />
+            <>
+                {endGameButton}
+                <SetupDetails
+                    hasSession={sessionStacks.length > 0}
+                    sessionStacks={sessionStacks}
+                    sessionProfit={sessionProfit}
+                    smallBlind={smallBlind}
+                    setSmallBlind={setSmallBlind}
+                    bigBlind={bigBlind}
+                    setBigBlind={setBigBlind}
+                    buyIn={buyIn}
+                    setBuyIn={setBuyIn}
+                    onBack={() => setPhase('setup-size')}
+                    onStart={() => {
+                        if (sessionStacks.length === 0) {
+                            setSessionStacks(Array(tableSize).fill(buyIn));
+                        }
+                        startNewHand();
+                    }}
+                    onEnd={() => {
+                        void endCurrentGame();
+                    }}
+                />
+            </>
         );
     }
 
     if (phase === 'deal-position') {
         return (
             <>
+                {endGameButton}
                 <DealPosition
                     tableSize={tableSize}
                     onSelectSeat={(i) => {
@@ -1153,6 +1201,7 @@ export default function PlayPage() {
     if (phase === 'deal-hole') {
         return (
             <>
+                {endGameButton}
                 <DealHoleCards
                     botPosition={hand.botPosition}
                     holeCards={hand.holeCards}
@@ -1180,6 +1229,7 @@ export default function PlayPage() {
         );
         return (
             <>
+                {endGameButton}
                 <PlayPhase
                     pot={hand.pot}
                     currentBet={hand.currentBet}

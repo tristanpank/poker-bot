@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import {
+  BackendStreamStatus,
   BluffPoint,
   BluffLevel,
   EmotionState,
@@ -44,8 +45,30 @@ function toneForBluff(level: BluffLevel): MetricTone {
   return "good";
 }
 
+function resolutionLabel(width: number, height: number): string {
+  if (width <= 0 || height <= 0) {
+    return "--";
+  }
+
+  return `${width}x${height}`;
+}
+
+function scaleLabel(session: BackendStreamStatus): string {
+  const deliveredPixels = session.frameWidth * session.frameHeight;
+  const capturedPixels = session.captureWidth * session.captureHeight;
+  if (deliveredPixels <= 0 || capturedPixels <= 0) {
+    return "--";
+  }
+
+  const ratio = deliveredPixels / capturedPixels;
+  return `${Math.round(ratio * 100)}%`;
+}
+
 export default function TestPage() {
-  const sessionIdRef = useRef(createCvStreamSessionId());
+  const [currentSessionId, setCurrentSessionId] = useState(() =>
+    createCvStreamSessionId(),
+  );
+  const sessionIdRef = useRef(currentSessionId);
   const {
     videoRef: localVideoRef,
     isStreaming,
@@ -53,6 +76,8 @@ export default function TestPage() {
     metrics,
     bluffHistory,
     captureInfo,
+    backendStatus,
+    currentBackendStream,
     startStream,
     stopStream,
   } = useCvWebRtcStream({
@@ -67,6 +92,7 @@ export default function TestPage() {
   const stop = useCallback(async () => {
     await stopStream();
     sessionIdRef.current = createCvStreamSessionId();
+    setCurrentSessionId(sessionIdRef.current);
   }, [stopStream]);
 
   return (
@@ -85,6 +111,13 @@ export default function TestPage() {
           </p>
           <p className="max-w-3xl text-xs text-slate-400">
             Capture negotiated (shared client): {captureInfo}
+          </p>
+          <p className="max-w-3xl text-xs text-slate-400">
+            Backend sees {backendStatus.activeStreamCount} active stream
+            {backendStatus.activeStreamCount === 1 ? "" : "s"} right now.
+            {currentBackendStream
+              ? ` This test page is receiving ${currentBackendStream.analysisFps.toFixed(1)} analysis FPS from the backend while the backend is processing ${currentBackendStream.streamFps.toFixed(1)} stream FPS for this session. Capture is ${resolutionLabel(currentBackendStream.captureWidth, currentBackendStream.captureHeight)} and backend-delivered frames are ${resolutionLabel(currentBackendStream.frameWidth, currentBackendStream.frameHeight)}.`
+              : " This page will appear in the backend stream table once its WebRTC session is connected."}
           </p>
 
           <div className="flex flex-wrap items-center gap-3 pt-2">
@@ -146,6 +179,88 @@ export default function TestPage() {
               The same streaming client powers both the test page and the real
               join page.
             </div>
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
+                Backend stream load
+              </h2>
+              <p className="mt-1 text-xs text-slate-400">
+                This shows every active WebRTC CV stream the backend is handling,
+                so you can compare this page against the rest of the system load.
+              </p>
+            </div>
+            <div className="rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
+              Active streams: {backendStatus.activeStreamCount}
+            </div>
+          </div>
+
+          <div className="mt-4 overflow-x-auto">
+            <table className="min-w-full text-left text-xs text-slate-300">
+              <thead className="text-slate-500">
+                <tr className="border-b border-slate-800">
+                  <th className="px-3 py-2 font-medium">Session</th>
+                  <th className="px-3 py-2 font-medium">State</th>
+                  <th className="px-3 py-2 font-medium">Analysis FPS</th>
+                  <th className="px-3 py-2 font-medium">Stream FPS</th>
+                  <th className="px-3 py-2 font-medium">Inferred FPS</th>
+                  <th className="px-3 py-2 font-medium">Frames</th>
+                  <th className="px-3 py-2 font-medium">Delivered</th>
+                  <th className="px-3 py-2 font-medium">Capture</th>
+                  <th className="px-3 py-2 font-medium">Scale</th>
+                  <th className="px-3 py-2 font-medium">Signal</th>
+                </tr>
+              </thead>
+              <tbody>
+                {backendStatus.sessions.length === 0 ? (
+                  <tr>
+                    <td
+                      className="px-3 py-4 text-slate-500"
+                      colSpan={10}
+                    >
+                      No active backend CV streams.
+                    </td>
+                  </tr>
+                ) : (
+                  backendStatus.sessions.map((session) => {
+                    const isCurrent = session.sessionId === currentSessionId;
+                    return (
+                      <tr
+                        key={session.sessionId}
+                        className={`border-b border-slate-900/80 ${
+                          isCurrent ? "bg-emerald-500/10" : ""
+                        }`}
+                      >
+                        <td className="px-3 py-2 font-mono text-[11px] text-slate-200">
+                          {isCurrent ? "This page" : session.sessionId.slice(0, 8)}
+                        </td>
+                        <td className="px-3 py-2">{session.connectionState}</td>
+                        <td className="px-3 py-2">{session.analysisFps.toFixed(1)}</td>
+                        <td className="px-3 py-2">{session.streamFps.toFixed(1)}</td>
+                        <td className="px-3 py-2">
+                          {session.inferredStreamFps.toFixed(1)}
+                        </td>
+                        <td className="px-3 py-2">{session.framesReceived}</td>
+                        <td className="px-3 py-2">
+                          {resolutionLabel(session.frameWidth, session.frameHeight)}
+                        </td>
+                        <td className="px-3 py-2">
+                          {resolutionLabel(
+                            session.captureWidth,
+                            session.captureHeight,
+                          )}
+                        </td>
+                        <td className="px-3 py-2">{scaleLabel(session)}</td>
+                        <td className="px-3 py-2">{session.signalQuality}</td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
           </div>
         </section>
 

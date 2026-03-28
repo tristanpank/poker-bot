@@ -33,6 +33,28 @@ export type BluffPoint = {
   value: number;
 };
 
+export type BackendStreamStatus = {
+  sessionId: string;
+  connectionState: string;
+  framesReceived: number;
+  metadataMessages: number;
+  analysisFps: number;
+  streamFps: number;
+  inferredStreamFps: number;
+  signalQuality: SignalQuality;
+  bluffRisk: number;
+  frameWidth: number;
+  frameHeight: number;
+  latestFrameId: number | null;
+  captureWidth: number;
+  captureHeight: number;
+};
+
+export type BackendWebRtcStatus = {
+  activeStreamCount: number;
+  sessions: BackendStreamStatus[];
+};
+
 type CaptureResult = {
   fps: number;
   width: number;
@@ -59,14 +81,32 @@ type StreamPhase =
 
 const ANALYSIS_FRAME_MS = 16;
 const BLUFF_WINDOW_MS = 30_000;
-const SEND_MAX_BITRATE = 12_000_000;
+const SEND_MAX_BITRATE = 20_000_000;
 const SEND_MAX_FPS = 30;
+const WEBRTC_STATUS_POLL_MS = 1500;
 const CAPTURE_FPS_TARGETS = [30, 24];
 const HIGH_FPS_CAPTURE_PROFILES = [
+  { width: 1920, height: 1080 },
+  { width: 1600, height: 900 },
   { width: 1280, height: 720 },
   { width: 960, height: 540 },
   { width: 640, height: 360 },
 ];
+const MAX_CAPTURE_WIDTH = 1920;
+const MAX_CAPTURE_HEIGHT = 1080;
+
+function readCapabilityMax(
+  capability: number | MediaSettingsRange | undefined,
+  fallback: number,
+): number {
+  if (typeof capability === 'number') {
+    return capability;
+  }
+  if (capability && typeof capability.max === 'number') {
+    return capability.max;
+  }
+  return fallback;
+}
 
 export const INITIAL_VISION_METRICS: VisionMetrics = {
   brightness: 0,
@@ -88,6 +128,11 @@ export const INITIAL_VISION_METRICS: VisionMetrics = {
   analysisFps: 0,
   streamFps: 0,
   updatedAt: '--',
+};
+
+const INITIAL_BACKEND_WEBRTC_STATUS: BackendWebRtcStatus = {
+  activeStreamCount: 0,
+  sessions: [],
 };
 
 export function createCvStreamSessionId(): string {
@@ -176,6 +221,7 @@ async function tuneVideoSender(sender: RTCRtpSender): Promise<void> {
 
     await sender.setParameters({
       ...params,
+      degradationPreference: 'maintain-resolution',
       encodings: tunedEncodings,
     });
   } catch {
@@ -191,13 +237,15 @@ function shouldPreferCapture(
   candidate: CaptureResult,
   current: CaptureResult,
 ): boolean {
-  if (candidate.fps > current.fps + 0.5) {
+  const candidateArea = captureArea(candidate);
+  const currentArea = captureArea(current);
+  if (candidateArea > currentArea) {
     return true;
   }
-  if (candidate.fps + 0.5 < current.fps) {
+  if (candidateArea < currentArea) {
     return false;
   }
-  return captureArea(candidate) > captureArea(current);
+  return candidate.fps > current.fps + 0.5;
 }
 
 function readCaptureResult(track: MediaStreamTrack): CaptureResult {
@@ -211,18 +259,41 @@ function readCaptureResult(track: MediaStreamTrack): CaptureResult {
 
 async function tuneCaptureTrack(track: MediaStreamTrack): Promise<CaptureResult> {
   let best = readCaptureResult(track);
+  const capabilities = track.getCapabilities();
+  const maxCapabilityWidth = Math.min(
+    readCapabilityMax(capabilities.width, MAX_CAPTURE_WIDTH),
+    MAX_CAPTURE_WIDTH,
+  );
+  const maxCapabilityHeight = Math.min(
+    readCapabilityMax(capabilities.height, MAX_CAPTURE_HEIGHT),
+    MAX_CAPTURE_HEIGHT,
+  );
+  const maxCapabilityFps = Math.min(
+    readCapabilityMax(capabilities.frameRate, SEND_MAX_FPS),
+    SEND_MAX_FPS,
+  );
 
-  if (best.fps >= 24 && best.width >= 640 && best.height >= 360) {
-    return best;
+  try {
+    await track.applyConstraints({
+      width: { ideal: maxCapabilityWidth, max: maxCapabilityWidth },
+      height: { ideal: maxCapabilityHeight, max: maxCapabilityHeight },
+      frameRate: { ideal: maxCapabilityFps, max: maxCapabilityFps },
+    });
+    best = readCaptureResult(track);
+  } catch {
+    // Fall through to profile-based tuning when exact max-capability tuning fails.
   }
 
   for (const fpsTarget of CAPTURE_FPS_TARGETS) {
     for (const profile of HIGH_FPS_CAPTURE_PROFILES) {
+      const targetWidth = Math.min(profile.width, maxCapabilityWidth);
+      const targetHeight = Math.min(profile.height, maxCapabilityHeight);
+      const targetFps = Math.min(fpsTarget, maxCapabilityFps);
       try {
         await track.applyConstraints({
-          width: { ideal: profile.width, max: profile.width },
-          height: { ideal: profile.height, max: profile.height },
-          frameRate: { ideal: fpsTarget, max: fpsTarget },
+          width: { ideal: targetWidth, max: targetWidth },
+          height: { ideal: targetHeight, max: targetHeight },
+          frameRate: { ideal: targetFps, max: targetFps },
         });
       } catch {
         continue;
@@ -231,7 +302,11 @@ async function tuneCaptureTrack(track: MediaStreamTrack): Promise<CaptureResult>
       const candidate = readCaptureResult(track);
       if (shouldPreferCapture(candidate, best)) {
         best = candidate;
-        if (best.fps >= 24 && best.width >= 640 && best.height >= 360) {
+        if (
+          best.width >= maxCapabilityWidth
+          && best.height >= maxCapabilityHeight
+          && best.fps >= maxCapabilityFps - 0.5
+        ) {
           return best;
         }
       }
@@ -244,8 +319,8 @@ async function tuneCaptureTrack(track: MediaStreamTrack): Promise<CaptureResult>
         width: { ideal: best.width, max: best.width },
         height: { ideal: best.height, max: best.height },
         frameRate: {
-          ideal: Math.max(24, Math.round(best.fps || 30)),
-          max: Math.max(24, Math.round(best.fps || 30)),
+          ideal: Math.min(Math.max(24, Math.round(best.fps || SEND_MAX_FPS)), maxCapabilityFps),
+          max: Math.min(Math.max(24, Math.round(best.fps || SEND_MAX_FPS)), maxCapabilityFps),
         },
       });
       best = readCaptureResult(track);
@@ -277,6 +352,10 @@ export function useCvWebRtcStream({
   const [bluffHistory, setBluffHistory] = useState<BluffPoint[]>([]);
   const [captureInfo, setCaptureInfo] = useState('--');
   const [phase, setPhase] = useState<StreamPhase>('idle');
+  const [backendStatus, setBackendStatus] = useState<BackendWebRtcStatus>(
+    INITIAL_BACKEND_WEBRTC_STATUS,
+  );
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
   const teardown = useCallback(async (resetMetrics: boolean) => {
     activeRef.current = false;
@@ -307,6 +386,7 @@ export function useCvWebRtcStream({
 
     const endedSessionId = activeSessionIdRef.current;
     activeSessionIdRef.current = null;
+    setCurrentSessionId(null);
     frameIdRef.current = 0;
     setIsStreaming(false);
     setPhase('idle');
@@ -336,6 +416,36 @@ export function useCvWebRtcStream({
     };
   }, [teardown]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const pollStatus = async () => {
+      try {
+        const res = await fetch(`${backendBaseUrl}/cv/webrtc/status`);
+        if (!res.ok) {
+          return;
+        }
+
+        const data = (await res.json()) as BackendWebRtcStatus;
+        if (!cancelled) {
+          setBackendStatus(data);
+        }
+      } catch {
+        // Ignore transient polling failures.
+      }
+    };
+
+    void pollStatus();
+    const pollId = window.setInterval(() => {
+      void pollStatus();
+    }, WEBRTC_STATUS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollId);
+    };
+  }, [backendBaseUrl]);
+
   const startStream = useCallback(async ({ sessionId }: StartStreamArgs) => {
     if (isStreaming) {
       return true;
@@ -352,8 +462,8 @@ export function useCvWebRtcStream({
       setPhase('requesting_camera');
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 1280, min: 640, max: 1920 },
-          height: { ideal: 720, min: 360, max: 1080 },
+          width: { ideal: MAX_CAPTURE_WIDTH, min: 640, max: MAX_CAPTURE_WIDTH },
+          height: { ideal: MAX_CAPTURE_HEIGHT, min: 360, max: MAX_CAPTURE_HEIGHT },
           frameRate: { ideal: SEND_MAX_FPS, max: SEND_MAX_FPS },
           facingMode: { ideal: 'user' },
         },
@@ -507,6 +617,7 @@ export function useCvWebRtcStream({
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
 
       activeSessionIdRef.current = sessionId;
+      setCurrentSessionId(sessionId);
       activeRef.current = true;
       setPhase('connecting');
       setIsStreaming(true);
@@ -520,6 +631,13 @@ export function useCvWebRtcStream({
     }
   }, [backendBaseUrl, isStreaming, teardown]);
 
+  const currentBackendStream =
+    currentSessionId === null
+      ? null
+      : backendStatus.sessions.find(
+          (session) => session.sessionId === currentSessionId,
+        ) ?? null;
+
   return {
     videoRef,
     isStreaming,
@@ -528,6 +646,8 @@ export function useCvWebRtcStream({
     bluffHistory,
     captureInfo,
     phase,
+    backendStatus,
+    currentBackendStream,
     startStream,
     stopStream,
   };

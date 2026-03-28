@@ -107,6 +107,7 @@ async def load_session(session_id: str) -> Optional[dict[str, Any]]:
 async def delete_session(session_id: str) -> None:
     """Delete a session from Redis."""
     client = await get_redis()
+    await delete_webcam_session(session_id, client=client)
     await client.delete(_session_key(session_id))
 
 
@@ -140,6 +141,11 @@ def _webcam_metrics_key(cv_session_id: str) -> str:
     return f"poker:webcam:metrics:{cv_session_id}"
 
 
+def _default_webcam_session_data() -> dict[str, Any]:
+    """Return the default Redis payload for a webcam session."""
+    return {"code": None, "opponents": {}}
+
+
 async def save_webcam_metrics(cv_session_id: str, metrics_json: str) -> None:
     """Save the latest CV analysis metrics for a webcam session (short TTL)."""
     try:
@@ -167,6 +173,23 @@ async def generate_webcam_code(session_id: str) -> str:
     opponents to discover the session they should connect to.
     """
     client = await get_redis()
+    settings = get_settings()
+    wkey = _webcam_session_key(session_id)
+    raw = await client.get(wkey)
+    if raw is None:
+        data = _default_webcam_session_data()
+    else:
+        data = json.loads(raw)
+        data.setdefault("code", None)
+        data.setdefault("opponents", {})
+
+    existing_code = data.get("code")
+    if isinstance(existing_code, str) and existing_code:
+        payload = json.dumps({"session_id": session_id})
+        await client.set(_webcam_code_key(existing_code), payload, ex=_CODE_TTL_SECONDS)
+        await client.set(wkey, json.dumps(data), ex=settings.session_ttl_seconds)
+        return existing_code
+
     code = _generate_code()
 
     # Retry if the code already exists (extremely unlikely with 36^6 space)
@@ -177,12 +200,8 @@ async def generate_webcam_code(session_id: str) -> str:
 
     payload = json.dumps({"session_id": session_id})
     await client.set(_webcam_code_key(code), payload, ex=_CODE_TTL_SECONDS)
-
-    # Ensure the webcam session key exists (idempotent)
-    settings = get_settings()
-    wkey = _webcam_session_key(session_id)
-    if not await client.exists(wkey):
-        await client.set(wkey, json.dumps({"opponents": {}}), ex=settings.session_ttl_seconds)
+    data["code"] = code
+    await client.set(wkey, json.dumps(data), ex=settings.session_ttl_seconds)
 
     return code
 
@@ -287,16 +306,41 @@ async def get_webcam_status(session_id: str) -> dict[str, Any]:
     wkey = _webcam_session_key(session_id)
     raw = await client.get(wkey)
     if raw is None:
-        return {"opponents": {}}
-    
+        return {"sessionActive": False, "opponents": {}}
+
     data = json.loads(raw)
-    
+    opponents = data.get("opponents", {})
+    result = {"sessionActive": True, "opponents": opponents}
+
     # Fetch metrics for all connected opponents
-    for pos_str, opp in data.get("opponents", {}).items():
+    for pos_str, opp in opponents.items():
         if opp.get("connected") and "cv_session_id" in opp:
             mkey = _webcam_metrics_key(opp["cv_session_id"])
             mraw = await client.get(mkey)
             if mraw is not None:
                 opp["metrics"] = json.loads(mraw)
-                
-    return data
+
+    return result
+
+
+async def delete_webcam_session(
+    session_id: str, *, client: Optional[aioredis.Redis] = None
+) -> None:
+    """Delete the webcam join code, session state, and cached metrics."""
+    redis_client = client or await get_redis()
+    wkey = _webcam_session_key(session_id)
+    raw = await redis_client.get(wkey)
+    if raw is None:
+        return
+
+    data = json.loads(raw)
+    code = data.get("code")
+    if isinstance(code, str) and code:
+        await redis_client.delete(_webcam_code_key(code))
+
+    for opponent in data.get("opponents", {}).values():
+        cv_session_id = opponent.get("cv_session_id")
+        if isinstance(cv_session_id, str) and cv_session_id:
+            await redis_client.delete(_webcam_metrics_key(cv_session_id))
+
+    await redis_client.delete(wkey)
