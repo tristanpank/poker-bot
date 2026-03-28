@@ -7,15 +7,24 @@ webcam session management for opponent bluff-data connections.
 """
 
 import json
+import logging
 import secrets
 import string
+import time
 from typing import Any, Optional
 
 import redis.asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from backend.config import get_settings
 
 _redis_client: Optional[aioredis.Redis] = None
+_last_metrics_redis_error_log_at: float = 0.0
+_METRICS_REDIS_ERROR_LOG_INTERVAL_SEC = 15.0
+
+
+logger = logging.getLogger(__name__)
 
 
 async def get_redis() -> aioredis.Redis:
@@ -36,6 +45,27 @@ async def close_redis() -> None:
     if _redis_client is not None:
         await _redis_client.aclose()
         _redis_client = None
+
+
+async def _reset_redis_client() -> None:
+    """Drop the cached Redis client so the next request reconnects cleanly."""
+    global _redis_client
+    client = _redis_client
+    _redis_client = None
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+def _should_log_metrics_redis_error() -> bool:
+    global _last_metrics_redis_error_log_at
+    now = time.monotonic()
+    if now - _last_metrics_redis_error_log_at < _METRICS_REDIS_ERROR_LOG_INTERVAL_SEC:
+        return False
+    _last_metrics_redis_error_log_at = now
+    return True
 
 
 def _session_key(session_id: str) -> str:
@@ -112,8 +142,16 @@ def _webcam_metrics_key(cv_session_id: str) -> str:
 
 async def save_webcam_metrics(cv_session_id: str, metrics_json: str) -> None:
     """Save the latest CV analysis metrics for a webcam session (short TTL)."""
-    client = await get_redis()
-    await client.set(_webcam_metrics_key(cv_session_id), metrics_json, ex=10)
+    try:
+        client = await get_redis()
+        await client.set(_webcam_metrics_key(cv_session_id), metrics_json, ex=10)
+    except (RedisConnectionError, RedisTimeoutError):
+        await _reset_redis_client()
+        if _should_log_metrics_redis_error():
+            logger.warning(
+                "Redis unavailable while saving webcam metrics; metrics caching will retry automatically",
+                exc_info=True,
+            )
 
 
 def _generate_code() -> str:

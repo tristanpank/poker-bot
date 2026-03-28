@@ -1,6 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useState } from 'react';
+
+import { useCvWebRtcStream } from '../lib/useCvWebRtcStream';
 
 const BACKEND =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
@@ -11,36 +13,36 @@ export default function JoinPage() {
   const [code, setCode] = useState('');
   const [playerPosition, setPlayerPosition] = useState(1);
   const [joinState, setJoinState] = useState<JoinState>('idle');
-  const [error, setError] = useState<string | null>(null);
+  const [joinError, setJoinError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [cvSessionId, setCvSessionId] = useState<string | null>(null);
+  const [isJoining, setIsJoining] = useState(false);
+  const [isStartingWebcam, setIsStartingWebcam] = useState(false);
+  const [isStoppingWebcam, setIsStoppingWebcam] = useState(false);
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const dcRef = useRef<RTCDataChannel | null>(null);
-  const metaIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const activeRef = useRef(false);
+  const {
+    videoRef,
+    isStreaming,
+    error: streamError,
+    captureInfo,
+    phase,
+    startStream,
+    stopStream,
+  } = useCvWebRtcStream({
+    backendBaseUrl: BACKEND,
+  });
 
-  // Clean up on unmount
-  useEffect(() => {
-    return () => {
-      activeRef.current = false;
-      if (metaIntervalRef.current) clearInterval(metaIntervalRef.current);
-      if (dcRef.current) dcRef.current.close();
-      if (pcRef.current) pcRef.current.close();
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-    };
-  }, []);
+  const error = joinError ?? streamError;
 
   const handleJoin = useCallback(async () => {
-    setError(null);
+    setJoinError(null);
     if (!code.trim()) {
-      setError('Please enter a join code.');
+      setJoinError('Please enter a join code.');
       return;
     }
 
     try {
+      setIsJoining(true);
       const res = await fetch(`${BACKEND}/session/webcam/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -57,128 +59,92 @@ export default function JoinPage() {
       setCvSessionId(data.cv_session_id);
       setJoinState('joined');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to join session.');
+      setJoinError(err instanceof Error ? err.message : 'Failed to join session.');
+    } finally {
+      setIsJoining(false);
     }
   }, [code, playerPosition]);
 
   const startWebcam = useCallback(async () => {
     if (!cvSessionId || !sessionId) return;
-    setError(null);
-
-    if (joinState === 'joined') {
-      await fetch(`${BACKEND}/session/webcam/reconnect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
-      }).catch(() => undefined);
-    }
+    setJoinError(null);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 360 },
-          frameRate: { ideal: 15 },
-          facingMode: 'user',
-        },
-        audio: false,
-      });
-
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        void videoRef.current.play().catch(() => undefined);
+      setIsStartingWebcam(true);
+      if (joinState === 'joined') {
+        void fetch(`${BACKEND}/session/webcam/reconnect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
+        }).catch(() => undefined);
       }
 
-      activeRef.current = true;
-      setJoinState('streaming');
-
-      // Setup WebRTC
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-      });
-      pcRef.current = pc;
-
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-      const dc = pc.createDataChannel('metadata');
-      dcRef.current = dc;
-
-      dc.onopen = () => {
-        let frameId = 0;
-        metaIntervalRef.current = setInterval(() => {
-          if (dc.readyState === 'open' && activeRef.current) {
-            dc.send(JSON.stringify({
-              sessionId: cvSessionId,
-              frameId: frameId++,
-              captureTs: Date.now(),
-              streamFps: 15
-            }));
-          }
-        }, 100);
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      const res = await fetch(`${BACKEND}/cv/webrtc/offer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sdp: offer.sdp,
-          type: offer.type,
-          session_id: cvSessionId
-        })
-      });
-
-      if (!res.ok) {
-        throw new Error('Failed to negotiate WebRTC connection');
+      const started = await startStream({ sessionId: cvSessionId });
+      if (started) {
+        setJoinState('streaming');
       }
-
-      const answer = await res.json();
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (err) {
-      setError(
-        err instanceof Error ? `Camera error: ${err.message}` : 'Unable to access camera.'
-      );
+    } finally {
+      setIsStartingWebcam(false);
     }
-  }, [cvSessionId, sessionId]);
+  }, [cvSessionId, joinState, playerPosition, sessionId, startStream]);
 
   const stopWebcam = useCallback(async () => {
-    activeRef.current = false;
-    if (metaIntervalRef.current) {
-      clearInterval(metaIntervalRef.current);
-      metaIntervalRef.current = null;
-    }
-    if (dcRef.current) {
-      dcRef.current.close();
-      dcRef.current = null;
-    }
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
+    try {
+      setIsStoppingWebcam(true);
+      await stopStream();
 
-    // Notify backend of disconnect
-    if (sessionId) {
-      await fetch(`${BACKEND}/session/webcam/disconnect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
-      }).catch(() => undefined);
-    }
+      if (sessionId) {
+        await fetch(`${BACKEND}/session/webcam/disconnect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, player_position: playerPosition }),
+        }).catch(() => undefined);
+      }
 
-    setJoinState('joined');
-  }, [sessionId, playerPosition]);
+      setJoinState('joined');
+    } finally {
+      setIsStoppingWebcam(false);
+    }
+  }, [playerPosition, sessionId, stopStream]);
+
+  const statusLabel = isJoining
+    ? 'Joining...'
+    : isStartingWebcam
+      ? phase === 'requesting_camera'
+        ? 'Requesting camera...'
+        : phase === 'tuning_camera'
+          ? 'Tuning camera...'
+          : phase === 'negotiating_webrtc'
+            ? 'Preparing WebRTC...'
+            : phase === 'waiting_for_backend'
+              ? 'Contacting backend...'
+              : phase === 'connecting'
+                ? 'Connecting stream...'
+                : 'Starting webcam...'
+      : isStoppingWebcam
+        ? 'Stopping webcam...'
+        : isStreaming
+          ? phase === 'live'
+            ? 'Live'
+            : 'Connecting stream...'
+          : 'Ready';
+
+  const statusClass = isJoining || isStartingWebcam || isStoppingWebcam
+    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+    : isStreaming && phase !== 'live'
+      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+      : isStreaming
+      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+      : 'bg-slate-700/50 text-slate-400 border border-slate-600/30';
+
+  const isBusy = isJoining || isStartingWebcam || isStoppingWebcam;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 px-4 py-10 text-slate-100 flex items-start justify-center"
-      style={{ fontFamily: "'Outfit', sans-serif" }}>
+    <div
+      className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 px-4 py-10 text-slate-100 flex items-start justify-center"
+      style={{ fontFamily: "'Outfit', sans-serif" }}
+    >
       <main className="w-full max-w-lg flex flex-col gap-6">
-        {/* Header */}
         <section className="text-center">
           <div className="inline-flex items-center gap-2 mb-3">
             <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
@@ -192,9 +158,11 @@ export default function JoinPage() {
           <p className="mt-2 text-sm text-slate-400 max-w-md mx-auto">
             Enter the code shared by the bot operator to connect your webcam for bluff analysis.
           </p>
+          <p className="mt-2 text-xs text-slate-500 max-w-md mx-auto">
+            Capture negotiated: {captureInfo}
+          </p>
         </section>
 
-        {/* Join form */}
         {joinState === 'idle' && (
           <section className="rounded-2xl border border-slate-700/50 bg-slate-900/80 backdrop-blur-sm p-6 shadow-2xl shadow-black/20 flex flex-col gap-5">
             <div>
@@ -206,6 +174,7 @@ export default function JoinPage() {
                 maxLength={6}
                 value={code}
                 onChange={(e) => setCode(e.target.value.toUpperCase())}
+                disabled={isJoining}
                 placeholder="ABC123"
                 className="w-full rounded-xl border border-slate-600/50 bg-slate-800/80 px-4 py-3 text-center text-2xl font-mono font-bold tracking-[0.3em] text-white placeholder:text-slate-600 focus:border-emerald-500/50 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all"
               />
@@ -220,6 +189,7 @@ export default function JoinPage() {
                   <button
                     key={pos}
                     onClick={() => setPlayerPosition(pos)}
+                    disabled={isJoining}
                     className={`rounded-xl py-3 text-sm font-semibold transition-all ${playerPosition === pos
                         ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
                         : 'bg-slate-800/80 text-slate-300 border border-slate-600/30 hover:bg-slate-700/80 hover:border-slate-500/40'
@@ -233,10 +203,10 @@ export default function JoinPage() {
 
             <button
               onClick={handleJoin}
-              disabled={code.trim().length < 6}
+              disabled={code.trim().length < 6 || isJoining}
               className="mt-1 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 px-6 py-3.5 text-sm font-semibold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-400 hover:to-emerald-500 hover:shadow-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
             >
-              Join Session
+              {isJoining ? 'Joining...' : 'Join Session'}
             </button>
 
             {error && (
@@ -247,7 +217,6 @@ export default function JoinPage() {
           </section>
         )}
 
-        {/* Camera preview / streaming state */}
         {joinState !== 'idle' && (
           <section className="rounded-2xl border border-slate-700/50 bg-slate-900/80 backdrop-blur-sm p-6 shadow-2xl shadow-black/20 flex flex-col gap-5">
             <div className="flex items-center justify-between">
@@ -255,15 +224,12 @@ export default function JoinPage() {
                 <p className="text-xs text-slate-400 font-medium">
                   Connected as <span className="text-emerald-400 font-semibold">Player {playerPosition}</span>
                 </p>
-                <p className="text-xs text-slate-500 mt-0.5">Session: {sessionId?.slice(0, 8)}…</p>
+                <p className="text-xs text-slate-500 mt-0.5">Session: {sessionId?.slice(0, 8)}...</p>
               </div>
               <span
-                className={`rounded-full px-3 py-1 text-xs font-semibold ${joinState === 'streaming'
-                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                    : 'bg-slate-700/50 text-slate-400 border border-slate-600/30'
-                  }`}
+                className={`rounded-full px-3 py-1 text-xs font-semibold ${statusClass}`}
               >
-                {joinState === 'streaming' ? '● Live' : 'Ready'}
+                {statusLabel}
               </span>
             </div>
 
@@ -278,20 +244,22 @@ export default function JoinPage() {
             </div>
 
             <div className="flex gap-3">
-              {joinState === 'joined' && (
+              {!isStreaming && (
                 <button
                   onClick={startWebcam}
+                  disabled={isBusy}
                   className="flex-1 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all hover:from-emerald-400 hover:to-emerald-500"
                 >
-                  Start Webcam
+                  {isStartingWebcam ? 'Starting Webcam...' : 'Start Webcam'}
                 </button>
               )}
-              {joinState === 'streaming' && (
+              {isStreaming && (
                 <button
                   onClick={stopWebcam}
+                  disabled={isBusy}
                   className="flex-1 rounded-xl bg-gradient-to-r from-rose-500 to-rose-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-rose-500/20 transition-all hover:from-rose-400 hover:to-rose-500"
                 >
-                  Stop Webcam
+                  {isStoppingWebcam ? 'Stopping Webcam...' : 'Stop Webcam'}
                 </button>
               )}
             </div>

@@ -8,6 +8,7 @@ state for temporal signals such as POS pulse estimation.
 from __future__ import annotations
 
 import base64
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,6 +29,11 @@ ROI_SEARCH_RADIUS_X = 8
 ROI_SEARCH_RADIUS_Y = 6
 ROI_SEARCH_STEP = 2
 ActivityZone = Literal["none", "left", "center", "right"]
+SESSION_LOG_INTERVAL_MS = 15_000
+SESSION_LOG_FRAME_INTERVAL = 300
+
+
+logger = logging.getLogger(__name__)
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -85,6 +91,8 @@ class CvSessionState:
     roi_stability: float = 0.0
     baseline_buckets: list[BaselineBucket] = field(default_factory=list)
     last_seen_at: int = 0
+    frames_analyzed: int = 0
+    last_log_at: int = 0
 
 
 class CvService:
@@ -98,7 +106,13 @@ class CvService:
     def clear_session(self, session_id: str) -> None:
         """Delete a session's analysis state."""
         with self._lock:
-            self._sessions.pop(session_id, None)
+            removed = self._sessions.pop(session_id, None)
+        if removed is not None:
+            logger.info(
+                "Cleared CV session %s after %d analyzed frames",
+                session_id,
+                removed.frames_analyzed,
+            )
 
     def analyze(self, request: CvAnalyzeRequest) -> CvMetrics:
         """
@@ -141,6 +155,12 @@ class CvService:
             if session is None:
                 session = CvSessionState(last_seen_at=timestamp)
                 self._sessions[session_id] = session
+                logger.info(
+                    "Created CV session %s for %dx%d stream",
+                    session_id,
+                    width,
+                    height,
+                )
 
             session.last_seen_at = timestamp
             metrics = self._compute_metrics(
@@ -150,6 +170,15 @@ class CvService:
                 timestamp=timestamp,
                 stream_fps=stream_fps,
                 session=session,
+            )
+            session.frames_analyzed += 1
+            self._maybe_log_session_metrics(
+                session_id=session_id,
+                width=width,
+                height=height,
+                session=session,
+                metrics=metrics,
+                timestamp=timestamp,
             )
 
         return metrics
@@ -161,7 +190,53 @@ class CvService:
             if now_ms - state.last_seen_at > SESSION_TTL_MS
         ]
         for session_id in stale_ids:
-            self._sessions.pop(session_id, None)
+            stale = self._sessions.pop(session_id, None)
+            if stale is not None:
+                logger.info(
+                    "Expired CV session %s after %d analyzed frames and %d ms idle",
+                    session_id,
+                    stale.frames_analyzed,
+                    max(0, now_ms - stale.last_seen_at),
+                )
+
+    def _maybe_log_session_metrics(
+        self,
+        session_id: str,
+        width: int,
+        height: int,
+        session: CvSessionState,
+        metrics: CvMetrics,
+        timestamp: int,
+    ) -> None:
+        should_log = session.frames_analyzed == 1
+        if not should_log and timestamp - session.last_log_at >= SESSION_LOG_INTERVAL_MS:
+            should_log = True
+        if not should_log and session.frames_analyzed % SESSION_LOG_FRAME_INTERVAL == 0:
+            should_log = True
+        if not should_log:
+            return
+
+        session.last_log_at = timestamp
+        logger.info(
+            (
+                "CV heartbeat session=%s frames=%d frame=%dx%d analysis_fps=%.1f "
+                "stream_fps=%.1f quality=%s pulse_bpm=%s pulse_conf=%.1f "
+                "motion=%.1f stress=%.1f bluff=%.1f baseline=%.1f%%"
+            ),
+            session_id,
+            session.frames_analyzed,
+            width,
+            height,
+            metrics.analysis_fps,
+            metrics.stream_fps,
+            metrics.signal_quality,
+            "none" if metrics.pulse_bpm is None else f"{metrics.pulse_bpm:.1f}",
+            metrics.pulse_confidence,
+            metrics.motion,
+            metrics.stress,
+            metrics.bluff_risk,
+            metrics.baseline_progress,
+        )
 
     def _hann_window(self, n: int) -> np.ndarray:
         window = self._hann_cache.get(n)
