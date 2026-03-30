@@ -102,6 +102,7 @@ class GameStateRequest(BaseModel):
                     }
                 ],
                 "bot_position": 0,
+                "seat_map": [3, 4],
                 "current_bet": 50,
                 "big_blind": 10,
                 "model_version": "v24"
@@ -129,6 +130,12 @@ class GameStateRequest(BaseModel):
     
     # Bot information
     bot_position: int = Field(..., ge=0, le=5, description="The bot's position at the table")
+    seat_map: Optional[list[int]] = Field(
+        default=None,
+        min_length=2,
+        max_length=6,
+        description="Optional mapping from compact hand positions to physical 6-max seats.",
+    )
     
     # Betting state
     starting_stacks: Optional[list[int]] = Field(

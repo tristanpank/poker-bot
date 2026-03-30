@@ -238,3 +238,70 @@ def test_opponent_call_tracks_window_summary_and_primes_next_opponent_window(cli
     assert next_read["position"] == 2
     assert next_read["current_window_started_at_ms"] is not None
     assert next_read["current_window_started_at_ms"] >= actor_read["last_window_ended_at_ms"]
+
+
+def test_opponent_cv_summary_uses_physical_seat_map_when_present(client: TestClient):
+    session_id = "test-session-cv-seat-map"
+    cv_session_id = f"{session_id}__p4"
+    now_ms = int(time.time() * 1000.0)
+    window_start_ms = now_ms - 3_000
+
+    append_webcam_metric_sample(
+        cv_session_id,
+        {"bluffRisk": 61.0, "bluffDelta": 9.0},
+        timestamp_ms=window_start_ms + 400,
+    )
+    append_webcam_metric_sample(
+        cv_session_id,
+        {"bluffRisk": 67.0, "bluffDelta": 17.0},
+        timestamp_ms=window_start_ms + 1_200,
+    )
+
+    game_state = _base_game_state(
+        session_id=session_id,
+        current_player_idx=1,
+        current_bet=10,
+        pot=30,
+        players=[
+            {
+                "position": 0,
+                "stack": 990,
+                "bet": 10,
+                "hole_cards": [{"rank": "J", "suit": "h"}, {"rank": "J", "suit": "d"}],
+                "is_bot": True,
+                "is_active": True,
+                "has_acted": True,
+            },
+            {
+                "position": 1,
+                "stack": 995,
+                "bet": 5,
+                "hole_cards": None,
+                "is_bot": False,
+                "is_active": True,
+                "has_acted": False,
+            },
+        ],
+    )
+    game_state["seat_map"] = [1, 4]
+    game_state["cv_reads"] = {
+        "1": {
+            "position": 1,
+            "current_window_started_at_ms": window_start_ms,
+        }
+    }
+
+    response = client.post(
+        "/poker/step",
+        json={
+            "actor": "opponent",
+            "action": "call",
+            "game_state": game_state,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    read = response.json()["game_state"]["cv_reads"]["1"]
+    assert read["last_window_sample_count"] == 2
+    assert read["last_window_avg_bluff_delta"] == pytest.approx(13.0)
+    assert read["last_window_max_bluff_delta"] == pytest.approx(17.0)

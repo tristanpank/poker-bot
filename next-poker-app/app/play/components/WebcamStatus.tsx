@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getTablePosition } from '../../lib/tablePositions';
+import { FULL_RING_SEAT_COUNT, getSeatLabel } from '../../lib/tablePositions';
 
 const BACKEND =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
@@ -21,6 +21,7 @@ type OpponentStatus = {
 };
 
 type WebcamStatusData = {
+  code?: string | null;
   tableSize?: number | null;
   botPosition?: number | null;
   opponents: Record<string, OpponentStatus>;
@@ -29,10 +30,10 @@ type WebcamStatusData = {
 type WebcamStatusProps = {
   sessionId: string | null;
   tableSize: number;
-  botPosition: number | null;
+  botSeat: number | null;
 };
 
-export default function WebcamStatus({ sessionId, tableSize, botPosition }: WebcamStatusProps) {
+export default function WebcamStatus({ sessionId, tableSize, botSeat }: WebcamStatusProps) {
   const [code, setCode] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [statusData, setStatusData] = useState<WebcamStatusData>({ opponents: {} });
@@ -40,9 +41,8 @@ export default function WebcamStatus({ sessionId, tableSize, botPosition }: Webc
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Poll for opponent connection status
   useEffect(() => {
-    if (!sessionId || !code) return;
+    if (!sessionId) return;
 
     const poll = async () => {
       try {
@@ -52,7 +52,7 @@ export default function WebcamStatus({ sessionId, tableSize, botPosition }: Webc
           setStatusData(data);
         }
       } catch {
-        // Silently ignore polling errors
+        // Silently ignore polling errors.
       }
     };
 
@@ -62,10 +62,10 @@ export default function WebcamStatus({ sessionId, tableSize, botPosition }: Webc
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [sessionId, code]);
+  }, [sessionId]);
 
   const generateCode = useCallback(async () => {
-    if (!sessionId || botPosition === null) return;
+    if (!sessionId || botSeat === null) return;
     setIsGenerating(true);
     setError(null);
 
@@ -85,7 +85,7 @@ export default function WebcamStatus({ sessionId, tableSize, botPosition }: Webc
     } finally {
       setIsGenerating(false);
     }
-  }, [botPosition, sessionId]);
+  }, [botSeat, sessionId]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -95,94 +95,96 @@ export default function WebcamStatus({ sessionId, tableSize, botPosition }: Webc
       return;
     }
 
-    if (botPosition !== null) {
+    if (botSeat !== null) {
       void generateCode();
     }
-  }, [botPosition, generateCode, sessionId]);
+  }, [botSeat, generateCode, sessionId]);
 
   const copyCode = useCallback(async () => {
-    if (!code) return;
+    const nextCode = code ?? statusData.code ?? null;
+    if (!nextCode) return;
     try {
-      await navigator.clipboard.writeText(code);
+      await navigator.clipboard.writeText(nextCode);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback: select text
+      // Ignore clipboard failures.
     }
-  }, [code]);
+  }, [code, statusData.code]);
 
-  const resolvedTableSize = tableSize;
-  const resolvedBotPosition = botPosition ?? (typeof statusData.botPosition === 'number' ? statusData.botPosition : null);
-  const opponentPositions = Array.from({ length: resolvedTableSize }, (_, seat) => seat).filter(
-    (seat) => seat !== resolvedBotPosition,
+  const resolvedTableSize = tableSize || FULL_RING_SEAT_COUNT;
+  const resolvedBotSeat = botSeat ?? (typeof statusData.botPosition === 'number' ? statusData.botPosition : null);
+  const displayCode = code ?? statusData.code ?? null;
+  const opponentSeats = Array.from({ length: resolvedTableSize }, (_, seat) => seat).filter(
+    (seat) => seat !== resolvedBotSeat,
   );
-  const connectedCount = Object.values(statusData.opponents).filter((o) => o.connected).length;
+  const connectedCount = Object.values(statusData.opponents).filter((opponent) => opponent.connected).length;
 
   return (
-    <section className="rounded-2xl border border-slate-700/30 bg-slate-900/40 backdrop-blur-sm p-3 flex flex-col gap-2">
+    <section className="rounded-2xl border border-slate-700/30 bg-slate-900/40 p-3 backdrop-blur-sm flex flex-col gap-2">
       <div className="flex items-center justify-between">
         <h3 className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
           Opponent Webcams
         </h3>
-        {code && (
+        {displayCode && (
           <span className="text-[10px] text-slate-600">
-            {connectedCount}/{opponentPositions.length} connected
+            {connectedCount}/{opponentSeats.length} seated
           </span>
         )}
       </div>
 
-      {!code ? (
+      {!displayCode ? (
         <button
           onClick={generateCode}
-          disabled={isGenerating || !sessionId || botPosition === null}
+          disabled={isGenerating || !sessionId || botSeat === null}
           className="w-full rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-blue-500/15 transition-all hover:bg-blue-400 disabled:opacity-40"
         >
-          {isGenerating ? 'Loading Code...' : botPosition === null ? 'Choose Bot Seat First' : 'Generate Code'}
+          {isGenerating ? 'Loading Code...' : botSeat === null ? 'Choose Bot Seat First' : 'Generate Code'}
         </button>
       ) : (
         <>
-          {resolvedBotPosition !== null && (
+          {resolvedBotSeat !== null && (
             <p className="text-[10px] text-slate-500">
-              Bot position: <span className="text-slate-300">{getTablePosition(resolvedBotPosition, resolvedTableSize)}</span>
+              Bot seat: <span className="text-slate-300">{getSeatLabel(resolvedBotSeat)}</span>
             </p>
           )}
 
-          {/* Code display */}
           <div className="flex items-center gap-1.5">
             <div className="flex-1 rounded-lg bg-slate-800/80 border border-slate-600/30 py-2 text-center">
               <span className="text-lg font-mono font-bold tracking-[0.25em] text-white">
-                {code}
+                {displayCode}
               </span>
             </div>
             <button
               onClick={copyCode}
               className="rounded-lg bg-slate-800/80 border border-slate-600/30 px-3 py-2 text-xs text-slate-300 hover:text-white"
             >
-              {copied ? '✓' : '⎘'}
+              {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
 
-          {/* Player connection grid - more compact */}
           <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-            {opponentPositions.map((pos) => {
-              const opponent = statusData.opponents[String(pos)];
+            {opponentSeats.map((seat) => {
+              const opponent = statusData.opponents[String(seat)];
               const isConnected = opponent?.connected ?? false;
-              const displayName = opponent?.player_name ?? `Player ${pos + 1}`;
+              const displayName = opponent?.player_name ?? `Player ${seat + 1}`;
 
               return (
                 <div
-                  key={pos}
-                  className={`rounded-lg py-1.5 px-0.5 text-center text-[10px] font-semibold transition-all ${isConnected
-                    ? 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-400'
-                    : 'bg-slate-800/40 border border-slate-700/20 text-slate-500'
+                  key={seat}
+                  className={`rounded-lg py-1.5 px-0.5 text-center text-[10px] font-semibold transition-all ${
+                    isConnected
+                      ? 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-400'
+                      : 'bg-slate-800/40 border border-slate-700/20 text-slate-500'
                   }`}
                 >
-                  <div className="flex flex-col items-center justify-center gap-0.5 min-h-[58px]">
+                  <div className="flex min-h-[58px] flex-col items-center justify-center gap-0.5">
                     <div
-                      className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-slate-600'
-                        }`}
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-slate-600'
+                      }`}
                     />
-                    <span className="text-[11px] uppercase tracking-wide opacity-90">{getTablePosition(pos, resolvedTableSize)}</span>
+                    <span className="text-[11px] uppercase tracking-wide opacity-90">{getSeatLabel(seat)}</span>
                     <span className="max-w-full truncate px-1 text-[9px] text-slate-200">{displayName}</span>
                     {isConnected && opponent?.metrics && (
                       <div className="mt-1 flex flex-col items-center text-[9px] leading-tight opacity-90">
@@ -199,7 +201,7 @@ export default function WebcamStatus({ sessionId, tableSize, botPosition }: Webc
           </div>
         </>
       )}
-      {!code && botPosition === null && (
+      {!displayCode && botSeat === null && (
         <p className="text-[10px] text-slate-500 text-center">
           Pick the bot&apos;s real table seat before sharing the join code.
         </p>

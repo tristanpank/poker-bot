@@ -97,6 +97,59 @@ def test_status_by_code_includes_table_context(app: FastAPI, mock_redis):
     assert data["botPosition"] == 3
 
 
+def test_status_by_code_prefers_saved_bot_seat_metadata(app: FastAPI, mock_redis):
+    client = TestClient(app)
+    client.post(
+        "/session",
+        json={
+            "session_id": "metadata-session-seat",
+            "data": {
+                "tableSize": 6,
+                "botSeat": 5,
+                "hand": {"botPosition": 1},
+            },
+        },
+    )
+    gen_resp = client.post(
+        "/session/webcam/generate-code",
+        json={"session_id": "metadata-session-seat"},
+    )
+    code = gen_resp.json()["code"]
+    status_resp = client.get(f"/session/webcam/status-by-code/{code}")
+
+    assert status_resp.status_code == 200
+    data = status_resp.json()
+    assert data["tableSize"] == 6
+    assert data["botPosition"] == 5
+
+
+def test_status_includes_manual_seats_without_blocking_join_metadata(app: FastAPI, mock_redis):
+    client = TestClient(app)
+    client.post(
+        "/session",
+        json={
+            "session_id": "metadata-session-manual",
+            "data": {
+                "tableSize": 6,
+                "botSeat": 2,
+                "manualSeats": [1, 4],
+            },
+        },
+    )
+    gen_resp = client.post(
+        "/session/webcam/generate-code",
+        json={"session_id": "metadata-session-manual"},
+    )
+    code = gen_resp.json()["code"]
+    status_resp = client.get(f"/session/webcam/status-by-code/{code}")
+
+    assert status_resp.status_code == 200
+    data = status_resp.json()
+    assert data["botPosition"] == 2
+    assert data["manualSeats"] == [1, 4]
+    assert data["code"] == code
+
+
 def test_join_uses_real_seat_index_and_persists_player_name(app: FastAPI, mock_redis):
     client = TestClient(app)
     client.post(
@@ -152,6 +205,34 @@ def test_join_defaults_player_name_when_blank(app: FastAPI, mock_redis):
 
     assert join_resp.status_code == 200
     assert join_resp.json()["player_name"] == "Player 5"
+
+
+def test_manual_host_seat_does_not_block_later_webcam_join(app: FastAPI, mock_redis):
+    client = TestClient(app)
+    client.post(
+        "/session",
+        json={
+            "session_id": "metadata-session-manual-join",
+            "data": {
+                "tableSize": 6,
+                "botSeat": 2,
+                "manualSeats": [4],
+            },
+        },
+    )
+    gen_resp = client.post(
+        "/session/webcam/generate-code",
+        json={"session_id": "metadata-session-manual-join"},
+    )
+    code = gen_resp.json()["code"]
+
+    join_resp = client.post(
+        "/session/webcam/join",
+        json={"code": code, "player_position": 4, "player_name": "Late Join"},
+    )
+
+    assert join_resp.status_code == 200
+    assert join_resp.json()["player_name"] == "Late Join"
 
 
 def test_webcam_positions_rotate_with_next_hand_and_keep_names(app: FastAPI, mock_redis):

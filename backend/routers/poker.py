@@ -34,6 +34,17 @@ _CV_SIGNAL_ELEVATED_ACT_MAX = 16.0
 _CV_SIGNAL_MAX_ACT_MAX = 28.0
 
 
+def _resolve_cv_metric_key(game_state: GameStateRequest, actor_position: int) -> str | None:
+    session_id = game_state.session_id
+    if not session_id:
+        return None
+
+    seat_map = list(game_state.seat_map or [])
+    if 0 <= actor_position < len(seat_map):
+        return f"{session_id}__p{int(seat_map[actor_position])}"
+    return f"{session_id}__p{actor_position}"
+
+
 def _derive_cv_bluff_risk_level_from_act_max(act_max: float | None) -> str | None:
     if act_max is None:
         return None
@@ -181,14 +192,15 @@ def _update_cv_read_tracking(
         actor_position = int(actor.position)
         actor_key = str(actor_position)
         actor_read = cv_reads.get(actor_key, PlayerCvRead(position=actor_position))
+        metric_key = _resolve_cv_metric_key(game_state, actor_position)
 
-        if not actor.is_bot:
+        if (not actor.is_bot) and metric_key is not None:
             window_start_ms = actor_read.current_window_started_at_ms
             if window_start_ms is None:
                 window_start_ms = max(0, now_ms - 8_000)
 
             summary = summarize_webcam_metric_window(
-                f"{game_state.session_id}__p{actor_position}",
+                metric_key,
                 started_at_ms=window_start_ms,
                 ended_at_ms=now_ms,
             )

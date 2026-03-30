@@ -1,22 +1,9 @@
 import React from 'react';
 import { getTablePosition } from '../../lib/tablePositions';
+import TableVisual, { TableSeatVisual } from './TableVisual';
 
 type Card = { rank: string; suit: string };
 type PlayerState = { position: number; stack: number; bet: number; hole_cards: Card[] | null; is_bot: boolean; is_active: boolean; has_acted: boolean };
-type PlayerCvRead = {
-    position: number;
-    currentWindowStartedAtMs: number | null;
-    lastWindowStartedAtMs: number | null;
-    lastWindowEndedAtMs: number | null;
-    lastWindowAvgBluffDelta: number | null;
-    lastWindowMaxBluffDelta: number | null;
-    lastWindowSampleCount: number;
-    orbitAvgBluffDelta: number | null;
-    orbitMaxBluffDelta: number | null;
-    orbitWindowCount: number;
-    orbitSampleCount: number;
-    wasAggressorThisPot: boolean;
-};
 type BotResponse = {
     action: string;
     action_id: number | null;
@@ -134,16 +121,14 @@ type PlayPhaseProps = {
     street: 'preflop' | 'flop' | 'turn' | 'river';
     players: PlayerState[];
     playerNames: Record<string, string>;
+    tableSeats: TableSeatVisual[];
     currentPlayerIdx: number;
-    cvReads: Record<string, PlayerCvRead>;
-    potAggressors: number[];
     isLoading: boolean;
     botResponse: BotResponse | null;
     showRaiseInput: boolean;
     setShowRaiseInput: (show: boolean) => void;
     raiseInput: string;
     setRaiseInput: (val: string) => void;
-    onOpenCommunityPicker: () => void;
     onQueryBot: () => void;
     onRecordAction: (action: 'fold' | 'check_call' | 'raise', amount?: number) => void;
     onUndo: () => void;
@@ -174,16 +159,14 @@ export default function PlayPhase({
     street,
     players,
     playerNames,
+    tableSeats,
     currentPlayerIdx,
-    cvReads,
-    potAggressors,
     isLoading,
     botResponse,
     showRaiseInput,
     setShowRaiseInput,
     raiseInput,
     setRaiseInput,
-    onOpenCommunityPicker,
     onQueryBot,
     onRecordAction,
     onUndo,
@@ -206,21 +189,11 @@ export default function PlayPhase({
     const currentPlayer = players[currentPlayerIdx];
     const isBotTurn = currentPlayer?.is_bot ?? false;
     const botPlayer = players.find((p) => p.is_bot);
-    const potAggressorPositions = new Set(potAggressors);
     const raiseMin = legalActions.minRaiseTo ?? 0;
     const raiseMax = legalActions.maxRaiseTo ?? 0;
     const raiseValue = Number(raiseInput);
     const hasRaiseValue = Number.isFinite(raiseValue);
     const raiseIsLegal = legalActions.canRaise && hasRaiseValue && raiseValue >= raiseMin && raiseValue <= raiseMax;
-    const canDealNextStreet = (
-        !showdownMode
-        && currentPlayerIdx === -1
-        && (
-            (street === 'preflop' && communityCards.length === 0)
-            || (street === 'flop' && communityCards.length === 3)
-            || (street === 'turn' && communityCards.length === 4)
-        )
-    );
     const recommendationNote = botResponse ? getRecommendationNote(botResponse) : null;
 
     return (
@@ -255,90 +228,50 @@ export default function PlayPhase({
 
             <main className="flex-1 p-2 flex flex-col gap-2 pb-2">
                 <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-xl p-2.5">
-                    <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-1.5">Bot&apos;s Hand ({getTablePosition(botPosition, players.length)})</p>
-                    <div className="flex gap-1.5">
-                        {holeCards.map((c, i) => (
-                            <div key={i} className={`card-mini suit-${c.suit} scale-90 origin-left`}>
-                                <span className="card-rank">{c.rank}</span>
-                                <span className="card-suit">{suitSym(c.suit)}</span>
-                            </div>
-                        ))}
-                    </div>
-                </section>
-
-                <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-xl p-2.5">
-                    <div className="flex justify-between items-center mb-1.5">
-                        <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold">
-                            Board - {street}
-                        </p>
-                        {canDealNextStreet && (
-                            <button
-                                onClick={onOpenCommunityPicker}
-                                className="text-[10px] font-bold px-2 py-1 rounded-lg bg-[var(--color-accent)]/15 text-[var(--color-accent)] border border-[var(--color-accent)]/30 hover:bg-[var(--color-accent)]/25 active:scale-95 transition-all"
-                            >
-                                + Deal {communityCards.length === 0 ? 'Flop' : communityCards.length === 3 ? 'Turn' : 'River'}
-                            </button>
-                        )}
-                    </div>
-                    <div className="flex gap-1.5">
-                        {communityCards.length > 0 ? communityCards.map((c, i) => (
-                            <div key={i} className={`card-mini suit-${c.suit} scale-90 origin-left`}>
-                                <span className="card-rank">{c.rank}</span>
-                                <span className="card-suit">{suitSym(c.suit)}</span>
-                            </div>
-                        )) : (
-                            <p className="text-xs text-slate-500 italic">No community cards yet</p>
-                        )}
-                    </div>
-                </section>
-
-                {!showdownMode && children}
-
-                <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-xl p-2.5">
                     <div className="flex justify-between items-center mb-2">
                         <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold">Table</p>
                     </div>
-                    <div className="flex flex-col gap-1.5">
-                        {players.map((player, idx) => (
-                            (() => {
-                                const read = cvReads[String(player.position)];
-                                const wasPotAggressor = potAggressorPositions.has(player.position) || read?.wasAggressorThisPot;
-                                const shouldShowRead = (
-                                    isBotTurn
-                                    && !player.is_bot
-                                    && (player.is_active || wasPotAggressor)
-                                    && read?.lastWindowMaxBluffDelta != null
-                                );
+                    <TableVisual
+                        seats={tableSeats}
+                        center={(
+                            <div className="flex flex-col items-center gap-2">
+                                <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-[0.18em]">{street}</p>
+                                <div className="flex flex-wrap justify-center gap-1.5">
+                                    {communityCards.length > 0 ? communityCards.map((c, i) => (
+                                        <div key={i} className={`card-mini suit-${c.suit} scale-90 origin-left`}>
+                                            <span className="card-rank">{c.rank}</span>
+                                            <span className="card-suit">{suitSym(c.suit)}</span>
+                                        </div>
+                                    )) : (
+                                        <p className="text-xs text-slate-500 italic">No board yet</p>
+                                    )}
+                                </div>
+                                <div className="flex items-center gap-3 text-xs font-semibold text-[var(--color-text-primary)]">
+                                    <span>Pot {pot}</span>
+                                    <span>Bet {currentBet}</span>
+                                </div>
+                            </div>
+                        )}
+                    />
 
-                                return (
-                                    <div
-                                        key={idx}
-                                        className={`rounded-lg border px-3 py-1.5 ${idx === currentPlayerIdx ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'} ${!player.is_active ? 'opacity-60' : ''}`}
-                                    >
-                                        <div className="flex items-center justify-between">
-                                            <span className="text-xs font-semibold text-[var(--color-text-primary)]">
-                                                {getPlayerName(player, players.length, playerNames)}
-                                            </span>
-                                            <span className="text-[10px] text-[var(--color-text-secondary)]">
-                                                {player.is_active ? 'Active' : 'Folded'}
-                                            </span>
-                                        </div>
-                                        <div className="text-[10px] text-[var(--color-text-secondary)] mt-0.5">
-                                            Stack: <span className="text-[var(--color-text-primary)] font-semibold">{player.stack}</span> | Bet: <span className="text-[var(--color-text-primary)] font-semibold">{player.bet}</span>
-                                        </div>
-                                        {shouldShowRead && (
-                                            <div className="mt-1.5 flex flex-wrap gap-1">
-                                                {read?.lastWindowMaxBluffDelta != null && (
-                                                    <span className="rounded-full border border-slate-400/30 bg-slate-200/5 px-2 py-0.5 text-[10px] font-semibold text-slate-200">
-                                                        Act Max {formatSignedDelta(read.lastWindowMaxBluffDelta)}
-                                                    </span>
-                                                )}
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })()
-                        ))}
+                    {!showdownMode && children && (
+                        <div className="mt-2">
+                            {children}
+                        </div>
+                    )}
+
+                    <div className="mt-2 rounded-xl border border-[var(--color-border-color)] bg-slate-950/35 p-3">
+                        <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-2">
+                            Bot&apos;s Hand ({getTablePosition(botPosition, players.length)})
+                        </p>
+                        <div className="flex justify-center gap-1.5">
+                            {holeCards.map((c, i) => (
+                                <div key={i} className={`card-mini suit-${c.suit} scale-90 origin-left`}>
+                                    <span className="card-rank">{c.rank}</span>
+                                    <span className="card-suit">{suitSym(c.suit)}</span>
+                                </div>
+                            ))}
+                        </div>
                     </div>
 
                     {!showdownMode && (

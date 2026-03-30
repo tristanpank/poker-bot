@@ -189,8 +189,10 @@ async def test_status_empty_session(mock_redis):
     assert resp.json() == {
         "sessionActive": False,
         "opponents": {},
+        "code": None,
         "tableSize": None,
         "botPosition": None,
+        "manualSeats": [],
     }
 
 
@@ -245,6 +247,8 @@ async def test_delete_session_ends_webcam_session(mock_redis):
     assert status_resp.json() == {
         "sessionActive": False,
         "opponents": {},
+        "code": None,
         "tableSize": None,
         "botPosition": None,
+        "manualSeats": [],
     }

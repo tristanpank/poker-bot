@@ -3,7 +3,13 @@
 import { useCallback, useState } from 'react';
 import { useEffect } from 'react';
 
-import { getDefaultPlayerName, getSeatLabel, getTablePosition } from '../lib/tablePositions';
+import {
+  FULL_RING_SEAT_COUNT,
+  getCompactRoleForSeat,
+  getDefaultPlayerName,
+  getSeatLabel,
+  sixSeatLayout,
+} from '../lib/tablePositions';
 import { useCvWebRtcStream } from '../lib/useCvWebRtcStream';
 
 const BACKEND =
@@ -11,8 +17,8 @@ const BACKEND =
 const JOIN_PAGE_STATE_KEY = 'poker.join.page.state';
 const SESSION_STATUS_POLL_INTERVAL_MS = 3000;
 
-function buildSeatAvailability(tableSize: number, botPosition: number | null): boolean[] {
-  return Array.from({ length: tableSize }, (_, seat) => seat !== botPosition);
+function buildSeatAvailability(botSeat: number | null): boolean[] {
+  return Array.from({ length: FULL_RING_SEAT_COUNT }, (_, seat) => seat !== botSeat);
 }
 
 type JoinState = 'idle' | 'joined' | 'streaming';
@@ -51,9 +57,8 @@ export default function JoinPage() {
   const [isJoining, setIsJoining] = useState(false);
   const [isStartingWebcam, setIsStartingWebcam] = useState(false);
   const [isStoppingWebcam, setIsStoppingWebcam] = useState(false);
-  const [tableSize, setTableSize] = useState(6);
-  const [botPosition, setBotPosition] = useState<number | null>(null);
-  const [availableSeats, setAvailableSeats] = useState<boolean[]>(() => buildSeatAvailability(6, null));
+  const [botSeat, setBotSeat] = useState<number | null>(null);
+  const [availableSeats, setAvailableSeats] = useState<boolean[]>(() => buildSeatAvailability(null));
   const [isLoadingSeatStatus, setIsLoadingSeatStatus] = useState(false);
 
   const {
@@ -73,10 +78,9 @@ export default function JoinPage() {
   const trimmedPlayerName = playerName.trim();
   const resolvedPlayerName = trimmedPlayerName || getDefaultPlayerName(playerPosition);
   const hasCompleteCode = trimmedCode.length === 6;
-  const hasSeatMap = botPosition !== null;
+  const hasSeatMap = botSeat !== null;
   const isSeatTaken = useCallback((position: number) => !availableSeats[position], [availableSeats]);
   const hasAnyAvailableSeat = availableSeats.some(Boolean);
-  const selectableSeats = Array.from({ length: tableSize }, (_, seat) => seat).filter((seat) => seat !== botPosition);
 
   const notifyDisconnect = useCallback(
     (targetSessionId: string, targetPlayerPosition: number, targetCvSessionId: string | null, keepalive = false) => {
@@ -180,17 +184,14 @@ export default function JoinPage() {
         }
 
         const data = (await res.json()) as WebcamSessionStatus;
-        if (typeof data.tableSize === 'number' && data.tableSize >= 2 && data.tableSize <= 6) {
-          setTableSize(data.tableSize);
-        }
         if (typeof data.botPosition === 'number' && data.botPosition >= 0 && data.botPosition < 6) {
-          setBotPosition(data.botPosition);
+          setBotSeat(data.botPosition);
         }
         if (cvSessionId) {
           const currentOpponent = Object.entries(data.opponents).find(([, opponent]) => opponent.cv_session_id === cvSessionId);
           if (currentOpponent) {
             const nextPosition = Number(currentOpponent[0]);
-            if (Number.isInteger(nextPosition) && nextPosition >= 0 && nextPosition < Math.max(2, tableSize)) {
+            if (Number.isInteger(nextPosition) && nextPosition >= 0 && nextPosition < FULL_RING_SEAT_COUNT) {
               setPlayerPosition(nextPosition);
             }
             if (currentOpponent[1].player_name?.trim()) {
@@ -214,7 +215,7 @@ export default function JoinPage() {
     return () => {
       window.clearInterval(pollId);
     };
-  }, [cvSessionId, joinState, resetToIdle, sessionId, tableSize]);
+  }, [cvSessionId, joinState, resetToIdle, sessionId]);
 
   useEffect(() => {
     if (!sessionId || joinState === 'idle') {
@@ -236,7 +237,7 @@ export default function JoinPage() {
 
   useEffect(() => {
     if (joinState !== 'idle' || !hasCompleteCode) {
-      setAvailableSeats(buildSeatAvailability(tableSize, botPosition));
+      setAvailableSeats(buildSeatAvailability(botSeat));
       setIsLoadingSeatStatus(false);
       return;
     }
@@ -249,19 +250,16 @@ export default function JoinPage() {
         const res = await fetch(`${BACKEND}/session/webcam/status-by-code/${trimmedCode}`);
         if (!res.ok) {
           if (!cancelled) {
-            setAvailableSeats([true, true, true, true, true]);
+            setAvailableSeats(buildSeatAvailability(null));
           }
           return;
         }
 
         const data = (await res.json()) as WebcamSessionStatus;
-        const nextTableSize = typeof data.tableSize === 'number' && data.tableSize >= 2 && data.tableSize <= 6
-          ? data.tableSize
-          : 6;
-        const nextBotPosition = typeof data.botPosition === 'number' && data.botPosition >= 0 && data.botPosition < nextTableSize
+        const nextBotPosition = typeof data.botPosition === 'number' && data.botPosition >= 0 && data.botPosition < FULL_RING_SEAT_COUNT
           ? data.botPosition
           : null;
-        const nextAvailableSeats = buildSeatAvailability(nextTableSize, nextBotPosition);
+        const nextAvailableSeats = buildSeatAvailability(nextBotPosition);
         for (const [position, opponent] of Object.entries(data.opponents)) {
           const seatIndex = Number(position);
           if (
@@ -275,15 +273,13 @@ export default function JoinPage() {
         }
 
         if (!cancelled) {
-          setTableSize(nextTableSize);
-          setBotPosition(nextBotPosition);
+          setBotSeat(nextBotPosition);
           setAvailableSeats(nextAvailableSeats);
         }
       } catch {
         if (!cancelled) {
-          setTableSize(6);
-          setBotPosition(null);
-          setAvailableSeats(buildSeatAvailability(6, null));
+          setBotSeat(null);
+          setAvailableSeats(buildSeatAvailability(null));
         }
       } finally {
         if (!cancelled) {
@@ -301,18 +297,18 @@ export default function JoinPage() {
       cancelled = true;
       window.clearInterval(pollId);
     };
-  }, [botPosition, hasCompleteCode, joinState, tableSize, trimmedCode]);
+  }, [botSeat, hasCompleteCode, joinState, trimmedCode]);
 
   useEffect(() => {
     if (joinState !== 'idle' || !isSeatTaken(playerPosition)) {
       return;
     }
 
-    const nextAvailablePosition = availableSeats.findIndex((isAvailable, seat) => isAvailable && seat !== botPosition);
+    const nextAvailablePosition = availableSeats.findIndex((isAvailable, seat) => isAvailable && seat !== botSeat);
     if (nextAvailablePosition >= 0) {
       setPlayerPosition(nextAvailablePosition);
     }
-  }, [availableSeats, botPosition, isSeatTaken, joinState, playerPosition]);
+  }, [availableSeats, botSeat, isSeatTaken, joinState, playerPosition]);
 
   const handleJoin = useCallback(async () => {
     setJoinError(null);
@@ -511,35 +507,51 @@ export default function JoinPage() {
               <label className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1.5 block">
                 Your Seat
               </label>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                {selectableSeats.map((pos) => {
-                  const taken = hasCompleteCode && isSeatTaken(pos);
+              <div className="relative mx-auto h-[20rem] max-w-md rounded-[2rem] border border-slate-700/50 bg-slate-950/60 p-3">
+                <div className="absolute inset-8 rounded-[999px] border border-emerald-500/15 bg-[radial-gradient(circle_at_center,rgba(16,185,129,0.14),rgba(15,23,42,0.3)_60%,rgba(2,6,23,0.92)_100%)]" />
+                <div className="absolute inset-[4rem] rounded-[999px] border border-white/5 bg-slate-950/30" />
+                {sixSeatLayout.map(({ seat, className }) => {
+                  const taken = hasCompleteCode && isSeatTaken(seat);
+                  const isBotSeat = seat === botSeat;
+                  const isSelected = playerPosition === seat;
+                  const occupiedSeats = [
+                    ...(botSeat === null ? [] : [botSeat]),
+                    ...availableSeats
+                      .map((isAvailable, idx) => (!isAvailable && idx !== botSeat ? idx : null))
+                      .filter((value): value is number => value !== null),
+                  ];
+                  const role = getCompactRoleForSeat(seat, occupiedSeats);
+                  const isDisabled = isJoining || taken || !hasSeatMap || isBotSeat;
+
                   return (
                     <button
-                      key={pos}
-                      onClick={() => setPlayerPosition(pos)}
-                      disabled={isJoining || taken || !hasSeatMap}
-                      className={`rounded-xl py-3 text-sm font-semibold transition-all ${
-                        taken
-                          ? 'bg-slate-900/80 text-slate-500 border border-slate-700/40 cursor-not-allowed opacity-60'
-                          : playerPosition === pos
-                            ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
-                            : 'bg-slate-800/80 text-slate-300 border border-slate-600/30 hover:bg-slate-700/80 hover:border-slate-500/40'
+                      key={seat}
+                      onClick={() => setPlayerPosition(seat)}
+                      disabled={isDisabled}
+                      className={`absolute ${className} flex h-20 w-20 -translate-y-1/2 flex-col items-center justify-center rounded-3xl border text-center text-[11px] font-semibold transition-all ${
+                        isBotSeat
+                          ? 'border-sky-400/40 bg-sky-500/10 text-sky-100'
+                          : taken
+                            ? 'cursor-not-allowed border-slate-700/40 bg-slate-900/80 text-slate-500 opacity-60'
+                            : isSelected
+                              ? 'border-emerald-400 bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
+                              : 'border-slate-600/30 bg-slate-800/80 text-slate-300 hover:bg-slate-700/80 hover:border-slate-500/40'
                       }`}
                     >
-                      <div className="flex flex-col items-center gap-0.5">
-                        <span>{getSeatLabel(pos)}</span>
-                        <span className="text-[10px] uppercase tracking-wide opacity-80">
-                          {getTablePosition(pos, tableSize)}
-                        </span>
-                      </div>
+                      <span className="uppercase tracking-[0.16em]">{getSeatLabel(seat)}</span>
+                      <span className="mt-1 text-[10px] text-white/80">
+                        {isBotSeat ? 'Bot' : taken ? 'Taken' : 'Open'}
+                      </span>
+                      <span className="mt-1 text-[9px] uppercase tracking-[0.14em] opacity-80">
+                        {role ?? (isBotSeat ? 'Locked' : taken ? 'Seated' : 'Available')}
+                      </span>
                     </button>
                   );
                 })}
               </div>
-              {hasSeatMap && botPosition !== null && (
+              {hasSeatMap && botSeat !== null && (
                 <p className="mt-2 text-xs text-slate-500">
-                  Bot seat: <span className="text-slate-300">{getSeatLabel(botPosition)} ({getTablePosition(botPosition, tableSize)})</span>
+                  Bot seat: <span className="text-slate-300">{getSeatLabel(botSeat)}</span>
                 </p>
               )}
               {hasCompleteCode && (
@@ -547,9 +559,9 @@ export default function JoinPage() {
                   {isLoadingSeatStatus
                     ? 'Checking available seats...'
                     : !hasSeatMap
-                      ? 'Waiting for the host to choose the bot seat so the table seats can be labeled correctly.'
+                      ? 'Waiting for the host to choose the bot seat.'
                       : hasAnyAvailableSeat
-                        ? 'Seat labels match the real table. Taken seats are greyed out.'
+                        ? 'Choose any open seat. Grey seats are already occupied.'
                       : 'All seats are currently taken.'}
                 </p>
               )}
@@ -579,7 +591,7 @@ export default function JoinPage() {
                   Connected as <span className="text-emerald-400 font-semibold">{resolvedPlayerName}</span>
                 </p>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  {getSeatLabel(playerPosition)} ({getTablePosition(playerPosition, tableSize)}) • Session: {sessionId?.slice(0, 8)}...
+                  {getSeatLabel(playerPosition)} • Session: {sessionId?.slice(0, 8)}...
                 </p>
               </div>
               <span

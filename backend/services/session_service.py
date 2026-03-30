@@ -172,21 +172,36 @@ def _default_webcam_session_data() -> dict[str, Any]:
 def _extract_table_context_from_session_data(session_data: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Extract current table metadata for webcam join/seat labeling."""
     if not isinstance(session_data, dict):
-        return {"tableSize": None, "botPosition": None}
+        return {"tableSize": None, "botPosition": None, "manualSeats": []}
 
     table_size_raw = session_data.get("tableSize")
+    manual_seats_raw = session_data.get("manualSeats")
     hand = session_data.get("hand") if isinstance(session_data.get("hand"), dict) else {}
-    bot_position_raw = hand.get("botPosition")
+    bot_position_raw = session_data.get("botSeat")
+    if not isinstance(bot_position_raw, int):
+        bot_position_raw = hand.get("botSeat")
+    if not isinstance(bot_position_raw, int):
+        bot_position_raw = hand.get("botPosition")
 
     table_size = int(table_size_raw) if isinstance(table_size_raw, int) and 2 <= table_size_raw <= 6 else None
     bot_position = int(bot_position_raw) if isinstance(bot_position_raw, int) and 0 <= bot_position_raw <= 5 else None
+    manual_seats = []
+    if isinstance(manual_seats_raw, list):
+        manual_seats = sorted({
+            int(seat)
+            for seat in manual_seats_raw
+            if isinstance(seat, int) and 0 <= seat <= 5
+        })
 
     if table_size is not None and bot_position is not None and bot_position >= table_size:
         bot_position = None
+    if table_size is not None:
+        manual_seats = [seat for seat in manual_seats if seat < table_size and seat != bot_position]
 
     return {
         "tableSize": table_size,
         "botPosition": bot_position,
+        "manualSeats": manual_seats,
     }
 
 
@@ -573,11 +588,16 @@ async def get_webcam_status(session_id: str) -> dict[str, Any]:
     raw = await client.get(wkey)
     table_context = _extract_table_context_from_session_data(await load_session(session_id))
     if raw is None:
-        return {"sessionActive": False, "opponents": {}, **table_context}
+        return {"sessionActive": False, "opponents": {}, "code": None, **table_context}
 
     data = json.loads(raw)
     opponents = data.get("opponents", {})
-    result = {"sessionActive": True, "opponents": opponents, **table_context}
+    result = {
+        "sessionActive": True,
+        "opponents": opponents,
+        "code": data.get("code"),
+        **table_context,
+    }
 
     # Fetch metrics for all connected opponents
     for pos_str, opp in opponents.items():
