@@ -321,7 +321,7 @@ class CvService:
         metrics: CvMetrics,
         timestamp: int,
     ) -> None:
-        should_log = session.frames_analyzed == 0
+        should_log = session.frames_analyzed <= 1
         if not should_log and timestamp - session.last_log_at >= SESSION_LOG_INTERVAL_MS:
             should_log = True
         if not should_log and session.frames_analyzed % SESSION_LOG_FRAME_INTERVAL == 0:

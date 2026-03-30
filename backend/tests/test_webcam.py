@@ -186,7 +186,12 @@ async def test_status_empty_session(mock_redis):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/session/webcam/status/nonexistent")
     assert resp.status_code == 200
-    assert resp.json() == {"sessionActive": False, "opponents": {}}
+    assert resp.json() == {
+        "sessionActive": False,
+        "opponents": {},
+        "tableSize": None,
+        "botPosition": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -237,4 +242,9 @@ async def test_delete_session_ends_webcam_session(mock_redis):
 
     assert join_resp.status_code == 404
     assert status_resp.status_code == 200
-    assert status_resp.json() == {"sessionActive": False, "opponents": {}}
+    assert status_resp.json() == {
+        "sessionActive": False,
+        "opponents": {},
+        "tableSize": None,
+        "botPosition": None,
+    }
