@@ -10,13 +10,14 @@ type SetupDetailsProps = {
     setBigBlind: (amt: number) => void;
     buyIn: number;
     setBuyIn: (amt: number) => void;
+    showBack?: boolean;
     onBack: () => void;
     onStart: () => void;
     onEnd: () => void;
 };
 
 export default function SetupDetails({
-    hasSession, sessionStacks, sessionProfit, smallBlind, setSmallBlind, bigBlind, setBigBlind, buyIn, setBuyIn, onBack, onStart, onEnd
+    hasSession, sessionStacks, sessionProfit, smallBlind, setSmallBlind, bigBlind, setBigBlind, buyIn, setBuyIn, showBack = true, onBack, onStart, onEnd
 }: SetupDetailsProps) {
     return (
         <div className="flex-1 flex flex-col items-center justify-center gap-8 p-6 min-h-[100dvh]">
@@ -61,7 +62,7 @@ export default function SetupDetails({
             )}
 
             <div className="w-full max-w-sm flex gap-3 mt-4 animate-slide-up" style={{ animationDelay: '300ms', animationFillMode: 'forwards' }}>
-                {!hasSession && (
+                {!hasSession && showBack && (
                     <button onClick={onBack}
                         className="flex-1 py-4 px-4 rounded-2xl font-bold text-sm tracking-[0.1em] uppercase transition-all duration-300 border border-[var(--color-border-color)] bg-[var(--color-surface)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] active:scale-95 flex items-center justify-center gap-2">
                         <span className="text-lg">←</span> Back

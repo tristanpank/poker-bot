@@ -1,19 +1,20 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import SetupSize from './components/SetupSize';
 import SetupDetails from './components/SetupDetails';
-import DealPosition from './components/DealPosition';
 import DealHoleCards from './components/DealHoleCards';
 import CardSelector from './components/CardSelector';
 import PlayPhase from './components/PlayPhase';
 import ResumePrompt from './components/ResumePrompt';
 import WebcamStatus from './components/WebcamStatus';
+import { FULL_RING_SEAT_COUNT, compactSeatMap, getCompactRoleForSeat, getSeatLabel, getTablePosition } from '../lib/tablePositions';
+import type { TableSeatVisual } from './components/TableVisual';
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
 const MODEL_VERSION = 'v24';
 const SESSION_COOKIE_NAME = 'poker_session_id';
 const SESSION_COOKIE_MAX_AGE = 86400; // 24 hours
+const HOST_BOT_SEAT = 3;
 
 // ---------------------------------------------------------------------------
 // Cookie helpers
@@ -46,12 +47,42 @@ type PlayerState = {
     is_active: boolean;
     has_acted: boolean;
 };
+type PlayerCvRead = {
+    position: number;
+    currentWindowStartedAtMs: number | null;
+    lastWindowStartedAtMs: number | null;
+    lastWindowEndedAtMs: number | null;
+    lastWindowAvgBluffDelta: number | null;
+    lastWindowMaxBluffDelta: number | null;
+    lastWindowSampleCount: number;
+    orbitAvgBluffDelta: number | null;
+    orbitMaxBluffDelta: number | null;
+    orbitWindowCount: number;
+    orbitSampleCount: number;
+    wasAggressorThisPot: boolean;
+};
 type BotResponse = {
     action: 'fold' | 'check' | 'call' | 'raise_amt';
     action_id: number | null;
     amount: number | null;
+    originalAction: 'fold' | 'check' | 'call' | 'raise_amt' | null;
+    originalActionId: number | null;
+    originalAmount: number | null;
+    cvInfluenceApplied: boolean;
+    cvActMax: number | null;
+    cvBluffRiskLevel: 'low' | 'watch' | 'elevated' | null;
 };
-type Phase = 'resume-prompt' | 'setup-size' | 'setup-details' | 'deal-position' | 'deal-hole' | 'play';
+type WebcamStatusResponse = {
+    code?: string | null;
+    opponents: Record<string, {
+        connected?: boolean;
+        player_name?: string;
+    }>;
+    tableSize?: number | null;
+    botPosition?: number | null;
+    manualSeats?: number[] | null;
+};
+type Phase = 'resume-prompt' | 'setup-details' | 'deal-hole' | 'play';
 type LegalActionState = {
     canFold: boolean;
     canCheck: boolean;
@@ -63,6 +94,7 @@ type LegalActionState = {
 };
 type HandState = {
     botPosition: number;
+    seatMap: number[];
     holeCards: Card[];
     communityCards: Card[];
     players: PlayerState[];
@@ -75,6 +107,8 @@ type HandState = {
     preflopCallCount: number;
     preflopLastRaiser: number | null;
     lastAggressor: number | null;
+    cvReads: Record<string, PlayerCvRead>;
+    potAggressors: number[];
     botResponse: BotResponse | null;
     street: 'preflop' | 'flop' | 'turn' | 'river';
     isLoading: boolean;
@@ -93,6 +127,12 @@ type BackendAppliedAction = {
     action: 'fold' | 'check' | 'call' | 'raise_amt';
     raise_amt: number | null;
     action_id?: number | null;
+    original_action?: 'fold' | 'check' | 'call' | 'raise_amt' | null;
+    original_raise_amt?: number | null;
+    original_action_id?: number | null;
+    cv_influence_applied?: boolean | null;
+    cv_act_max?: number | null;
+    cv_bluff_risk_level?: 'low' | 'watch' | 'elevated' | null;
 };
 type BackendGameState = {
     session_id?: string | null;
@@ -100,6 +140,7 @@ type BackendGameState = {
     pot: number;
     players: PlayerState[];
     bot_position: number;
+    seat_map?: number[] | null;
     starting_stacks?: number[] | null;
     current_bet: number;
     big_blind: number;
@@ -109,8 +150,24 @@ type BackendGameState = {
     preflop_call_count?: number | null;
     preflop_last_raiser?: number | null;
     last_aggressor?: number | null;
+    cv_reads?: Record<string, {
+        position: number;
+        current_window_started_at_ms?: number | null;
+        last_window_started_at_ms?: number | null;
+        last_window_ended_at_ms?: number | null;
+        last_window_avg_bluff_delta?: number | null;
+        last_window_max_bluff_delta?: number | null;
+        last_window_sample_count?: number | null;
+        orbit_avg_bluff_delta?: number | null;
+        orbit_max_bluff_delta?: number | null;
+        orbit_window_count?: number | null;
+        orbit_sample_count?: number | null;
+        was_aggressor_this_pot?: boolean | null;
+    }>;
+    pot_aggressors?: number[] | null;
     model_version?: string | null;
 };
+type BackendPlayerCvRead = NonNullable<BackendGameState['cv_reads']>[string];
 type BackendStepRequest = {
     game_state: BackendGameState;
     actor: 'bot' | 'opponent';
@@ -166,6 +223,7 @@ const EMPTY_LEGAL_ACTIONS: LegalActionState = {
 
 const EMPTY_HAND: HandState = {
     botPosition: 0,
+    seatMap: [],
     holeCards: [],
     communityCards: [],
     players: [],
@@ -178,6 +236,8 @@ const EMPTY_HAND: HandState = {
     preflopCallCount: 0,
     preflopLastRaiser: null,
     lastAggressor: null,
+    cvReads: {},
+    potAggressors: [],
     botResponse: null,
     street: 'preflop',
     isLoading: false,
@@ -185,16 +245,30 @@ const EMPTY_HAND: HandState = {
 
 const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
 
-function initPlayers(count: number, stack: number, botPos: number): PlayerState[] {
-    return Array.from({ length: count }, (_, i) => ({
+function initPlayersForSeatMap(seatMap: number[], stack: number, botSeat: number): PlayerState[] {
+    return seatMap.map((seat, i) => ({
         position: i,
         stack,
         bet: 0,
-        hole_cards: i === botPos ? [] : null,
-        is_bot: i === botPos,
+        hole_cards: seat === botSeat ? [] : null,
+        is_bot: seat === botSeat,
         is_active: true,
         has_acted: false,
     }));
+}
+
+function buildHandFromSeatMap(seatMap: number[], stack: number, botSeat: number): HandState {
+    const players = initPlayersForSeatMap(seatMap, stack, botSeat);
+    const botPosition = seatMap.indexOf(botSeat);
+
+    return {
+        ...EMPTY_HAND,
+        botPosition: botPosition >= 0 ? botPosition : 0,
+        seatMap,
+        players,
+        startingStacks: players.map((player) => player.stack),
+        currentPlayerIdx: 0,
+    };
 }
 
 function firstActivePlayerFrom(players: PlayerState[], startPos: number): number {
@@ -226,8 +300,76 @@ function mapBackendLegalActions(legal: BackendLegalActions | null | undefined): 
     };
 }
 
-function toBackendGameState(hand: HandState, bigBlind: number): BackendGameState {
+function toBackendPlayerCvRead(read: PlayerCvRead) {
     return {
+        position: read.position,
+        current_window_started_at_ms: read.currentWindowStartedAtMs,
+        last_window_started_at_ms: read.lastWindowStartedAtMs,
+        last_window_ended_at_ms: read.lastWindowEndedAtMs,
+        last_window_avg_bluff_delta: read.lastWindowAvgBluffDelta,
+        last_window_max_bluff_delta: read.lastWindowMaxBluffDelta,
+        last_window_sample_count: read.lastWindowSampleCount,
+        orbit_avg_bluff_delta: read.orbitAvgBluffDelta,
+        orbit_max_bluff_delta: read.orbitMaxBluffDelta,
+        orbit_window_count: read.orbitWindowCount,
+        orbit_sample_count: read.orbitSampleCount,
+        was_aggressor_this_pot: read.wasAggressorThisPot,
+    };
+}
+
+function fromBackendPlayerCvRead(read: BackendPlayerCvRead): PlayerCvRead {
+    return {
+        position: read.position,
+        currentWindowStartedAtMs: read.current_window_started_at_ms ?? null,
+        lastWindowStartedAtMs: read.last_window_started_at_ms ?? null,
+        lastWindowEndedAtMs: read.last_window_ended_at_ms ?? null,
+        lastWindowAvgBluffDelta: read.last_window_avg_bluff_delta ?? null,
+        lastWindowMaxBluffDelta: read.last_window_max_bluff_delta ?? null,
+        lastWindowSampleCount: Math.max(0, read.last_window_sample_count ?? 0),
+        orbitAvgBluffDelta: read.orbit_avg_bluff_delta ?? null,
+        orbitMaxBluffDelta: read.orbit_max_bluff_delta ?? null,
+        orbitWindowCount: Math.max(0, read.orbit_window_count ?? 0),
+        orbitSampleCount: Math.max(0, read.orbit_sample_count ?? 0),
+        wasAggressorThisPot: Boolean(read.was_aggressor_this_pot),
+    };
+}
+
+function primeCvReadWindow(
+    reads: Record<string, PlayerCvRead>,
+    players: PlayerState[],
+    actorIndex: number,
+): Record<string, PlayerCvRead> {
+    if (actorIndex < 0 || actorIndex >= players.length) {
+        return reads;
+    }
+    const actor = players[actorIndex];
+    if (!actor || actor.is_bot) {
+        return reads;
+    }
+    const key = String(actor.position);
+    const existing = reads[key];
+    return {
+        ...reads,
+        [key]: {
+            position: actor.position,
+            currentWindowStartedAtMs: Date.now(),
+            lastWindowStartedAtMs: existing?.lastWindowStartedAtMs ?? null,
+            lastWindowEndedAtMs: existing?.lastWindowEndedAtMs ?? null,
+            lastWindowAvgBluffDelta: existing?.lastWindowAvgBluffDelta ?? null,
+            lastWindowMaxBluffDelta: existing?.lastWindowMaxBluffDelta ?? null,
+            lastWindowSampleCount: existing?.lastWindowSampleCount ?? 0,
+            orbitAvgBluffDelta: existing?.orbitAvgBluffDelta ?? null,
+            orbitMaxBluffDelta: existing?.orbitMaxBluffDelta ?? null,
+            orbitWindowCount: existing?.orbitWindowCount ?? 0,
+            orbitSampleCount: existing?.orbitSampleCount ?? 0,
+            wasAggressorThisPot: existing?.wasAggressorThisPot ?? false,
+        },
+    };
+}
+
+function toBackendGameState(hand: HandState, bigBlind: number, sessionId: string | null): BackendGameState {
+    return {
+        session_id: sessionId,
         community_cards: hand.communityCards.map((c) => ({ rank: c.rank, suit: c.suit })),
         pot: hand.pot,
         players: hand.players.map((p) => ({
@@ -240,6 +382,7 @@ function toBackendGameState(hand: HandState, bigBlind: number): BackendGameState
             has_acted: p.has_acted,
         })),
         bot_position: hand.botPosition,
+        seat_map: hand.seatMap,
         starting_stacks: hand.startingStacks,
         current_bet: hand.currentBet,
         big_blind: bigBlind,
@@ -249,6 +392,10 @@ function toBackendGameState(hand: HandState, bigBlind: number): BackendGameState
         preflop_call_count: hand.preflopCallCount,
         preflop_last_raiser: hand.preflopLastRaiser,
         last_aggressor: hand.lastAggressor,
+        cv_reads: Object.fromEntries(
+            Object.entries(hand.cvReads).map(([position, read]) => [position, toBackendPlayerCvRead(read)]),
+        ),
+        pot_aggressors: hand.potAggressors,
         model_version: MODEL_VERSION,
     };
 }
@@ -257,9 +404,13 @@ function mapBackendGameState(gameState: BackendGameState, prev: HandState): Hand
     const botPlayer = gameState.players.find((p) => p.is_bot);
     const holeCards = botPlayer?.hole_cards ?? prev.holeCards;
     const communityCards = gameState.community_cards ?? [];
+    const cvReads = Object.fromEntries(
+        Object.entries(gameState.cv_reads ?? {}).map(([position, read]) => [position, fromBackendPlayerCvRead(read)]),
+    );
     return {
         ...prev,
         botPosition: gameState.bot_position,
+        seatMap: gameState.seat_map ?? prev.seatMap,
         holeCards,
         communityCards,
         players: gameState.players,
@@ -272,6 +423,8 @@ function mapBackendGameState(gameState: BackendGameState, prev: HandState): Hand
         preflopCallCount: gameState.preflop_call_count ?? prev.preflopCallCount,
         preflopLastRaiser: gameState.preflop_last_raiser ?? prev.preflopLastRaiser,
         lastAggressor: gameState.last_aggressor ?? prev.lastAggressor,
+        cvReads: Object.keys(cvReads).length > 0 ? cvReads : prev.cvReads,
+        potAggressors: gameState.pot_aggressors ?? prev.potAggressors,
         street: getStreetFromBoardCount(communityCards.length),
     };
 }
@@ -289,6 +442,7 @@ function mapBackendStateToNextHand(gameState: BackendGameState): HandState {
     return {
         ...EMPTY_HAND,
         botPosition: gameState.bot_position,
+        seatMap: gameState.seat_map ?? [],
         players,
         startingStacks: gameState.starting_stacks ?? players.map((player) => player.stack),
         currentPlayerIdx: gameState.current_player_idx,
@@ -301,6 +455,12 @@ function mapAppliedActionToBotResponse(applied: BackendAppliedAction): BotRespon
         action: applied.action,
         action_id: applied.action_id ?? null,
         amount: applied.raise_amt ?? null,
+        originalAction: applied.original_action ?? null,
+        originalActionId: applied.original_action_id ?? null,
+        originalAmount: applied.original_raise_amt ?? null,
+        cvInfluenceApplied: Boolean(applied.cv_influence_applied),
+        cvActMax: applied.cv_act_max ?? null,
+        cvBluffRiskLevel: applied.cv_bluff_risk_level ?? null,
     };
 }
 
@@ -317,12 +477,14 @@ async function parseError(res: Response): Promise<string> {
 export default function PlayPage() {
     const [mounted, setMounted] = useState(false);
 
-    const [tableSize, setTableSize] = useState(6);
+    const tableSize = FULL_RING_SEAT_COUNT;
     const [smallBlind, setSmallBlind] = useState(1);
     const [bigBlind, setBigBlind] = useState(2);
     const [buyIn, setBuyIn] = useState(200);
     const [sessionStacks, setSessionStacks] = useState<number[]>([]);
     const [sessionProfit, setSessionProfit] = useState(0);
+    const [botSeat, setBotSeat] = useState<number | null>(null);
+    const [manualSeats, setManualSeats] = useState<number[]>([]);
 
     const [phase, setPhase] = useState<Phase>('resume-prompt');
     const [hand, setHand] = useState<HandState>(EMPTY_HAND);
@@ -348,6 +510,10 @@ export default function PlayPage() {
     const [isResolvingShowdown, setIsResolvingShowdown] = useState(false);
     const [isShowdownMode, setIsShowdownMode] = useState(false);
     const [resultFlash, setResultFlash] = useState<ResultFlash | null>(null);
+    const [isEndingGame, setIsEndingGame] = useState(false);
+    const [seatNames, setSeatNames] = useState<Record<string, string>>({});
+    const [webcamStatus, setWebcamStatus] = useState<WebcamStatusResponse>({ opponents: {} });
+    const resolvedSessionId = sessionId ?? getSessionCookie();
 
     const legalRequestSeq = useRef(0);
     const nextHandTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -359,6 +525,67 @@ export default function PlayPage() {
         }
     }, []);
 
+    useEffect(() => {
+        if (!resolvedSessionId) {
+            setSeatNames({});
+            setWebcamStatus({ opponents: {} });
+            setManualSeats([]);
+            return;
+        }
+
+        let isCancelled = false;
+        let intervalId: ReturnType<typeof setInterval> | null = null;
+
+        const loadPlayerNames = async () => {
+            try {
+                const res = await fetch(`${BACKEND}/session/webcam/status/${resolvedSessionId}`);
+                if (!res.ok) {
+                    return;
+                }
+                const data: WebcamStatusResponse = await res.json();
+                if (isCancelled) {
+                    return;
+                }
+                const nextSeatNames = Object.fromEntries(
+                    Object.entries(data.opponents ?? {})
+                        .map(([position, opponent]) => [position, opponent.player_name?.trim() ?? ''])
+                        .filter(([, name]) => Boolean(name)),
+                );
+                setSeatNames(nextSeatNames);
+                setWebcamStatus(data);
+                setManualSeats(
+                    Array.isArray(data.manualSeats)
+                        ? data.manualSeats.filter((seat): seat is number => Number.isInteger(seat))
+                        : [],
+                );
+            } catch {
+                // Keep the most recent names if polling temporarily fails.
+            }
+        };
+
+        void loadPlayerNames();
+        intervalId = setInterval(() => {
+            void loadPlayerNames();
+        }, 3000);
+
+        return () => {
+            isCancelled = true;
+            if (intervalId) {
+                clearInterval(intervalId);
+            }
+        };
+    }, [resolvedSessionId]);
+
+    const connectedOpponentSeats = compactSeatMap(
+        Object.entries(webcamStatus.opponents ?? {})
+            .filter(([, opponent]) => opponent.connected)
+            .map(([seat]) => Number(seat))
+            .filter((seat) => Number.isInteger(seat)),
+    );
+    const playerNames = Object.fromEntries(
+        hand.seatMap.map((seat, position) => [String(position), seatNames[String(seat)] ?? '']),
+    );
+
     // ---------------------------------------------------------------------------
     // Session persistence helpers
     // ---------------------------------------------------------------------------
@@ -367,11 +594,15 @@ export default function PlayPage() {
         hand?: HandState;
         sessionStacks?: number[];
         sessionProfit?: number;
+        botSeat?: number | null;
+        manualSeats?: number[];
     }) => {
         const sid = sessionId ?? getSessionCookie();
         if (!sid) return;
         const payload = {
             tableSize,
+            botSeat: overrides?.botSeat ?? botSeat,
+            manualSeats: overrides?.manualSeats ?? manualSeats,
             smallBlind,
             bigBlind,
             buyIn,
@@ -390,7 +621,7 @@ export default function PlayPage() {
         } catch (err) {
             console.error('Session save failed:', err);
         }
-    }, [sessionId, tableSize, smallBlind, bigBlind, buyIn, phase, hand, sessionStacks, sessionProfit]);
+    }, [sessionId, tableSize, botSeat, manualSeats, smallBlind, bigBlind, buyIn, phase, hand, sessionStacks, sessionProfit]);
 
     const createSession = useCallback(async (): Promise<string> => {
         const sid = generateSessionId();
@@ -404,10 +635,12 @@ export default function PlayPage() {
                     session_id: sid,
                     data: {
                         tableSize,
+                        botSeat: HOST_BOT_SEAT,
+                        manualSeats: [],
                         smallBlind,
                         bigBlind,
                         buyIn,
-                        phase: 'setup-size',
+                        phase: 'deal-hole',
                         hand: EMPTY_HAND,
                         sessionStacks: [],
                         sessionProfit: 0,
@@ -433,13 +666,48 @@ export default function PlayPage() {
         }
     }, [sessionId]);
 
+    const endCurrentGame = useCallback(async () => {
+        setIsEndingGame(true);
+        try {
+            if (nextHandTimerRef.current) {
+                clearTimeout(nextHandTimerRef.current);
+                nextHandTimerRef.current = null;
+            }
+            autoResolveSingleLeftRef.current = false;
+            setResumeSessionData(null);
+            setSessionStacks([]);
+            setSessionProfit(0);
+            setHistory([]);
+            setHand(EMPTY_HAND);
+            setPickingFor(null);
+            setPendingRank(null);
+            setRaiseInput('');
+            setShowRaiseInput(false);
+            setLegalActions(EMPTY_LEGAL_ACTIONS);
+            setShowdownEntries([]);
+            setShowdownResult(null);
+            setShowdownError(null);
+            setIsResolvingShowdown(false);
+            setIsShowdownMode(false);
+            setResultFlash(null);
+            setBotSeat(null);
+            setManualSeats([]);
+            setSeatNames({});
+            setWebcamStatus({ opponents: {} });
+            setPhase('setup-details');
+            await deleteCurrentSession();
+        } finally {
+            setIsEndingGame(false);
+        }
+    }, [deleteCurrentSession]);
+
     // Check for existing session on mount
     useEffect(() => {
         const checkSession = async () => {
             const cookie = getSessionCookie();
             if (!cookie) {
                 setIsCheckingSession(false);
-                setPhase('setup-size');
+                setPhase('setup-details');
                 setMounted(true);
                 return;
             }
@@ -459,16 +727,17 @@ export default function PlayPage() {
             // Cookie exists but session not found in Redis — clean up
             clearSessionCookie();
             setIsCheckingSession(false);
-            setPhase('setup-size');
+            setPhase('setup-details');
             setMounted(true);
         };
         checkSession();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const resumeFromSession = useCallback((data: Record<string, unknown>) => {
         const d = data as {
             tableSize: number;
+            botSeat?: number | null;
+            manualSeats?: number[] | null;
             smallBlind: number;
             bigBlind: number;
             buyIn: number;
@@ -477,22 +746,30 @@ export default function PlayPage() {
             sessionStacks: number[];
             sessionProfit: number;
         };
-        setTableSize(d.tableSize);
+        const restoredHand: HandState = {
+            ...EMPTY_HAND,
+            ...d.hand,
+            cvReads: d.hand?.cvReads ?? {},
+            potAggressors: d.hand?.potAggressors ?? [],
+        };
+        const restoredBotSeat = typeof d.botSeat === 'number'
+            ? d.botSeat
+            : restoredHand.seatMap[restoredHand.botPosition] ?? HOST_BOT_SEAT;
+        setBotSeat(restoredBotSeat);
+        setManualSeats(Array.isArray(d.manualSeats) ? d.manualSeats.filter((seat): seat is number => Number.isInteger(seat)) : []);
         setSmallBlind(d.smallBlind);
         setBigBlind(d.bigBlind);
         setBuyIn(d.buyIn);
         setSessionStacks(d.sessionStacks);
         setSessionProfit(d.sessionProfit);
-        setHand(d.hand);
+        setHand(restoredHand);
         // If they were mid-hand in the play phase, restore to deal-hole to let them re-enter cards
         // since hole cards are selected via the card picker UI
         if (d.phase === 'play' || d.phase === 'deal-hole') {
             setPhase('deal-hole');
             setPickingFor('hole');
             // Reset hole cards so they re-pick (they might have changed between sessions)
-            setHand(prev => ({ ...prev, holeCards: [] }));
-        } else if (d.phase === 'deal-position') {
-            setPhase('deal-position');
+            setHand({ ...restoredHand, holeCards: [] });
         } else {
             // For setup phases, just go straight to setup-details so they can start a new hand
             setPhase('setup-details');
@@ -553,7 +830,7 @@ export default function PlayPage() {
             const res = await fetch(`${BACKEND}/poker/legal`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(toBackendGameState(currentHand, bigBlind)),
+                body: JSON.stringify(toBackendGameState(currentHand, bigBlind, sessionId)),
             });
             if (!res.ok) {
                 const detail = await parseError(res);
@@ -569,7 +846,7 @@ export default function PlayPage() {
                 setLegalActions(EMPTY_LEGAL_ACTIONS);
             }
         }
-    }, [bigBlind]);
+    }, [bigBlind, sessionId]);
 
     const stepAction = useCallback(async (
         currentHand: HandState,
@@ -577,7 +854,7 @@ export default function PlayPage() {
     ): Promise<BackendStepResponse> => {
         const payload: BackendStepRequest = {
             ...request,
-            game_state: toBackendGameState(currentHand, bigBlind),
+            game_state: toBackendGameState(currentHand, bigBlind, sessionId),
         };
         const res = await fetch(`${BACKEND}/poker/step`, {
             method: 'POST',
@@ -589,7 +866,7 @@ export default function PlayPage() {
             throw new Error(`API error: ${res.status} ${detail}`);
         }
         return await res.json();
-    }, [bigBlind]);
+    }, [bigBlind, sessionId]);
 
     const queryBot = useCallback(async (currentHand: HandState) => {
         const actorIdx = currentHand.currentPlayerIdx;
@@ -619,6 +896,10 @@ export default function PlayPage() {
         pushHistory(`Select ${rank}${suitSym(suit)}`);
 
         if (pickingFor === 'hole') {
+            if (hand.players.length < 2) {
+                setPendingRank(null);
+                return;
+            }
             const newHole = [...hand.holeCards, card];
             setHand((prev) => ({ ...prev, holeCards: newHole }));
             if (newHole.length >= 2) {
@@ -665,6 +946,8 @@ export default function PlayPage() {
                     preflopCallCount: 0,
                     preflopLastRaiser: null,
                     lastAggressor: null,
+                    cvReads: primeCvReadWindow({}, players, firstToAct),
+                    potAggressors: [],
                     botResponse: null,
                 }));
                 setIsShowdownMode(false);
@@ -701,6 +984,7 @@ export default function PlayPage() {
             currentBet: 0,
             currentPlayerIdx: firstToAct,
             streetRaiseCount: 0,
+            cvReads: primeCvReadWindow(prev.cvReads, players, firstToAct),
             botResponse: null,
         }));
         setIsShowdownMode(false);
@@ -885,7 +1169,7 @@ export default function PlayPage() {
         setShowdownError(null);
         try {
             const payload: BackendResolveRequest = {
-                game_state: toBackendGameState(hand, bigBlind),
+                game_state: toBackendGameState(hand, bigBlind, sessionId),
                 starting_stacks: hand.startingStacks,
                 opponents: showdownEntries.map((entry) => ({
                     player_index: entry.playerIndex,
@@ -910,7 +1194,7 @@ export default function PlayPage() {
         } finally {
             setIsResolvingShowdown(false);
         }
-    }, [applyResolvedHand, bigBlind, hand, isResolvingShowdown, showdownEntries]);
+    }, [applyResolvedHand, bigBlind, hand, isResolvingShowdown, sessionId, showdownEntries]);
 
     const autoResolveSingleLeft = useCallback(async () => {
         if (isResolvingShowdown) return;
@@ -918,7 +1202,7 @@ export default function PlayPage() {
         setShowdownError(null);
         try {
             const payload: BackendResolveRequest = {
-                game_state: toBackendGameState(hand, bigBlind),
+                game_state: toBackendGameState(hand, bigBlind, sessionId),
                 starting_stacks: hand.startingStacks,
                 opponents: [],
             };
@@ -940,22 +1224,23 @@ export default function PlayPage() {
         } finally {
             setIsResolvingShowdown(false);
         }
-    }, [applyResolvedHand, bigBlind, hand, isResolvingShowdown]);
+    }, [applyResolvedHand, bigBlind, hand, isResolvingShowdown, sessionId]);
 
     const startNewHand = useCallback(() => {
+        const nextBotSeat = HOST_BOT_SEAT;
+        const nextSeatMap = compactSeatMap([nextBotSeat, ...manualSeats, ...connectedOpponentSeats]);
         const baseStack = sessionStacks[0] ?? buyIn;
+        const nextHand = buildHandFromSeatMap(nextSeatMap, baseStack, nextBotSeat);
+
         if (nextHandTimerRef.current) {
             clearTimeout(nextHandTimerRef.current);
             nextHandTimerRef.current = null;
         }
         autoResolveSingleLeftRef.current = false;
         setHistory([]);
-        setPhase('deal-position');
-        setHand({
-            ...EMPTY_HAND,
-            players: initPlayers(tableSize, baseStack, 0),
-            startingStacks: Array(tableSize).fill(baseStack),
-        });
+        setBotSeat(nextBotSeat);
+        setPhase('deal-hole');
+        setHand(nextHand);
         setPickingFor(null);
         setPendingRank(null);
         setShowRaiseInput(false);
@@ -970,16 +1255,112 @@ export default function PlayPage() {
 
         // Ensure session exists
         if (!sessionId && !getSessionCookie()) {
-            void createSession();
+            void createSession().then(() => {
+                void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats });
+            });
         } else {
-            void saveSession({ phase: 'deal-position' });
+            void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats });
         }
-    }, [buyIn, createSession, saveSession, sessionId, sessionStacks, tableSize]);
+    }, [buyIn, connectedOpponentSeats, createSession, manualSeats, saveSession, sessionId, sessionStacks]);
+
+    const handleSeatLobbyClick = useCallback((seat: number) => {
+        if (connectedOpponentSeats.includes(seat)) {
+            return;
+        }
+
+        if (seat === HOST_BOT_SEAT) {
+            return;
+        }
+
+        const nextManualSeats = manualSeats.includes(seat)
+            ? manualSeats.filter((value) => value !== seat)
+            : compactSeatMap([...manualSeats, seat]).filter((value) => value !== HOST_BOT_SEAT);
+        setManualSeats(nextManualSeats);
+        const nextSeatMap = compactSeatMap([HOST_BOT_SEAT, ...nextManualSeats, ...connectedOpponentSeats]);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, sessionStacks[0] ?? buyIn, HOST_BOT_SEAT);
+        setHand((prev) => ({
+            ...nextHand,
+            holeCards: prev.holeCards,
+            communityCards: prev.communityCards,
+        }));
+        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: HOST_BOT_SEAT, manualSeats: nextManualSeats });
+    }, [buyIn, connectedOpponentSeats, manualSeats, saveSession, sessionStacks]);
+
+    useEffect(() => {
+        if (phase !== 'deal-hole' || pickingFor === 'showdown') {
+            return;
+        }
+        if (botSeat === null) {
+            return;
+        }
+        const nextSeatMap = compactSeatMap([botSeat, ...manualSeats, ...connectedOpponentSeats]);
+        const currentSeatMap = hand.seatMap ?? [];
+        if (
+            nextSeatMap.length === currentSeatMap.length
+            && nextSeatMap.every((seat, idx) => seat === currentSeatMap[idx])
+        ) {
+            return;
+        }
+
+        const nextHand = buildHandFromSeatMap(nextSeatMap, sessionStacks[0] ?? buyIn, botSeat);
+        setHand((prev) => ({
+            ...nextHand,
+            holeCards: prev.holeCards,
+            communityCards: prev.communityCards,
+        }));
+    }, [botSeat, buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, phase, pickingFor, sessionStacks]);
+
+    useEffect(() => {
+        if (phase !== 'deal-hole') {
+            return;
+        }
+        const occupiedSeatCount = compactSeatMap(
+            botSeat === null ? [...manualSeats, ...connectedOpponentSeats] : [botSeat, ...manualSeats, ...connectedOpponentSeats],
+        ).length;
+        if (occupiedSeatCount < 2) {
+            if (pickingFor === 'hole') {
+                setPickingFor(null);
+                setPendingRank(null);
+            }
+            return;
+        }
+        if (hand.holeCards.length >= 2) {
+            return;
+        }
+        if (pickingFor === null) {
+            setPickingFor('hole');
+        }
+    }, [botSeat, connectedOpponentSeats, hand.holeCards.length, manualSeats, phase, pickingFor]);
 
     useEffect(() => {
         if (phase !== 'play' || hand.isLoading || pickingFor !== null) return;
         void fetchLegalActions(hand, true);
     }, [fetchLegalActions, hand, phase, pickingFor]);
+
+    useEffect(() => {
+        if (phase !== 'play') return;
+        if (isShowdownMode) return;
+        if (pickingFor !== null) return;
+        if (hand.currentPlayerIdx !== -1) return;
+        if (hand.players.filter((player) => player.is_active).length <= 1) return;
+
+        // Re-open the board picker whenever we're between betting rounds
+        // and the board is still incomplete, including after undoing a flop card.
+        const shouldPickCommunity = hand.communityCards.length < 5;
+
+        if (!shouldPickCommunity) return;
+
+        setPendingRank(null);
+        setPickingFor('community');
+    }, [
+        hand.communityCards.length,
+        hand.currentPlayerIdx,
+        hand.players,
+        hand.street,
+        isShowdownMode,
+        phase,
+        pickingFor,
+    ]);
 
     useEffect(() => {
         if (phase !== 'play') {
@@ -1020,6 +1401,65 @@ export default function PlayPage() {
     }, [currentShowdownEntry, isShowdownMode]);
 
     const showdownCanResolve = showdownEntries.every((entry) => entry.mucked || entry.cards.length === 2);
+    const occupiedSeats = compactSeatMap(botSeat === null ? [...manualSeats, ...connectedOpponentSeats] : [botSeat, ...manualSeats, ...connectedOpponentSeats]);
+    const tableStatus = occupiedSeats.length < 2
+        ? 'Click a side seat to add a manual player or wait for a webcam join.'
+        : hand.holeCards.length >= 2
+            ? `Ready for a ${occupiedSeats.length}-handed start.`
+            : `Pick ${2 - hand.holeCards.length} more hole card${hand.holeCards.length === 1 ? '' : 's'} to begin.`;
+    const dealHoleTableSeats: TableSeatVisual[] = Array.from({ length: FULL_RING_SEAT_COUNT }, (_, seat) => {
+        const isBot = seat === HOST_BOT_SEAT;
+        const isConnected = connectedOpponentSeats.includes(seat);
+        const isManual = manualSeats.includes(seat);
+        const role = getCompactRoleForSeat(seat, occupiedSeats);
+        return {
+            seat,
+            title: getSeatLabel(seat),
+            subtitle: isBot ? 'Bot' : isConnected ? (seatNames[String(seat)]?.trim() || `Player ${seat + 1}`) : isManual ? 'Manual Player' : 'Open',
+            detail: role ?? (isBot ? 'Host' : isConnected ? 'Webcam' : isManual ? 'Host Seated' : 'Available'),
+            tone: isBot ? 'bot' : isConnected ? 'connected' : isManual ? 'manual' : 'open',
+            onClick: phase === 'deal-hole' && !isConnected && !isBot ? () => handleSeatLobbyClick(seat) : null,
+            disabled: phase !== 'deal-hole' || isConnected || isBot,
+        };
+    });
+    const playSeatByPhysicalSeat = new Map(hand.seatMap.map((seat, idx) => [seat, { player: hand.players[idx], compactPosition: idx }]));
+    const playTableSeats: TableSeatVisual[] = Array.from({ length: FULL_RING_SEAT_COUNT }, (_, seat) => {
+        const seatEntry = playSeatByPhysicalSeat.get(seat);
+        if (!seatEntry) {
+            return {
+                seat,
+                title: getSeatLabel(seat),
+                subtitle: 'Open',
+                detail: 'Empty',
+                tone: 'open',
+            };
+        }
+        const player = seatEntry.player;
+        const role = getCompactRoleForSeat(seat, hand.seatMap) ?? getTablePosition(seatEntry.compactPosition, hand.players.length);
+        const displayName = player.is_bot ? 'Bot' : (playerNames[String(seatEntry.compactPosition)]?.trim() || `Player ${seat + 1}`);
+        return {
+            seat,
+            title: getSeatLabel(seat),
+            subtitle: displayName,
+            detail: `${role} | ${player.stack}${player.bet > 0 ? ` bet ${player.bet}` : ''}`,
+            tone: player.is_bot ? 'bot' : !player.is_active ? 'folded' : seatEntry.compactPosition === hand.currentPlayerIdx ? 'active' : 'normal',
+        };
+    });
+    const showEndGameButton = phase !== 'resume-prompt'
+        && (sessionId !== null || getSessionCookie() !== null || sessionStacks.length > 0);
+    const endGameButton = showEndGameButton ? (
+        <div className="fixed right-4 top-4 z-50">
+            <button
+                onClick={() => {
+                    void endCurrentGame();
+                }}
+                disabled={isEndingGame}
+                className="rounded-xl border border-rose-500/40 bg-slate-950/85 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-rose-200 shadow-lg shadow-black/30 backdrop-blur transition-all hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+                {isEndingGame ? 'Ending Game...' : 'End Game'}
+            </button>
+        </div>
+    ) : null;
 
     if (!mounted) return null;
 
@@ -1029,7 +1469,7 @@ export default function PlayPage() {
             smallBlind: (resumeSessionData.smallBlind as number) ?? 1,
             bigBlind: (resumeSessionData.bigBlind as number) ?? 2,
             buyIn: (resumeSessionData.buyIn as number) ?? 200,
-            phase: (resumeSessionData.phase as string) ?? 'setup-size',
+            phase: (resumeSessionData.phase as string) ?? 'setup-details',
             sessionProfit: (resumeSessionData.sessionProfit as number) ?? 0,
             botStack: (() => {
                 const h = resumeSessionData.hand as HandState | undefined;
@@ -1049,80 +1489,42 @@ export default function PlayPage() {
                 onStartFresh={async () => {
                     await deleteCurrentSession();
                     setResumeSessionData(null);
-                    setPhase('setup-size');
+                    setBotSeat(null);
+                    setManualSeats([]);
+                    setSeatNames({});
+                    setWebcamStatus({ opponents: {} });
+                    setPhase('setup-details');
                 }}
-            />
-        );
-    }
-
-    if (phase === 'setup-size') {
-        return (
-            <SetupSize
-                tableSize={tableSize}
-                setTableSize={setTableSize}
-                onContinue={() => setPhase('setup-details')}
             />
         );
     }
 
     if (phase === 'setup-details') {
         return (
-            <SetupDetails
-                hasSession={sessionStacks.length > 0}
-                sessionStacks={sessionStacks}
-                sessionProfit={sessionProfit}
-                smallBlind={smallBlind}
-                setSmallBlind={setSmallBlind}
-                bigBlind={bigBlind}
-                setBigBlind={setBigBlind}
-                buyIn={buyIn}
-                setBuyIn={setBuyIn}
-                onBack={() => setPhase('setup-size')}
-                onStart={() => {
-                    if (sessionStacks.length === 0) {
-                        setSessionStacks(Array(tableSize).fill(buyIn));
-                    }
-                    startNewHand();
-                }}
-                onEnd={() => {
-                    setSessionStacks([]);
-                    setSessionProfit(0);
-                    setPhase('setup-size');
-                    void deleteCurrentSession();
-                }}
-            />
-        );
-    }
-
-    if (phase === 'deal-position') {
-        return (
             <>
-                <DealPosition
-                    tableSize={tableSize}
-                    onSelectSeat={(i) => {
-                        pushHistory('Set position');
-                        const players = initPlayers(tableSize, sessionStacks[0] ?? buyIn, i);
-                        setHand((prev) => ({
-                            ...prev,
-                            botPosition: i,
-                            players,
-                            startingStacks: players.map((p) => p.stack),
-                            currentPlayerIdx: 0,
-                            streetRaiseCount: 0,
-                            preflopRaiseCount: 0,
-                            preflopCallCount: 0,
-                            preflopLastRaiser: null,
-                            lastAggressor: null,
-                        }));
-                        setPhase('deal-hole');
-                        setPickingFor('hole');
+                {endGameButton}
+                <SetupDetails
+                    hasSession={sessionStacks.length > 0}
+                    sessionStacks={sessionStacks}
+                    sessionProfit={sessionProfit}
+                    smallBlind={smallBlind}
+                    setSmallBlind={setSmallBlind}
+                    bigBlind={bigBlind}
+                    setBigBlind={setBigBlind}
+                    buyIn={buyIn}
+                    setBuyIn={setBuyIn}
+                    showBack={false}
+                    onBack={() => undefined}
+                    onStart={() => {
+                        if (sessionStacks.length === 0) {
+                            setSessionStacks([buyIn]);
+                        }
+                        startNewHand();
                     }}
-                    canUndo={history.length > 0}
-                    onUndo={undo}
+                    onEnd={() => {
+                        void endCurrentGame();
+                    }}
                 />
-                <div className="px-2 pb-2">
-                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
-                </div>
             </>
         );
     }
@@ -1153,33 +1555,29 @@ export default function PlayPage() {
     if (phase === 'deal-hole') {
         return (
             <>
+                {endGameButton}
                 <DealHoleCards
                     botPosition={hand.botPosition}
                     holeCards={hand.holeCards}
                     players={hand.players}
+                    tableSeats={dealHoleTableSeats}
+                    tableStatus={tableStatus}
                     canUndo={history.length > 0}
                     onUndo={undo}
                 >
                     <CardSelector {...commonCardSelectorProps} />
                 </DealHoleCards>
                 <div className="px-2 pb-2">
-                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                    <WebcamStatus sessionId={resolvedSessionId} tableSize={tableSize} botSeat={botSeat} />
                 </div>
             </>
         );
     }
 
     if (phase === 'play') {
-        const canOpenCommunityPicker = (
-            hand.currentPlayerIdx === -1
-            && (
-                (hand.street === 'preflop' && hand.communityCards.length === 0)
-                || (hand.street === 'flop' && hand.communityCards.length === 3)
-                || (hand.street === 'turn' && hand.communityCards.length === 4)
-            )
-        );
         return (
             <>
+                {endGameButton}
                 <PlayPhase
                     pot={hand.pot}
                     currentBet={hand.currentBet}
@@ -1189,6 +1587,8 @@ export default function PlayPage() {
                     communityCards={hand.communityCards}
                     street={hand.street}
                     players={hand.players}
+                    playerNames={playerNames}
+                    tableSeats={playTableSeats}
                     currentPlayerIdx={hand.currentPlayerIdx}
                     isLoading={hand.isLoading}
                     botResponse={hand.botResponse}
@@ -1196,11 +1596,6 @@ export default function PlayPage() {
                     setShowRaiseInput={setShowRaiseInput}
                     raiseInput={raiseInput}
                     setRaiseInput={setRaiseInput}
-                    onOpenCommunityPicker={() => {
-                        if (!canOpenCommunityPicker) return;
-                        pushHistory('Open card picker');
-                        setPickingFor('community');
-                    }}
                     onQueryBot={() => queryBot(hand)}
                     onRecordAction={recordOpponentAction}
                     onUndo={undo}
@@ -1222,7 +1617,7 @@ export default function PlayPage() {
                     <CardSelector {...commonCardSelectorProps} />
                 </PlayPhase>
                 <div className="px-2 pb-2">
-                    <WebcamStatus sessionId={sessionId} tableSize={tableSize} />
+                    <WebcamStatus sessionId={resolvedSessionId} tableSize={tableSize} botSeat={botSeat} />
                 </div>
             </>
         );

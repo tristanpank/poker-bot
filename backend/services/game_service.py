@@ -52,6 +52,7 @@ from preflop_blueprint_v24 import (  # noqa: E402
     BUILTIN_PREFLOP_BLUEPRINT_NAME,
     preflop_blueprint_policy as preflop_blueprint_policy_v24,
 )
+from position_abstraction import canonical_late_position_index  # noqa: E402
 from preflop_blueprint_v25 import preflop_blueprint_policy as preflop_blueprint_policy_v25  # noqa: E402
 from poker_state_v24 import encode_info_state as encode_info_state_v24  # noqa: E402
 from poker_state_v25 import (  # noqa: E402
@@ -508,7 +509,8 @@ class GameService:
         big_blind = max(1, int(game_state.big_blind))
         if current_bet <= big_blind:
             return None
-        by_seat = {int(player.position) % 6: player for player in game_state.players}
+        player_count = max(1, len(game_state.players))
+        by_seat = {int(player.position) % player_count: player for player in game_state.players}
         candidates = [
             seat
             for seat, player in by_seat.items()
@@ -763,15 +765,17 @@ class GameService:
         hole_cards = [card_schema_to_pokerkit(card) for card in actor.hole_cards]
         to_call_bb = float(max(0, int(game_state.current_bet) - int(actor.bet))) / float(max(1, int(game_state.big_blind)))
         blueprint_policy = preflop_blueprint_policy_v25 if version_to_int(resolved_version) >= 25 else preflop_blueprint_policy_v24
+        player_count = max(2, len(game_state.players))
         policy, meta = blueprint_policy(
             hole_cards=hole_cards,
-            actor_seat=int(actor.position) % 6,
+            actor_seat=int(actor.position) % player_count,
             legal_mask=legal_mask,
             effective_stack_bb=self._effective_stack_bb_for_actor(game_state, actor_index),
             to_call_bb=to_call_bb,
             preflop_raise_count=int(self._estimated_preflop_raise_count(game_state)),
             preflop_call_count=int(self._estimated_preflop_call_count(game_state, actor_index)),
             aggressor_seat=self._estimated_preflop_last_raiser_position(game_state),
+            player_count=player_count,
             blueprint_name=BUILTIN_PREFLOP_BLUEPRINT_NAME,
         )
         if float(np.asarray(policy, dtype=np.float32).sum()) <= 1e-8 or not bool(meta.get("covered", False)):
@@ -1242,8 +1246,10 @@ class GameService:
         if not ordered_players:
             raise ValueError("Cannot build next hand state without players")
         rotated_players = ordered_players[1:] + ordered_players[:1]
+        current_seat_map = list(game_state.seat_map or [])
 
         next_players: list[PlayerState] = []
+        next_seat_map: list[int] = []
         next_bot_position = 0
         for new_position, (old_index, old_player) in enumerate(rotated_players):
             stack = final_stacks[old_index]
@@ -1258,6 +1264,8 @@ class GameService:
                 has_acted=False,
             )
             next_players.append(next_player)
+            if 0 <= old_index < len(current_seat_map):
+                next_seat_map.append(int(current_seat_map[old_index]))
             if old_player.is_bot:
                 next_bot_position = new_position
 
@@ -1273,6 +1281,7 @@ class GameService:
             pot=0,
             players=next_players,
             bot_position=next_bot_position,
+            seat_map=next_seat_map or None,
             starting_stacks=[int(player.stack) for player in next_players],
             current_bet=0,
             big_blind=int(game_state.big_blind),
@@ -1390,10 +1399,11 @@ class GameService:
         obs[59] = _has_flush_draw(hole_cards + board_cards)
         obs[60] = _current_hand_strength_scalar(hole_cards, board_cards, num_opponents=active_opponents)
 
-        hero_seat = bot_player.position % 6
-        obs[61 + hero_seat] = 1.0
-
         player_count = max(1, len(game_state.players))
+        hero_seat = bot_player.position % player_count
+        hero_position_bucket = canonical_late_position_index(player_count, hero_seat)
+        obs[61 + hero_position_bucket] = 1.0
+
         active_flags = [False] * player_count
         for player in game_state.players:
             seat = int(player.position) % player_count
@@ -1445,7 +1455,7 @@ class GameService:
                 if 0 <= action_id < min(spec.action_dim, 5):
                     obs[81 + action_id] = 1.0
 
-        by_seat = {player.position % 6: player for player in game_state.players}
+        by_seat = {player.position % max(1, player_count): player for player in game_state.players}
         for offset in range(6):
             seat = (hero_seat + offset) % 6
             seat_player = by_seat.get(seat)

@@ -1,21 +1,11 @@
-# Training dependencies
+# Full repo environment
+
+# Backend runtime and test dependencies
+-r backend/requirements.txt
+
+# Training and notebook dependencies
 rlcard
-torch
 matplotlib
 seaborn
 jupyter
-numpy
-pokerkit
 gymnasium
-
-# Backend API dependencies
-fastapi
-uvicorn[standard]
-pydantic-settings
-aiortc
-redis
-
-# Testing
-pytest
-pytest-asyncio
-httpx

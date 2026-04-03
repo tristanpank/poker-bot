@@ -1,9 +1,11 @@
 """Tests for backend CV analysis endpoints."""
 
 import base64
+import logging
 from fastapi.testclient import TestClient
 
 from backend.main import app
+from backend.services.cv_service import CvService
 
 
 def _rgba_base64(width: int, height: int) -> str:
@@ -59,6 +61,7 @@ def test_cv_analyze_returns_metrics() -> None:
     assert "bluffRisk" in metrics
     assert "analysisFps" in metrics
     assert "streamFps" in metrics
+    assert metrics["analysisSource"] == "theali29/Lie-Detector"
     assert metrics["streamFps"] == 24.2
 
 
@@ -118,6 +121,7 @@ def test_cv_analyze_raw_returns_metrics() -> None:
 
     data = response.json()
     assert "metrics" in data
+    assert data["metrics"]["analysisSource"] == "theali29/Lie-Detector"
     assert data["metrics"]["streamFps"] == 27.7
 
 
@@ -149,3 +153,21 @@ def test_cv_session_delete_returns_ok() -> None:
     )
     assert response.status_code == 200
     assert response.json()["ok"] is True
+
+
+def test_cv_service_logs_session_heartbeat(caplog) -> None:
+    service = CvService()
+
+    with caplog.at_level(logging.INFO):
+        service.analyze_raw(
+            session_id="log-test-session",
+            timestamp=1_000,
+            width=8,
+            height=8,
+            stream_fps=24.0,
+            rgba_bytes=_rgba_bytes(8, 8),
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Created CV session log-test-session" in message for message in messages)
+    assert any("CV heartbeat session=log-test-session" in message for message in messages)

@@ -6,6 +6,8 @@ from typing import Optional, Sequence
 import numpy as np
 from pokerkit import Card
 
+from position_abstraction import canonical_late_position_index
+
 ACTION_FOLD = 0
 ACTION_CHECK = 1
 ACTION_CALL = 2
@@ -431,6 +433,7 @@ def preflop_blueprint_policy(
     preflop_raise_count: int,
     preflop_call_count: int,
     aggressor_seat: Optional[int],
+    player_count: int = 6,
     blueprint_name: str = BUILTIN_PREFLOP_BLUEPRINT_NAME,
 ) -> tuple[np.ndarray, dict[str, object]]:
     if str(blueprint_name or BUILTIN_PREFLOP_BLUEPRINT_NAME) not in SUPPORTED_PREFLOP_BLUEPRINTS:
@@ -444,7 +447,13 @@ def preflop_blueprint_policy(
     combo_pct = combo_percentile_for_hand_key(hand_key)
     stack_bucket = preflop_stack_bucket(effective_stack_bb)
     spot_name = "rfi"
-    in_position = _is_in_position(actor_seat, aggressor_seat)
+    canonical_actor_seat = canonical_late_position_index(player_count, actor_seat)
+    canonical_aggressor_seat = (
+        canonical_late_position_index(player_count, aggressor_seat)
+        if aggressor_seat is not None
+        else None
+    )
+    in_position = _is_in_position(canonical_actor_seat, canonical_aggressor_seat)
 
     if int(preflop_raise_count) <= 0:
         if int(actor_seat) == 1 and float(to_call_bb) <= 1e-6 and int(preflop_call_count) > 0:
@@ -461,8 +470,8 @@ def preflop_blueprint_policy(
     chart = _build_chart(
         stack_bucket,
         spot_name,
-        int(actor_seat),
-        int(aggressor_seat) if aggressor_seat is not None else -1,
+        int(canonical_actor_seat),
+        int(canonical_aggressor_seat) if canonical_aggressor_seat is not None else -1,
         bool(in_position),
     )
     primary_semantic, secondary_semantic = chart.get(hand_key, ("fold", "fold"))
@@ -472,18 +481,26 @@ def preflop_blueprint_policy(
     primary_weight = 1.0
 
     if spot_name == "rfi":
-        threshold = _open_raise_percent(actor_seat, stack_bucket)
+        threshold = _open_raise_percent(canonical_actor_seat, stack_bucket)
         if int(actor_seat) == 0 and primary_semantic == "complete":
-            threshold = _open_complete_percent(actor_seat, stack_bucket)
+            threshold = _open_complete_percent(canonical_actor_seat, stack_bucket)
         primary_weight = _mix_weight(combo_pct, threshold)
     elif spot_name == "bb_vs_sb_complete":
         threshold = 0.36 if stack_bucket == "deep" else (0.40 if stack_bucket == "medium" else 0.44)
         primary_weight = _mix_weight(combo_pct, threshold)
     elif spot_name == "vs_rfi":
-        threshold, call_threshold = _vs_rfi_thresholds(actor_seat, aggressor_seat, stack_bucket)
+        threshold, call_threshold = _vs_rfi_thresholds(
+            canonical_actor_seat,
+            canonical_aggressor_seat,
+            stack_bucket,
+        )
         primary_weight = _mix_weight(combo_pct, threshold if primary_semantic.startswith("three_bet") or primary_semantic == "jam" else call_threshold)
     elif spot_name == "vs_3bet":
-        threshold, call_threshold = _vs_three_bet_thresholds(actor_seat, aggressor_seat, stack_bucket)
+        threshold, call_threshold = _vs_three_bet_thresholds(
+            canonical_actor_seat,
+            canonical_aggressor_seat,
+            stack_bucket,
+        )
         primary_weight = _mix_weight(combo_pct, threshold if primary_semantic in {"four_bet", "jam"} else call_threshold)
     elif spot_name == "vs_4bet_plus":
         threshold, call_threshold = _vs_four_bet_thresholds(stack_bucket)

@@ -53,6 +53,25 @@ async def test_generate_code(mock_redis):
 
 
 @pytest.mark.asyncio
+async def test_generate_code_reuses_existing_code_for_same_session(mock_redis):
+    """POST /session/webcam/generate-code returns the same code for the same session."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        first_resp = await ac.post(
+            "/session/webcam/generate-code",
+            json={"session_id": "test-session-reuse"},
+        )
+        second_resp = await ac.post(
+            "/session/webcam/generate-code",
+            json={"session_id": "test-session-reuse"},
+        )
+
+    assert first_resp.status_code == 200
+    assert second_resp.status_code == 200
+    assert first_resp.json()["code"] == second_resp.json()["code"]
+
+
+@pytest.mark.asyncio
 async def test_join_with_valid_code(mock_redis):
     """POST /session/webcam/join succeeds with a valid code and returns session info."""
     transport = ASGITransport(app=app)
@@ -131,8 +150,33 @@ async def test_status_shows_connected_opponents(mock_redis):
         status_resp = await ac.get("/session/webcam/status/test-session-4")
     assert status_resp.status_code == 200
     data = status_resp.json()
+    assert data["sessionActive"] is True
     assert data["opponents"]["1"]["connected"] is True
     assert data["opponents"]["4"]["connected"] is True
+
+
+@pytest.mark.asyncio
+async def test_status_by_code_shows_connected_opponents(mock_redis):
+    """GET /session/webcam/status-by-code/{code} exposes seat availability for joins."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        gen_resp = await ac.post(
+            "/session/webcam/generate-code",
+            json={"session_id": "test-session-status-by-code"},
+        )
+        code = gen_resp.json()["code"]
+
+        await ac.post("/session/webcam/join", json={"code": code, "player_position": 2})
+        await ac.post("/session/webcam/join", json={"code": code, "player_position": 5})
+
+        status_resp = await ac.get(f"/session/webcam/status-by-code/{code}")
+
+    assert status_resp.status_code == 200
+    data = status_resp.json()
+    assert data["session_id"] == "test-session-status-by-code"
+    assert data["sessionActive"] is True
+    assert data["opponents"]["2"]["connected"] is True
+    assert data["opponents"]["5"]["connected"] is True
 
 
 @pytest.mark.asyncio
@@ -142,7 +186,14 @@ async def test_status_empty_session(mock_redis):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/session/webcam/status/nonexistent")
     assert resp.status_code == 200
-    assert resp.json() == {"opponents": {}}
+    assert resp.json() == {
+        "sessionActive": False,
+        "opponents": {},
+        "code": None,
+        "tableSize": None,
+        "botPosition": None,
+        "manualSeats": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -169,3 +220,35 @@ async def test_disconnect_marks_opponent_disconnected(mock_redis):
         status_resp = await ac.get("/session/webcam/status/test-session-5")
     data = status_resp.json()
     assert data["opponents"]["2"]["connected"] is False
+
+
+@pytest.mark.asyncio
+async def test_delete_session_ends_webcam_session(mock_redis):
+    """Deleting the host session invalidates the webcam code and status."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        gen_resp = await ac.post(
+            "/session/webcam/generate-code",
+            json={"session_id": "test-session-6"},
+        )
+        code = gen_resp.json()["code"]
+
+        delete_resp = await ac.delete("/session/test-session-6")
+        assert delete_resp.status_code == 204
+
+        join_resp = await ac.post(
+            "/session/webcam/join",
+            json={"code": code, "player_position": 1},
+        )
+        status_resp = await ac.get("/session/webcam/status/test-session-6")
+
+    assert join_resp.status_code == 404
+    assert status_resp.status_code == 200
+    assert status_resp.json() == {
+        "sessionActive": False,
+        "opponents": {},
+        "code": None,
+        "tableSize": None,
+        "botPosition": None,
+        "manualSeats": [],
+    }

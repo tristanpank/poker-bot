@@ -10,6 +10,7 @@ if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
 from preflop_blueprint_v24 import canonical_preflop_hand_key, combo_percentile_for_hand_key
+from position_abstraction import canonical_late_position_index
 
 BASE_STATE_DIM_V24 = 80
 ACTION_COUNT_V24 = 5
@@ -543,7 +544,8 @@ def encode_info_state(
 
     street_idx = street_from_board_len(len(board_cards))
     vec[STREET_SLICE_V24.start + street_idx] = 1.0
-    vec[POSITION_SLICE_V24.start + (hero_seat % len(POSITION_NAMES_V21))] = 1.0
+    position_bucket = canonical_late_position_index(player_count, hero_seat)
+    vec[POSITION_SLICE_V24.start + position_bucket] = 1.0
 
     active_players = sum(1 for flag in active_flags if flag)
     players_behind = sum(1 for seat in range(player_count) if seat != hero_seat and active_flags[seat] and seat > hero_seat)

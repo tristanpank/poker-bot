@@ -95,3 +95,15 @@ async def webrtc_offer(
         raise HTTPException(
             status_code=400, detail=f"WebRTC offer failed: {str(exc)}"
         ) from exc
+
+
+@router.get("/webrtc/status")
+async def webrtc_status(
+    webrtc_service: WebRtcIngestService = Depends(get_webrtc_service),
+) -> dict[str, object]:
+    """Return a debug snapshot of active WebRTC CV ingest sessions."""
+    sessions = webrtc_service.list_active_sessions()
+    return {
+        "activeStreamCount": len(sessions),
+        "sessions": sessions,
+    }
