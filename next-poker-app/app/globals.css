@@ -20,10 +20,15 @@
   }
 }
 
-body {
-  background: var(--background);
+html, body {
+  background: #020617;
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  min-height: 100%;
+}
+
+body {
+  background: #020617;
 }
 
 @theme {
@@ -129,6 +134,7 @@ body {
   -webkit-font-smoothing: antialiased;
   background-image: linear-gradient(135deg, #0f172a 0%, #020617 100%);
   background-attachment: fixed;
+  background-size: cover;
   display: flex;
   justify-content: center;
 }

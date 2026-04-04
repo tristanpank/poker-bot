@@ -198,7 +198,7 @@ export default function PlayPhase({
 
     return (
         <div className="flex-1 flex flex-col">
-            <header className="p-2 px-3 flex justify-between items-center border-b border-[var(--color-border-color)] bg-slate-950/30 sticky top-0 z-10">
+            <header className="p-2 px-3 flex justify-between items-center border-b border-[var(--color-border-color)] bg-slate-950/30">
                 <div className="flex flex-col gap-0">
                     <div className="flex items-center gap-1.5">
                         <span className="text-base text-[var(--color-accent)]">{"\u2660"}</span>
@@ -473,10 +473,10 @@ export default function PlayPhase({
             {resultFlash && (
                 <div
                     className={`fixed top-2 left-1/2 -translate-x-1/2 z-30 px-3 py-1 rounded-lg border shadow-lg ${resultFlash.result === 'won'
-                            ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
-                            : resultFlash.result === 'lost'
-                                ? 'border-red-400/60 bg-red-500/20 text-red-200'
-                                : 'border-slate-400/60 bg-slate-700/30 text-slate-100'
+                        ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                        : resultFlash.result === 'lost'
+                            ? 'border-red-400/60 bg-red-500/20 text-red-200'
+                            : 'border-slate-400/60 bg-slate-700/30 text-slate-100'
                         }`}
                 >
                     <p className="text-xs font-bold">
