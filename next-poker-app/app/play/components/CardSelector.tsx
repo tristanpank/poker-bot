@@ -58,6 +58,10 @@ export default function CardSelector({
                     </div>
                     <button onClick={() => setPendingRank(null)} className="text-[10px] text-[var(--color-text-secondary)] hover:text-white mt-0.5">&larr; Back to ranks</button>
                 </div>
+            ) : pickingFor === 'community' && communityCardsCount >= 5 ? (
+                <div className="py-6 text-center text-xs font-semibold text-emerald-400">
+                    Maximum 5 community cards reached. Click Confirm to continue.
+                </div>
             ) : (
                 <div className="grid grid-cols-7 gap-1">
                     {RANKS.map(r => {

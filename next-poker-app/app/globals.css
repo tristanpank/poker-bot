@@ -20,10 +20,15 @@
   }
 }
 
-body {
-  background: var(--background);
+html, body {
+  background: #020617;
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  min-height: 100%;
+}
+
+body {
+  background: #020617;
 }
 
 @theme {
@@ -118,16 +123,18 @@ body {
 }
 
 .design-page-wrapper {
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  min-height: 100vh;
   margin: 0;
   padding: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   font-family: 'Outfit', sans-serif;
   color: var(--color-text-primary);
   -webkit-font-smoothing: antialiased;
   background-image: linear-gradient(135deg, #0f172a 0%, #020617 100%);
   background-attachment: fixed;
+  background-size: cover;
   display: flex;
   justify-content: center;
 }
