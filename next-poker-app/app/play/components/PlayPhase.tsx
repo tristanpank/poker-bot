@@ -236,15 +236,20 @@ export default function PlayPhase({
                         center={(
                             <div className="flex flex-col items-center gap-2">
                                 <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-[0.18em]">{street}</p>
-                                <div className="flex flex-wrap justify-center gap-1.5">
-                                    {communityCards.length > 0 ? communityCards.map((c, i) => (
-                                        <div key={i} className={`card-mini suit-${c.suit} scale-90 origin-left`}>
-                                            <span className="card-rank">{c.rank}</span>
-                                            <span className="card-suit">{suitSym(c.suit)}</span>
-                                        </div>
-                                    )) : (
-                                        <p className="text-xs text-slate-500 italic">No board yet</p>
-                                    )}
+                                <div className="flex items-center justify-center -space-x-2 scale-105">
+                                    {[0, 1, 2, 3, 4].map((i) => {
+                                        const c = communityCards[i];
+                                        return c ? (
+                                            <div key={i} className={`card-mini suit-${c.suit} scale-75`}>
+                                                <span className="card-rank">{c.rank}</span>
+                                                <span className="card-suit">{suitSym(c.suit)}</span>
+                                            </div>
+                                        ) : (
+                                            <div key={i} className="card-mini card-placeholder scale-75 opacity-40">
+                                                <span className="text-base">?</span>
+                                            </div>
+                                        );
+                                    })}
                                 </div>
                                 <div className="flex items-center gap-3 text-xs font-semibold text-[var(--color-text-primary)]">
                                     <span>Pot {pot}</span>
