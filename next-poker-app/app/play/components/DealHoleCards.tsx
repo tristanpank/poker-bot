@@ -42,7 +42,7 @@ export default function DealHoleCards({
                 center={(
                     <div className="flex flex-col items-center gap-3">
                         <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-secondary)]">Preflop</p>
-                        <div className="flex items-center justify-center gap-1.5">
+                        <div className="flex items-center justify-center -space-x-2 scale-105">
                             {[0, 1, 2, 3, 4].map((i) => (
                                 <div key={i} className="card-mini card-placeholder scale-75 opacity-40">
                                     <span className="text-base">?</span>

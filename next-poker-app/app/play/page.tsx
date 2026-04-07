@@ -892,6 +892,11 @@ export default function PlayPage() {
     }, [fetchLegalActions, saveSession, stepAction]);
 
     const selectCard = useCallback((rank: string, suit: string) => {
+        if (pickingFor === 'community' && hand.communityCards.length >= 5) {
+            setPendingRank(null);
+            return;
+        }
+
         const card: Card = { rank, suit };
         pushHistory(`Select ${rank}${suitSym(suit)}`);
 
@@ -958,8 +963,39 @@ export default function PlayPage() {
             }
         } else if (pickingFor === 'community') {
             const newComm = [...hand.communityCards, card];
-            const street = getStreetFromBoardCount(newComm.length);
-            setHand((prev) => ({ ...prev, communityCards: newComm, street }));
+            const newStreet = getStreetFromBoardCount(newComm.length);
+
+            // At each street boundary (flop=3, turn=4, river=5), close the picker
+            // and start a new betting round automatically.
+            const isStreetBoundary = newComm.length === 3 || newComm.length === 4 || newComm.length === 5;
+            if (isStreetBoundary) {
+                const players = hand.players.map((p) => ({ ...p, bet: 0, has_acted: false }));
+                const firstToAct = players.length === 2
+                    ? firstActivePlayerFrom(players, 1)
+                    : firstActivePlayerFrom(players, 0);
+
+                setPickingFor(null);
+                setShowRaiseInput(false);
+                setRaiseInput('');
+                setHand((prev) => ({
+                    ...prev,
+                    communityCards: newComm,
+                    street: newStreet,
+                    players,
+                    currentBet: 0,
+                    currentPlayerIdx: firstToAct,
+                    streetRaiseCount: 0,
+                    cvReads: primeCvReadWindow(prev.cvReads, players, firstToAct),
+                    botResponse: null,
+                }));
+                setIsShowdownMode(false);
+                setShowdownEntries([]);
+                setShowdownResult(null);
+                setShowdownError(null);
+                setLegalActions(EMPTY_LEGAL_ACTIONS);
+            } else {
+                setHand((prev) => ({ ...prev, communityCards: newComm, street: newStreet }));
+            }
         }
 
         setPendingRank(null);
@@ -1418,6 +1454,7 @@ export default function PlayPage() {
             subtitle: isBot ? 'Bot' : isConnected ? (seatNames[String(seat)]?.trim() || `Player ${seat + 1}`) : isManual ? 'Manual Player' : 'Open',
             detail: role ?? (isBot ? 'Host' : isConnected ? 'Webcam' : isManual ? 'Host Seated' : 'Available'),
             tone: isBot ? 'bot' : isConnected ? 'connected' : isManual ? 'manual' : 'open',
+            isDealer: role === 'BTN' || role === 'SB/BTN',
             onClick: phase === 'deal-hole' && !isConnected && !isBot ? () => handleSeatLobbyClick(seat) : null,
             disabled: phase !== 'deal-hole' || isConnected || isBot,
         };
@@ -1442,7 +1479,13 @@ export default function PlayPage() {
             title: getSeatLabel(seat),
             subtitle: displayName,
             detail: `${role} | ${player.stack}${player.bet > 0 ? ` bet ${player.bet}` : ''}`,
-            tone: player.is_bot ? 'bot' : !player.is_active ? 'folded' : seatEntry.compactPosition === hand.currentPlayerIdx ? 'active' : 'normal',
+            isDealer: role === 'BTN' || role === 'SB/BTN',
+            tone: (() => {
+                const isCurrentActor = seatEntry.compactPosition === hand.currentPlayerIdx;
+                if (isCurrentActor) return player.is_bot ? 'bot' : 'active';
+                if (!player.is_active) return 'folded';
+                return 'normal';
+            })(),
         };
     });
     const showEndGameButton = phase !== 'resume-prompt'

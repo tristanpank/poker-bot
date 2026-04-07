@@ -20,7 +20,7 @@ export default function PlayLayout({
     return (
         <div className="design-page-wrapper">
             <div className="design-mobile-container">
-                <div className="w-full max-w-[480px] h-screen flex flex-col relative no-select [background:radial-gradient(circle_at_top_right,rgba(59,130,246,0.1),transparent_40%),radial-gradient(circle_at_bottom_left,rgba(16,185,129,0.05),transparent_40%)]">
+                <div className="w-full max-w-[480px] h-screen flex flex-col relative no-select" style={{ background: 'radial-gradient(circle at top right, rgba(59,130,246,0.1), transparent 40%), radial-gradient(circle at bottom left, rgba(16,185,129,0.05), transparent 40%)', backgroundAttachment: 'fixed' }}>
                     {children}
                 </div>
             </div>
