@@ -76,6 +76,14 @@ export default function DealPosition({
                                 <span className="mt-1 text-[10px] uppercase tracking-[0.16em] text-white/55">
                                     {role ?? (isBotSeat ? 'Waiting' : isConnectedSeat ? 'Webcam' : isManualSeat ? 'Host Seated' : 'Empty')}
                                 </span>
+                                {isBotSeat && (
+                                    <span
+                                        className="absolute -top-2 -left-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border-2 border-slate-900 bg-amber-400 text-[11px] shadow-[0_0_8px_rgba(251,191,36,0.6)]"
+                                        title="Host"
+                                    >
+                                        👑
+                                    </span>
+                                )}
                             </button>
                         );
                     })}

@@ -1480,6 +1480,7 @@ export default function PlayPage() {
             subtitle: displayName,
             detail: `${role} | ${player.stack}${player.bet > 0 ? ` bet ${player.bet}` : ''}`,
             isDealer: role === 'BTN' || role === 'SB/BTN',
+            isBot: player.is_bot,
             tone: (() => {
                 const isCurrentActor = seatEntry.compactPosition === hand.currentPlayerIdx;
                 if (isCurrentActor) return player.is_bot ? 'bot' : 'active';
