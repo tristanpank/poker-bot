@@ -5,7 +5,7 @@ import Link from 'next/link';
 export default function HomePage() {
   return (
     <div className="design-page-wrapper">
-      <div className="design-mobile-container flex flex-col items-center justify-center px-4 md:px-6 relative overflow-hidden h-full">
+      <div className="design-mobile-container flex flex-col items-center justify-center px-4 md:px-6 relative overflow-hidden">
         {/* Subtle decorative background elements */}
         <div className="pointer-events-none absolute -top-40 -left-40 h-80 w-80 rounded-full bg-emerald-500/10 blur-[100px]" />
         <div className="pointer-events-none absolute -bottom-40 -right-40 h-80 w-80 rounded-full bg-blue-500/10 blur-[100px]" />
