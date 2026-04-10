@@ -116,6 +116,40 @@ docker compose up --build backend
 docker compose logs -f backend
 ```
 
+### 4 – Access the app on your phone with Cloudflare Quick Tunnel
+
+This is the fastest way to test the site on your phone with HTTPS, which is especially helpful for camera and WebRTC flows.
+
+1. Start the backend:
+
+```powershell
+docker compose up -d backend
+cloudflared tunnel --url http://localhost:8000
+```
+
+Copy the backend `https://...trycloudflare.com` URL from the `cloudflared` output.
+
+2. Start the frontend and point it at the backend tunnel:
+
+```powershell
+$env:NEXT_PUBLIC_BACKEND_URL="https://YOUR-BACKEND-URL.trycloudflare.com"
+docker compose up -d frontend
+cloudflared tunnel --url http://localhost:3000
+```
+
+3. Open the frontend `https://...trycloudflare.com` URL on your phone.
+
+Keep both `cloudflared` terminals running while you test.
+
+> **Notes**
+>
+> - Install `cloudflared` first if needed:
+>   ```powershell
+>   winget install Cloudflare.cloudflared
+>   ```
+> - The frontend will use `NEXT_PUBLIC_BACKEND_URL` when set. If it is not set, it falls back to `localhost` on your PC or to the current hostname on your local network.
+> - Cloudflare Quick Tunnels are best for temporary development and testing, not production hosting.
+
 ## Backend API
 
 ### Poker endpoints (`/poker`)

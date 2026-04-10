@@ -11,13 +11,12 @@ import {
   createCvStreamSessionId,
   useCvWebRtcStream,
 } from "../lib/useCvWebRtcStream";
+import { getBackendBaseUrl } from "../lib/backend";
 
 type MetricTone = "neutral" | "good" | "warn" | "alert";
 
 const BLUFF_WINDOW_MS = 30_000;
-const BACKEND_BASE_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ??
-  "http://localhost:8000";
+const BACKEND_BASE_URL = getBackendBaseUrl();
 
 const clamp = (v: number, min: number, max: number) =>
   Math.max(min, Math.min(max, v));

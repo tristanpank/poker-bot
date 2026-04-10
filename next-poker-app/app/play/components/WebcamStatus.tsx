@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FULL_RING_SEAT_COUNT, getSeatLabel } from '../../lib/tablePositions';
+import { getBackendBaseUrl } from '../../lib/backend';
 
-const BACKEND =
-  process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
+const BACKEND = getBackendBaseUrl();
 const POLL_INTERVAL_MS = 3000;
 
 type OpponentStatus = {

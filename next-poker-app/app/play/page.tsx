@@ -8,9 +8,10 @@ import PlayPhase from './components/PlayPhase';
 import ResumePrompt from './components/ResumePrompt';
 import WebcamStatus from './components/WebcamStatus';
 import { FULL_RING_SEAT_COUNT, compactSeatMap, getCompactRoleForSeat, getSeatLabel, getTablePosition } from '../lib/tablePositions';
+import { getBackendBaseUrl } from '../lib/backend';
 import type { TableSeatVisual } from './components/TableVisual';
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
+const BACKEND = getBackendBaseUrl();
 const MODEL_VERSION = 'v24';
 const SESSION_COOKIE_NAME = 'poker_session_id';
 const SESSION_COOKIE_MAX_AGE = 86400; // 24 hours

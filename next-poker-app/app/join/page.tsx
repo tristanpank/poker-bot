@@ -10,10 +10,10 @@ import {
   getSeatLabel,
   sixSeatLayout,
 } from '../lib/tablePositions';
+import { getBackendBaseUrl } from '../lib/backend';
 import { useCvWebRtcStream } from '../lib/useCvWebRtcStream';
 
-const BACKEND =
-  process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
+const BACKEND = getBackendBaseUrl();
 const JOIN_PAGE_STATE_KEY = 'poker.join.page.state';
 const SESSION_STATUS_POLL_INTERVAL_MS = 3000;
 
