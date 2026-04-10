@@ -200,6 +200,14 @@ The script resolves values in this order:
 
 The script prints the backend tunnel URL, frontend tunnel URL, and the permanent Short.io URL if configured.
 
+To stop the background `cloudflared` processes and Docker services later, run:
+
+```powershell
+.\scripts\Stop-PhoneTunnels.ps1
+```
+
+Closing the terminal window does not stop the tunnels, because the helper script launches `cloudflared` as background processes.
+
 ## Backend API
 
 ### Poker endpoints (`/poker`)
