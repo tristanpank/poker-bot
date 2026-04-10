@@ -150,6 +150,56 @@ Keep both `cloudflared` terminals running while you test.
 > - The frontend will use `NEXT_PUBLIC_BACKEND_URL` when set. If it is not set, it falls back to `localhost` on your PC or to the current hostname on your local network.
 > - Cloudflare Quick Tunnels are best for temporary development and testing, not production hosting.
 
+### 5 – Automate tunnel startup and optionally update a permanent Short.io link
+
+The repo includes a helper script that:
+
+- starts the backend container
+- opens a backend Quick Tunnel
+- restarts the frontend with `NEXT_PUBLIC_BACKEND_URL` pointing at that backend tunnel
+- opens a frontend Quick Tunnel
+- optionally creates or updates a permanent Short.io link so the same short URL can point at the new frontend tunnel after each restart
+
+Run it from the repo root:
+
+```powershell
+.\scripts\Start-PhoneTunnels.ps1
+```
+
+For repeat use, create a local ignored config file first:
+
+```powershell
+New-Item -ItemType Directory -Force .local\phone-tunnels | Out-Null
+Copy-Item .\scripts\PhoneTunnels.config.example.psd1 .\.local\phone-tunnels\config.psd1
+```
+
+Then edit `.local\phone-tunnels\config.psd1` and fill in at least:
+
+```powershell
+@{
+    ShortIoApiKey = 'your-shortio-api-key'
+    ShortIoDomain = 'your-account.short.gy'
+    ShortIoPath   = 'poker'
+}
+```
+
+After that, just run:
+
+```powershell
+.\scripts\Start-PhoneTunnels.ps1
+```
+
+On the first run, the script creates `https://your-account.short.gy/poker`. On later runs, it reuses the saved Short.io link ID from `.local/phone-tunnels/state.json` and updates the destination automatically.
+
+The script resolves values in this order:
+
+- command-line parameters
+- `.local\phone-tunnels\config.psd1`
+- environment variables
+- built-in defaults
+
+The script prints the backend tunnel URL, frontend tunnel URL, and the permanent Short.io URL if configured.
+
 ## Backend API
 
 ### Poker endpoints (`/poker`)

@@ -10,3 +10,4 @@ external
 training/results/v26
 # Docker
 docker-compose.override.yml
+.local/

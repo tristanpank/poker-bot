@@ -1,0 +1,6 @@
+services:
+  backend:
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
