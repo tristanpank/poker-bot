@@ -6,6 +6,8 @@ services:
       - "3000:3000"
     volumes:
       - ./next-poker-app:/app
+      - frontend-node-modules:/app/node_modules
+      - frontend-next-cache:/app/.next
     environment:
       - HOSTNAME=0.0.0.0
       - PORT=3000
@@ -50,4 +52,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  frontend-node-modules:
+  frontend-next-cache:
   redis-data:
