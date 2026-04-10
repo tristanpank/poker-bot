@@ -20,16 +20,17 @@
   }
 }
 
-html, body {
-  background: #020617;
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
-  min-height: 100%;
+html,
+body {
+  height: 100%;
 }
 
 body {
   background: #020617;
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
 }
+
 
 @theme {
   --color-surface: rgba(255, 255, 255, 0.05);
@@ -134,7 +135,6 @@ body {
   -webkit-font-smoothing: antialiased;
   background-image: linear-gradient(135deg, #0f172a 0%, #020617 100%);
   background-attachment: fixed;
-  background-size: cover;
   display: flex;
   justify-content: center;
 }
@@ -142,6 +142,7 @@ body {
 .design-mobile-container {
   max-width: 480px;
   width: 100%;
+  min-height: 100vh;
   position: relative;
   box-shadow: 0 0 40px rgba(0, 0, 0, 0.5);
 }
@@ -160,17 +161,19 @@ body {
   font-size: 13px;
   background: #fff;
   color: #1e293b;
-  border: 1px solid rgba(255,255,255,0.8);
-  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
   position: relative;
   transition: transform 0.2s, box-shadow 0.2s;
 }
 
-.card-mini.suit-h, .card-mini.suit-d {
+.card-mini.suit-h,
+.card-mini.suit-d {
   color: #ef4444;
 }
 
-.card-mini.suit-s, .card-mini.suit-c {
+.card-mini.suit-s,
+.card-mini.suit-c {
   color: #1e293b;
 }
 
@@ -187,18 +190,32 @@ body {
 }
 
 .card-mini.card-placeholder {
-  background: rgba(255,255,255,0.08);
-  border: 2px dashed rgba(255,255,255,0.2);
-  color: rgba(255,255,255,0.25);
+  background: rgba(255, 255, 255, 0.08);
+  border: 2px dashed rgba(255, 255, 255, 0.2);
+  color: rgba(255, 255, 255, 0.25);
   box-shadow: none;
 }
 
-.suit-btn-h, .suit-btn-d { color: #ef4444; }
-.suit-btn-s, .suit-btn-c { color: #1e293b; }
+.suit-btn-h,
+.suit-btn-d {
+  color: #ef4444;
+}
+
+.suit-btn-s,
+.suit-btn-c {
+  color: #1e293b;
+}
 
 @keyframes recommend-reveal {
-  from { opacity: 0; transform: scale(0.9) translateY(10px); }
-  to { opacity: 1; transform: scale(1) translateY(0); }
+  from {
+    opacity: 0;
+    transform: scale(0.9) translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 .animate-recommend {
@@ -206,8 +223,13 @@ body {
 }
 
 @keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 .animate-fade-in {

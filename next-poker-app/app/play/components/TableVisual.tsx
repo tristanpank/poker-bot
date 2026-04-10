@@ -12,6 +12,7 @@ export type TableSeatVisual = {
     onClick?: (() => void) | null;
     disabled?: boolean;
     isDealer?: boolean;
+    isBot?: boolean;
 };
 
 type TableVisualProps = {
@@ -82,6 +83,14 @@ export default function TableVisual({ seats, center }: TableVisualProps) {
                                     title="Dealer Button"
                                 >
                                     D
+                                </span>
+                            )}
+                            {(data.isBot || data.tone === 'bot') && (
+                                <span
+                                    className="absolute -top-2 -left-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border-2 border-slate-900 bg-amber-400 text-[11px] shadow-[0_0_8px_rgba(251,191,36,0.6)]"
+                                    title="Host"
+                                >
+                                    👑
                                 </span>
                             )}
                             <span className="text-[10px] font-bold uppercase tracking-[0.18em]">{data.title}</span>
