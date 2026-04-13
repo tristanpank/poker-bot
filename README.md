@@ -64,7 +64,7 @@ Interactive API docs: `http://localhost:8000/docs`
 > | Variable | Default | Description |
 > |---|---|---|
 > | `ENABLE_POKER_ROUTER` | `1` | Set to `0` to disable model-inference endpoints (useful when PyTorch is unavailable) |
-> | `ENABLE_POKER_PRELOAD` | `0` | Set to `1` to preload the default model on startup |
+> | `ENABLE_POKER_PRELOAD` | `1` | Preload the default model on startup so the first action request does not pay model load cost |
 > | `MODEL_VERSION` | `v18` | Default model version to use |
 > | `MODEL_CHECKPOINT_DIR` | `training/checkpoints` | Path to checkpoint directory |
 
