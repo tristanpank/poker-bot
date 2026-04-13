@@ -1245,6 +1245,7 @@ class GameService:
         )
         if not ordered_players:
             raise ValueError("Cannot build next hand state without players")
+        # Advance the dealer/button clockwise one seat while players stay in the same physical seats.
         rotated_players = ordered_players[1:] + ordered_players[:1]
         current_seat_map = list(game_state.seat_map or [])
 

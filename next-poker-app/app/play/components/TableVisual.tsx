@@ -10,9 +10,14 @@ export type TableSeatVisual = {
     detail?: string | null;
     tone: SeatTone;
     onClick?: (() => void) | null;
+    onDealerDrop?: (() => void) | null;
+    onDealerDragStart?: (() => void) | null;
+    onDealerDragEnd?: (() => void) | null;
     disabled?: boolean;
     isDealer?: boolean;
     isBot?: boolean;
+    canAcceptDealerDrop?: boolean;
+    dealerDraggable?: boolean;
 };
 
 type TableVisualProps = {
@@ -65,21 +70,50 @@ export default function TableVisual({ seats, center }: TableVisualProps) {
                         detail: null,
                         tone: 'open' as const,
                         onClick: null,
+                        onDealerDrop: null,
+                        onDealerDragStart: null,
+                        onDealerDragEnd: null,
                         disabled: false,
+                        canAcceptDealerDrop: false,
+                        dealerDraggable: false,
                     };
                     const disabled = Boolean(data.disabled);
                     const clickable = typeof data.onClick === 'function' && !disabled;
+                    const droppable = typeof data.onDealerDrop === 'function';
+                    const dragTarget = Boolean(data.canAcceptDealerDrop);
 
                     return (
                         <button
                             key={seat}
-                            onClick={() => data.onClick?.()}
-                            disabled={!clickable}
-                            className={`absolute ${className} flex h-24 w-24 flex-col items-center justify-center rounded-3xl border text-center transition-all duration-200 ${seatToneClass(data.tone, disabled)} ${clickable ? 'hover:scale-[1.03]' : ''}`}
+                            type="button"
+                            onClick={() => {
+                                if (clickable) {
+                                    data.onClick?.();
+                                }
+                            }}
+                            onDragOver={droppable ? (event) => {
+                                event.preventDefault();
+                                event.dataTransfer.dropEffect = 'move';
+                            } : undefined}
+                            onDrop={droppable ? (event) => {
+                                event.preventDefault();
+                                data.onDealerDrop?.();
+                            } : undefined}
+                            aria-disabled={disabled}
+                            className={`absolute ${className} flex h-24 w-24 flex-col items-center justify-center rounded-3xl border text-center transition-all duration-200 ${seatToneClass(data.tone, disabled)} ${clickable ? 'hover:scale-[1.03]' : ''} ${droppable ? 'cursor-pointer' : ''} ${dragTarget ? 'ring-2 ring-amber-300 ring-offset-2 ring-offset-slate-950' : ''}`}
                         >
                             {data.isDealer && (
                                 <span
-                                    className="absolute -top-2 -right-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border-2 border-slate-900 bg-white text-[9px] font-black text-slate-900 shadow-md"
+                                    draggable={Boolean(data.dealerDraggable)}
+                                    onDragStart={(event) => {
+                                        event.dataTransfer.effectAllowed = 'move';
+                                        event.dataTransfer.setData('text/plain', 'dealer-button');
+                                        data.onDealerDragStart?.();
+                                    }}
+                                    onDragEnd={() => {
+                                        data.onDealerDragEnd?.();
+                                    }}
+                                    className={`absolute -top-2 -right-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border-2 border-slate-900 bg-white text-[9px] font-black text-slate-900 shadow-md ${data.dealerDraggable ? 'cursor-grab active:cursor-grabbing' : ''}`}
                                     title="Dealer Button"
                                 >
                                     D
