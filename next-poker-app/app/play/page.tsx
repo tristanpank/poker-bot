@@ -1083,35 +1083,6 @@ export default function PlayPage() {
         setPendingRank(null);
     }, [bigBlind, hand, pickingFor, pushHistory, smallBlind]);
 
-    const confirmCommunityCards = useCallback(() => {
-        pushHistory('Confirm dealt cards');
-        setPickingFor(null);
-        setShowRaiseInput(false);
-        setRaiseInput('');
-
-        const street = getStreetFromBoardCount(hand.communityCards.length);
-        const players = hand.players.map((p) => ({ ...p, bet: 0, has_acted: false }));
-        const firstToAct = players.length === 2
-            ? firstActivePlayerFrom(players, 1)
-            : firstActivePlayerFrom(players, 0);
-
-        setHand((prev) => ({
-            ...prev,
-            street,
-            players,
-            currentBet: 0,
-            currentPlayerIdx: firstToAct,
-            streetRaiseCount: 0,
-            cvReads: primeCvReadWindow(prev.cvReads, players, firstToAct),
-            botResponse: null,
-        }));
-        setIsShowdownMode(false);
-        setShowdownEntries([]);
-        setShowdownResult(null);
-        setShowdownError(null);
-        setLegalActions(EMPTY_LEGAL_ACTIONS);
-    }, [hand.communityCards.length, hand.players, pushHistory]);
-
     const recordOpponentAction = useCallback(async (action: 'fold' | 'check_call' | 'raise', raiseAmt?: number) => {
         const playerIdx = hand.currentPlayerIdx;
         const player = hand.players[playerIdx];
@@ -1741,7 +1712,6 @@ export default function PlayPage() {
             }
             setPendingRank(null);
         },
-        onConfirmCommunity: confirmCommunityCards,
     };
 
     if (phase === 'deal-hole') {

@@ -17,12 +17,11 @@ type CardSelectorProps = {
     setPendingRank: (rank: string | null) => void;
     onSelectCard: (rank: string, suit: string) => void;
     onCancel: () => void;
-    onConfirmCommunity?: () => void;
 };
 
 export default function CardSelector({
     pickingFor, holeCardsCount, communityCardsCount, usedCards,
-    pendingRank, setPendingRank, onSelectCard, onCancel, onConfirmCommunity
+    pendingRank, setPendingRank, onSelectCard, onCancel
 }: CardSelectorProps) {
     if (!pickingFor) return null;
 
@@ -58,10 +57,6 @@ export default function CardSelector({
                     </div>
                     <button onClick={() => setPendingRank(null)} className="text-[10px] text-[var(--color-text-secondary)] hover:text-white mt-0.5">&larr; Back to ranks</button>
                 </div>
-            ) : pickingFor === 'community' && communityCardsCount >= 5 ? (
-                <div className="py-6 text-center text-xs font-semibold text-emerald-400">
-                    Maximum 5 community cards reached. Click Confirm to continue.
-                </div>
             ) : (
                 <div className="grid grid-cols-7 gap-1">
                     {RANKS.map(r => {
@@ -83,18 +78,6 @@ export default function CardSelector({
                     className="text-[10px] text-[var(--color-text-secondary)] hover:text-white px-2 py-1">
                     Cancel
                 </button>
-                {pickingFor === 'community' && onConfirmCommunity && (
-                    <button
-                        onClick={onConfirmCommunity}
-                        disabled={
-                            !(communityCardsCount === 3) &&
-                            !(communityCardsCount === 4) &&
-                            !(communityCardsCount === 5)
-                        }
-                        className="text-[10px] font-bold px-3 py-1.5 rounded-lg bg-[var(--color-accent)] text-slate-950 hover:bg-emerald-400 disabled:opacity-30 transition-all">
-                        Confirm
-                    </button>
-                )}
             </div>
         </div>
     );
