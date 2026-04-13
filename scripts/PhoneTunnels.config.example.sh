@@ -1,0 +1,6 @@
+FRONTEND_LOCAL_URL='http://localhost:3000'
+BACKEND_LOCAL_URL='http://localhost:8000'
+SHORTIO_PATH='poker'
+SHORTIO_API_KEY='paste-your-shortio-api-key-here'
+SHORTIO_DOMAIN='your-account.short.gy'
+SHORTIO_LINK_ID=''

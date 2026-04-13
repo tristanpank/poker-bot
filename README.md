@@ -162,31 +162,31 @@ The repo includes a helper script that:
 
 Run it from the repo root:
 
-```powershell
-.\scripts\Start-PhoneTunnels.ps1
+```bash
+bash ./scripts/Start-PhoneTunnels.sh
 ```
+
+On Windows, you can keep using `.\scripts\Start-PhoneTunnels.ps1`.
 
 For repeat use, create a local ignored config file first:
 
-```powershell
-New-Item -ItemType Directory -Force .local\phone-tunnels | Out-Null
-Copy-Item .\scripts\PhoneTunnels.config.example.psd1 .\.local\phone-tunnels\config.psd1
+```bash
+mkdir -p .local/phone-tunnels
+cp ./scripts/PhoneTunnels.config.example.sh ./.local/phone-tunnels/config.sh
 ```
 
-Then edit `.local\phone-tunnels\config.psd1` and fill in at least:
+Then edit `.local/phone-tunnels/config.sh` and fill in at least:
 
-```powershell
-@{
-    ShortIoApiKey = 'your-shortio-api-key'
-    ShortIoDomain = 'your-account.short.gy'
-    ShortIoPath   = 'poker'
-}
+```bash
+SHORTIO_API_KEY='your-shortio-api-key'
+SHORTIO_DOMAIN='your-account.short.gy'
+SHORTIO_PATH='poker'
 ```
 
 After that, just run:
 
-```powershell
-.\scripts\Start-PhoneTunnels.ps1
+```bash
+bash ./scripts/Start-PhoneTunnels.sh
 ```
 
 On the first run, the script creates `https://your-account.short.gy/poker`. On later runs, it reuses the saved Short.io link ID from `.local/phone-tunnels/state.json` and updates the destination automatically.
@@ -194,7 +194,7 @@ On the first run, the script creates `https://your-account.short.gy/poker`. On l
 The script resolves values in this order:
 
 - command-line parameters
-- `.local\phone-tunnels\config.psd1`
+- `.local/phone-tunnels/config.sh`
 - environment variables
 - built-in defaults
 
@@ -202,9 +202,11 @@ The script prints the backend tunnel URL, frontend tunnel URL, and the permanent
 
 To stop the background `cloudflared` processes and Docker services later, run:
 
-```powershell
-.\scripts\Stop-PhoneTunnels.ps1
+```bash
+bash ./scripts/Stop-PhoneTunnels.sh
 ```
+
+On Windows, the equivalent is `.\scripts\Stop-PhoneTunnels.ps1`.
 
 Closing the terminal window does not stop the tunnels, because the helper script launches `cloudflared` as background processes.
 
