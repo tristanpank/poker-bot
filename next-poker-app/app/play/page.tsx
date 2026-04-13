@@ -345,11 +345,12 @@ function reconcileSeatMapOrder(currentSeatMap: number[] | null | undefined, occu
         return nextOccupied;
     }
 
-    const nextOccupiedSet = new Set(nextOccupied);
-    const preserved = currentSeatMap.filter((seat) => nextOccupiedSet.has(seat));
-    const preservedSet = new Set(preserved);
-    const appended = nextOccupied.filter((seat) => !preservedSet.has(seat));
-    return [...preserved, ...appended];
+    const dealerIdx = dealerPositionIndex(currentSeatMap.length);
+    const dealerSeat = dealerIdx >= 0 ? currentSeatMap[dealerIdx] : undefined;
+    if (dealerSeat !== undefined && nextOccupied.includes(dealerSeat)) {
+        return rotateSeatMapToDealerSeat(nextOccupied, dealerSeat);
+    }
+    return nextOccupied;
 }
 
 function firstActivePlayerFrom(players: PlayerState[], startPos: number): number {
