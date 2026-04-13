@@ -24,7 +24,7 @@ type LegalActionState = {
     minRaiseTo: number | null;
     maxRaiseTo: number | null;
 };
-type ShowdownEntry = { playerIndex: number; position: number; cards: Card[]; mucked: boolean };
+type ShowdownEntry = { playerIndex: number; position: number; seat: number; cards: Card[]; mucked: boolean };
 type ShowdownResult = { result: 'won' | 'lost' | 'push'; amount: number; delta: number };
 type ResultFlash = { result: 'won' | 'lost' | 'push'; delta: number };
 
@@ -49,11 +49,17 @@ const ACTION_COLORS: Record<string, string> = {
 
 const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
 
-function getPlayerName(player: PlayerState, numPlayers: number, playerNames: Record<string, string>): string {
+function getPlayerName(
+    player: PlayerState,
+    numPlayers: number,
+    playerNames: Record<string, string>,
+    seatMap: number[],
+): string {
     const role = getTablePosition(player.position, numPlayers);
     if (player.is_bot) return `Bot (${role})`;
     const customName = playerNames[String(player.position)]?.trim();
-    return `${customName || `Player ${player.position + 1}`} (${role})`;
+    const physicalSeat = seatMap[player.position] ?? player.position;
+    return `${customName || `Player ${physicalSeat + 1}`} (${role})`;
 }
 
 function normalizeAction(action: string): string {
@@ -120,6 +126,7 @@ type PlayPhaseProps = {
     communityCards: Card[];
     street: 'preflop' | 'flop' | 'turn' | 'river';
     players: PlayerState[];
+    seatMap: number[];
     playerNames: Record<string, string>;
     tableSeats: TableSeatVisual[];
     currentPlayerIdx: number;
@@ -158,6 +165,7 @@ export default function PlayPhase({
     communityCards,
     street,
     players,
+    seatMap,
     playerNames,
     tableSeats,
     currentPlayerIdx,
@@ -282,7 +290,7 @@ export default function PlayPhase({
                     {!showdownMode && (
                         <div className="mt-2">
                             <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-1.5">
-                                {currentPlayerIdx === -1 ? 'Betting Round Complete' : (isBotTurn ? 'Bot Turn' : `Acting: ${currentPlayer ? getPlayerName(currentPlayer, players.length, playerNames) : ''}`)}
+                                {currentPlayerIdx === -1 ? 'Betting Round Complete' : (isBotTurn ? 'Bot Turn' : `Acting: ${currentPlayer ? getPlayerName(currentPlayer, players.length, playerNames, seatMap) : ''}`)}
                             </p>
 
                             {currentPlayerIdx !== -1 && (isBotTurn ? (
@@ -384,11 +392,11 @@ export default function PlayPhase({
                     <section className="bg-[var(--color-surface)] border border-[var(--color-border-color)] rounded-xl p-3">
                         <p className="text-[10px] text-[var(--color-text-secondary)] uppercase tracking-wider font-bold mb-2">Opponent Reveals</p>
                         <div className="flex flex-col gap-1.5">
-                            {showdownEntries.map((entry, idx) => {
+                            {showdownEntries.map((entry) => {
                                 const player = players[entry.playerIndex];
                                 const name = player
-                                    ? getPlayerName(player, players.length, playerNames)
-                                    : `${playerNames[String(entry.position)]?.trim() || `Player ${entry.position + 1}`} (${getTablePosition(entry.position, players.length)})`;
+                                    ? getPlayerName(player, players.length, playerNames, seatMap)
+                                    : `${playerNames[String(entry.position)]?.trim() || `Player ${entry.seat + 1}`} (${getTablePosition(entry.position, players.length)})`;
                                 const isCurrent = entry.playerIndex === currentShowdownPlayerIndex;
                                 return (
                                     <div
@@ -396,7 +404,7 @@ export default function PlayPhase({
                                         className={`rounded-lg border px-3 py-1.5 ${isCurrent ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border-color)] bg-slate-900/30'}`}
                                     >
                                         <div className="flex justify-between items-center">
-                                            <span className="text-xs font-semibold text-[var(--color-text-primary)]">{idx + 1}. {name}</span>
+                                            <span className="text-xs font-semibold text-[var(--color-text-primary)]">{name}</span>
                                             <span className="text-[10px] text-[var(--color-text-secondary)]">
                                                 {entry.mucked ? 'Mucked' : (entry.cards.length === 2 ? entry.cards.map((c) => `${c.rank}${suitSym(c.suit)}`).join(' ') : 'Pending')}
                                             </span>

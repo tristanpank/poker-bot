@@ -7,10 +7,11 @@ import CardSelector from './components/CardSelector';
 import PlayPhase from './components/PlayPhase';
 import ResumePrompt from './components/ResumePrompt';
 import WebcamStatus from './components/WebcamStatus';
-import { FULL_RING_SEAT_COUNT, compactSeatMap, getCompactRoleForSeat, getSeatLabel, getTablePosition } from '../lib/tablePositions';
+import { FULL_RING_SEAT_COUNT, compactSeatMap, getSeatLabel, getTablePosition } from '../lib/tablePositions';
+import { getBackendBaseUrl } from '../lib/backend';
 import type { TableSeatVisual } from './components/TableVisual';
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
+const BACKEND = getBackendBaseUrl();
 const MODEL_VERSION = 'v24';
 const SESSION_COOKIE_NAME = 'poker_session_id';
 const SESSION_COOKIE_MAX_AGE = 86400; // 24 hours
@@ -114,7 +115,7 @@ type HandState = {
     isLoading: boolean;
 };
 type HistoryEntry = { phase: Phase; hand: HandState; label: string };
-type ShowdownEntry = { playerIndex: number; position: number; cards: Card[]; mucked: boolean };
+type ShowdownEntry = { playerIndex: number; position: number; seat: number; cards: Card[]; mucked: boolean };
 
 type BackendLegalActions = {
     actor_index: number;
@@ -245,20 +246,46 @@ const EMPTY_HAND: HandState = {
 
 const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
 
-function initPlayersForSeatMap(seatMap: number[], stack: number, botSeat: number): PlayerState[] {
-    return seatMap.map((seat, i) => ({
+function stackMapFromSeatMap(seatMap: number[], stacks: number[]): Map<number, number> {
+    const bySeat = new Map<number, number>();
+    seatMap.forEach((seat, idx) => {
+        const stack = stacks[idx];
+        if (typeof stack === 'number' && Number.isFinite(stack)) {
+            bySeat.set(seat, Math.max(0, Math.trunc(stack)));
+        }
+    });
+    return bySeat;
+}
+
+function initPlayersForSeatMap(
+    seatMap: number[],
+    stackSource: number | Map<number, number>,
+    defaultStack: number,
+    botSeat: number,
+): PlayerState[] {
+    return seatMap.map((seat, i) => {
+        const resolvedStack = typeof stackSource === 'number'
+            ? stackSource
+            : (stackSource.get(seat) ?? defaultStack);
+        return {
         position: i,
-        stack,
+        stack: resolvedStack,
         bet: 0,
         hole_cards: seat === botSeat ? [] : null,
         is_bot: seat === botSeat,
-        is_active: true,
+        is_active: resolvedStack > 0,
         has_acted: false,
-    }));
+        };
+    });
 }
 
-function buildHandFromSeatMap(seatMap: number[], stack: number, botSeat: number): HandState {
-    const players = initPlayersForSeatMap(seatMap, stack, botSeat);
+function buildHandFromSeatMap(
+    seatMap: number[],
+    stackSource: number | Map<number, number>,
+    defaultStack: number,
+    botSeat: number,
+): HandState {
+    const players = initPlayersForSeatMap(seatMap, stackSource, defaultStack, botSeat);
     const botPosition = seatMap.indexOf(botSeat);
 
     return {
@@ -269,6 +296,61 @@ function buildHandFromSeatMap(seatMap: number[], stack: number, botSeat: number)
         startingStacks: players.map((player) => player.stack),
         currentPlayerIdx: 0,
     };
+}
+
+function deriveStackSource(
+    sourceSeatMap: number[] | null | undefined,
+    sourceStacks: number[] | null | undefined,
+    defaultStack: number,
+): number | Map<number, number> {
+    if (Array.isArray(sourceSeatMap) && Array.isArray(sourceStacks) && sourceSeatMap.length === sourceStacks.length && sourceSeatMap.length > 0) {
+        return stackMapFromSeatMap(sourceSeatMap, sourceStacks);
+    }
+    return defaultStack;
+}
+
+function dealerPositionIndex(playerCount: number): number {
+    if (playerCount <= 0) {
+        return -1;
+    }
+    return playerCount === 2 ? 0 : playerCount - 1;
+}
+
+function rotateSeatMapToDealerSeat(seatMap: number[], dealerSeat: number): number[] {
+    const playerCount = seatMap.length;
+    if (playerCount <= 1) {
+        return [...seatMap];
+    }
+
+    const currentIndex = seatMap.indexOf(dealerSeat);
+    const targetIndex = dealerPositionIndex(playerCount);
+    if (currentIndex < 0 || targetIndex < 0) {
+        return [...seatMap];
+    }
+
+    const shift = (currentIndex - targetIndex + playerCount) % playerCount;
+    if (shift === 0) {
+        return [...seatMap];
+    }
+
+    return [...seatMap.slice(shift), ...seatMap.slice(0, shift)];
+}
+
+function reconcileSeatMapOrder(currentSeatMap: number[] | null | undefined, occupiedSeats: number[]): number[] {
+    const nextOccupied = compactSeatMap(occupiedSeats);
+    if (nextOccupied.length === 0) {
+        return [];
+    }
+    if (!Array.isArray(currentSeatMap) || currentSeatMap.length === 0) {
+        return nextOccupied;
+    }
+
+    const dealerIdx = dealerPositionIndex(currentSeatMap.length);
+    const dealerSeat = dealerIdx >= 0 ? currentSeatMap[dealerIdx] : undefined;
+    if (dealerSeat !== undefined && nextOccupied.includes(dealerSeat)) {
+        return rotateSeatMapToDealerSeat(nextOccupied, dealerSeat);
+    }
+    return nextOccupied;
 }
 
 function firstActivePlayerFrom(players: PlayerState[], startPos: number): number {
@@ -511,6 +593,7 @@ export default function PlayPage() {
     const [isShowdownMode, setIsShowdownMode] = useState(false);
     const [resultFlash, setResultFlash] = useState<ResultFlash | null>(null);
     const [isEndingGame, setIsEndingGame] = useState(false);
+    const [isDraggingDealer, setIsDraggingDealer] = useState(false);
     const [seatNames, setSeatNames] = useState<Record<string, string>>({});
     const [webcamStatus, setWebcamStatus] = useState<WebcamStatusResponse>({ opponents: {} });
     const resolvedSessionId = sessionId ?? getSessionCookie();
@@ -1001,35 +1084,6 @@ export default function PlayPage() {
         setPendingRank(null);
     }, [bigBlind, hand, pickingFor, pushHistory, smallBlind]);
 
-    const confirmCommunityCards = useCallback(() => {
-        pushHistory('Confirm dealt cards');
-        setPickingFor(null);
-        setShowRaiseInput(false);
-        setRaiseInput('');
-
-        const street = getStreetFromBoardCount(hand.communityCards.length);
-        const players = hand.players.map((p) => ({ ...p, bet: 0, has_acted: false }));
-        const firstToAct = players.length === 2
-            ? firstActivePlayerFrom(players, 1)
-            : firstActivePlayerFrom(players, 0);
-
-        setHand((prev) => ({
-            ...prev,
-            street,
-            players,
-            currentBet: 0,
-            currentPlayerIdx: firstToAct,
-            streetRaiseCount: 0,
-            cvReads: primeCvReadWindow(prev.cvReads, players, firstToAct),
-            botResponse: null,
-        }));
-        setIsShowdownMode(false);
-        setShowdownEntries([]);
-        setShowdownResult(null);
-        setShowdownError(null);
-        setLegalActions(EMPTY_LEGAL_ACTIONS);
-    }, [hand.communityCards.length, hand.players, pushHistory]);
-
     const recordOpponentAction = useCallback(async (action: 'fold' | 'check_call' | 'raise', raiseAmt?: number) => {
         const playerIdx = hand.currentPlayerIdx;
         const player = hand.players[playerIdx];
@@ -1082,6 +1136,7 @@ export default function PlayPage() {
             .map(({ player, index }) => ({
                 playerIndex: index,
                 position: player.position,
+                seat: hand.seatMap[index] ?? player.position,
                 cards: [],
                 mucked: false,
             }));
@@ -1155,14 +1210,10 @@ export default function PlayPage() {
         }
         nextHandTimerRef.current = setTimeout(() => {
             const nextHand = mapBackendStateToNextHand(data.next_game_state);
-            const nextBotStack = nextHand.players.find((player) => player.is_bot)?.stack ?? 0;
+            const nextStacks = nextHand.players.map((player) => player.stack);
 
             const newProfit = sessionProfit + data.delta;
-            const newStacks = (() => {
-                const next = [...sessionStacks];
-                next[0] = nextBotStack;
-                return next.length > 0 ? next : [nextBotStack];
-            })();
+            const newStacks = nextStacks;
 
             setSessionProfit(newProfit);
             setSessionStacks(newStacks);
@@ -1264,9 +1315,10 @@ export default function PlayPage() {
 
     const startNewHand = useCallback(() => {
         const nextBotSeat = HOST_BOT_SEAT;
-        const nextSeatMap = compactSeatMap([nextBotSeat, ...manualSeats, ...connectedOpponentSeats]);
-        const baseStack = sessionStacks[0] ?? buyIn;
-        const nextHand = buildHandFromSeatMap(nextSeatMap, baseStack, nextBotSeat);
+        const nextSeatMap = reconcileSeatMapOrder(hand.seatMap, [nextBotSeat, ...manualSeats, ...connectedOpponentSeats]);
+        const stackSource = deriveStackSource(hand.seatMap, sessionStacks, buyIn);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, nextBotSeat);
+        const nextStacks = nextHand.players.map((player) => player.stack);
 
         if (nextHandTimerRef.current) {
             clearTimeout(nextHandTimerRef.current);
@@ -1275,6 +1327,7 @@ export default function PlayPage() {
         autoResolveSingleLeftRef.current = false;
         setHistory([]);
         setBotSeat(nextBotSeat);
+        setSessionStacks(nextStacks);
         setPhase('deal-hole');
         setHand(nextHand);
         setPickingFor(null);
@@ -1292,12 +1345,12 @@ export default function PlayPage() {
         // Ensure session exists
         if (!sessionId && !getSessionCookie()) {
             void createSession().then(() => {
-                void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats });
+                void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats, sessionStacks: nextStacks });
             });
         } else {
-            void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats });
+            void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats, sessionStacks: nextStacks });
         }
-    }, [buyIn, connectedOpponentSeats, createSession, manualSeats, saveSession, sessionId, sessionStacks]);
+    }, [buyIn, connectedOpponentSeats, createSession, hand.seatMap, manualSeats, saveSession, sessionId, sessionStacks]);
 
     const handleSeatLobbyClick = useCallback((seat: number) => {
         if (connectedOpponentSeats.includes(seat)) {
@@ -1312,15 +1365,67 @@ export default function PlayPage() {
             ? manualSeats.filter((value) => value !== seat)
             : compactSeatMap([...manualSeats, seat]).filter((value) => value !== HOST_BOT_SEAT);
         setManualSeats(nextManualSeats);
-        const nextSeatMap = compactSeatMap([HOST_BOT_SEAT, ...nextManualSeats, ...connectedOpponentSeats]);
-        const nextHand = buildHandFromSeatMap(nextSeatMap, sessionStacks[0] ?? buyIn, HOST_BOT_SEAT);
+        const nextSeatMap = reconcileSeatMapOrder(hand.seatMap, [HOST_BOT_SEAT, ...nextManualSeats, ...connectedOpponentSeats]);
+        const stackSource = deriveStackSource(hand.seatMap, sessionStacks, buyIn);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, HOST_BOT_SEAT);
+        const nextStacks = nextHand.players.map((player) => player.stack);
+        setSessionStacks(nextStacks);
         setHand((prev) => ({
             ...nextHand,
             holeCards: prev.holeCards,
             communityCards: prev.communityCards,
         }));
-        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: HOST_BOT_SEAT, manualSeats: nextManualSeats });
-    }, [buyIn, connectedOpponentSeats, manualSeats, saveSession, sessionStacks]);
+        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: HOST_BOT_SEAT, manualSeats: nextManualSeats, sessionStacks: nextStacks });
+    }, [buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, saveSession, sessionStacks]);
+
+    const moveDealerButton = useCallback((targetSeat: number) => {
+        if (phase !== 'deal-hole') {
+            return;
+        }
+
+        const fallbackConnectedSeats = compactSeatMap(
+            Object.entries(webcamStatus.opponents ?? {})
+                .filter(([, opponent]) => opponent.connected)
+                .map(([seat]) => Number(seat))
+                .filter((seat) => Number.isInteger(seat)),
+        );
+        const fallbackOccupiedSeats = compactSeatMap(
+            botSeat === null ? [...manualSeats, ...fallbackConnectedSeats] : [botSeat, ...manualSeats, ...fallbackConnectedSeats],
+        );
+        const sourceSeatMap = hand.seatMap.length > 0 ? hand.seatMap : fallbackOccupiedSeats;
+        if (sourceSeatMap.length < 2 || !sourceSeatMap.includes(targetSeat)) {
+            return;
+        }
+
+        const nextSeatMap = rotateSeatMapToDealerSeat(sourceSeatMap, targetSeat);
+        if (nextSeatMap.length === sourceSeatMap.length && nextSeatMap.every((seat, idx) => seat === sourceSeatMap[idx])) {
+            return;
+        }
+
+        const currentStacks = hand.players.length === sourceSeatMap.length
+            ? hand.players.map((player) => player.stack)
+            : sessionStacks;
+        const stackSource = deriveStackSource(sourceSeatMap, currentStacks, buyIn);
+        const nextBotSeat = botSeat ?? HOST_BOT_SEAT;
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, nextBotSeat);
+        const nextStacks = nextHand.players.map((player) => player.stack);
+        const preservedHand = {
+            ...nextHand,
+            holeCards: hand.holeCards,
+            communityCards: hand.communityCards,
+        };
+
+        setHand(preservedHand);
+        setSessionStacks(nextStacks);
+        setIsDraggingDealer(false);
+        void saveSession({
+            phase: 'deal-hole',
+            hand: preservedHand,
+            botSeat: nextBotSeat,
+            manualSeats,
+            sessionStacks: nextStacks,
+        });
+    }, [botSeat, buyIn, hand.communityCards, hand.holeCards, hand.players, hand.seatMap, manualSeats, phase, saveSession, sessionStacks, webcamStatus]);
 
     useEffect(() => {
         if (phase !== 'deal-hole' || pickingFor === 'showdown') {
@@ -1329,22 +1434,28 @@ export default function PlayPage() {
         if (botSeat === null) {
             return;
         }
-        const nextSeatMap = compactSeatMap([botSeat, ...manualSeats, ...connectedOpponentSeats]);
+        const nextSeatMap = reconcileSeatMapOrder(hand.seatMap, [botSeat, ...manualSeats, ...connectedOpponentSeats]);
         const currentSeatMap = hand.seatMap ?? [];
+        const currentOccupied = compactSeatMap(currentSeatMap);
+        const nextOccupied = compactSeatMap([botSeat, ...manualSeats, ...connectedOpponentSeats]);
         if (
-            nextSeatMap.length === currentSeatMap.length
-            && nextSeatMap.every((seat, idx) => seat === currentSeatMap[idx])
+            nextOccupied.length === currentOccupied.length
+            && nextOccupied.every((seat, idx) => seat === currentOccupied[idx])
         ) {
             return;
         }
 
-        const nextHand = buildHandFromSeatMap(nextSeatMap, sessionStacks[0] ?? buyIn, botSeat);
+        const stackSource = deriveStackSource(hand.seatMap, sessionStacks, buyIn);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, botSeat);
+        const nextStacks = nextHand.players.map((player) => player.stack);
+        setSessionStacks(nextStacks);
         setHand((prev) => ({
             ...nextHand,
             holeCards: prev.holeCards,
             communityCards: prev.communityCards,
         }));
-    }, [botSeat, buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, phase, pickingFor, sessionStacks]);
+        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat, manualSeats, sessionStacks: nextStacks });
+    }, [botSeat, buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, phase, pickingFor, saveSession, sessionStacks]);
 
     useEffect(() => {
         if (phase !== 'deal-hole') {
@@ -1437,26 +1548,39 @@ export default function PlayPage() {
     }, [currentShowdownEntry, isShowdownMode]);
 
     const showdownCanResolve = showdownEntries.every((entry) => entry.mucked || entry.cards.length === 2);
-    const occupiedSeats = compactSeatMap(botSeat === null ? [...manualSeats, ...connectedOpponentSeats] : [botSeat, ...manualSeats, ...connectedOpponentSeats]);
+    const configuredOccupiedSeats = compactSeatMap(
+        botSeat === null ? [...manualSeats, ...connectedOpponentSeats] : [botSeat, ...manualSeats, ...connectedOpponentSeats],
+    );
+    const occupiedSeats = phase === 'deal-hole' && hand.seatMap.length > 0
+        ? hand.seatMap
+        : configuredOccupiedSeats;
     const tableStatus = occupiedSeats.length < 2
         ? 'Click a side seat to add a manual player or wait for a webcam join.'
         : hand.holeCards.length >= 2
             ? `Ready for a ${occupiedSeats.length}-handed start.`
-            : `Pick ${2 - hand.holeCards.length} more hole card${hand.holeCards.length === 1 ? '' : 's'} to begin.`;
+            : `Pick ${2 - hand.holeCards.length} more hole card${hand.holeCards.length === 1 ? '' : 's'} to begin. Drag the dealer button to another occupied seat between hands if you need to rotate positions.`;
     const dealHoleTableSeats: TableSeatVisual[] = Array.from({ length: FULL_RING_SEAT_COUNT }, (_, seat) => {
         const isBot = seat === HOST_BOT_SEAT;
         const isConnected = connectedOpponentSeats.includes(seat);
         const isManual = manualSeats.includes(seat);
-        const role = getCompactRoleForSeat(seat, occupiedSeats);
+        const compactPosition = occupiedSeats.indexOf(seat);
+        const role = compactPosition >= 0 ? getTablePosition(compactPosition, occupiedSeats.length) : null;
+        const isDealer = role === 'BTN' || role === 'SB/BTN';
+        const isOccupied = compactPosition >= 0;
         return {
             seat,
             title: getSeatLabel(seat),
             subtitle: isBot ? 'Bot' : isConnected ? (seatNames[String(seat)]?.trim() || `Player ${seat + 1}`) : isManual ? 'Manual Player' : 'Open',
             detail: role ?? (isBot ? 'Host' : isConnected ? 'Webcam' : isManual ? 'Host Seated' : 'Available'),
             tone: isBot ? 'bot' : isConnected ? 'connected' : isManual ? 'manual' : 'open',
-            isDealer: role === 'BTN' || role === 'SB/BTN',
+            isDealer,
+            dealerDraggable: phase === 'deal-hole' && isOccupied && occupiedSeats.length >= 2,
+            onDealerDragStart: phase === 'deal-hole' ? () => setIsDraggingDealer(true) : null,
+            onDealerDragEnd: phase === 'deal-hole' ? () => setIsDraggingDealer(false) : null,
+            onDealerDrop: phase === 'deal-hole' && isOccupied && !isDealer ? () => moveDealerButton(seat) : null,
+            canAcceptDealerDrop: phase === 'deal-hole' && isDraggingDealer && isOccupied && !isDealer,
             onClick: phase === 'deal-hole' && !isConnected && !isBot ? () => handleSeatLobbyClick(seat) : null,
-            disabled: phase !== 'deal-hole' || isConnected || isBot,
+            disabled: phase !== 'deal-hole',
         };
     });
     const playSeatByPhysicalSeat = new Map(hand.seatMap.map((seat, idx) => [seat, { player: hand.players[idx], compactPosition: idx }]));
@@ -1472,7 +1596,7 @@ export default function PlayPage() {
             };
         }
         const player = seatEntry.player;
-        const role = getCompactRoleForSeat(seat, hand.seatMap) ?? getTablePosition(seatEntry.compactPosition, hand.players.length);
+        const role = getTablePosition(seatEntry.compactPosition, hand.players.length);
         const displayName = player.is_bot ? 'Bot' : (playerNames[String(seatEntry.compactPosition)]?.trim() || `Player ${seat + 1}`);
         return {
             seat,
@@ -1560,9 +1684,6 @@ export default function PlayPage() {
                     showBack={false}
                     onBack={() => undefined}
                     onStart={() => {
-                        if (sessionStacks.length === 0) {
-                            setSessionStacks([buyIn]);
-                        }
                         startNewHand();
                     }}
                     onEnd={() => {
@@ -1593,7 +1714,6 @@ export default function PlayPage() {
             }
             setPendingRank(null);
         },
-        onConfirmCommunity: confirmCommunityCards,
     };
 
     if (phase === 'deal-hole') {
@@ -1631,6 +1751,7 @@ export default function PlayPage() {
                     communityCards={hand.communityCards}
                     street={hand.street}
                     players={hand.players}
+                    seatMap={hand.seatMap}
                     playerNames={playerNames}
                     tableSeats={playTableSeats}
                     currentPlayerIdx={hand.currentPlayerIdx}

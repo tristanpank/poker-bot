@@ -64,7 +64,7 @@ Interactive API docs: `http://localhost:8000/docs`
 > | Variable | Default | Description |
 > |---|---|---|
 > | `ENABLE_POKER_ROUTER` | `1` | Set to `0` to disable model-inference endpoints (useful when PyTorch is unavailable) |
-> | `ENABLE_POKER_PRELOAD` | `0` | Set to `1` to preload the default model on startup |
+> | `ENABLE_POKER_PRELOAD` | `1` | Preload the default model on startup so the first action request does not pay model load cost |
 > | `MODEL_VERSION` | `v18` | Default model version to use |
 > | `MODEL_CHECKPOINT_DIR` | `training/checkpoints` | Path to checkpoint directory |
 
@@ -115,6 +115,100 @@ docker compose up --build backend
 ```bash
 docker compose logs -f backend
 ```
+
+### 4 – Access the app on your phone with Cloudflare Quick Tunnel
+
+This is the fastest way to test the site on your phone with HTTPS, which is especially helpful for camera and WebRTC flows.
+
+1. Start the backend:
+
+```powershell
+docker compose up -d backend
+cloudflared tunnel --url http://localhost:8000
+```
+
+Copy the backend `https://...trycloudflare.com` URL from the `cloudflared` output.
+
+2. Start the frontend and point it at the backend tunnel:
+
+```powershell
+$env:NEXT_PUBLIC_BACKEND_URL="https://YOUR-BACKEND-URL.trycloudflare.com"
+docker compose up -d frontend
+cloudflared tunnel --url http://localhost:3000
+```
+
+3. Open the frontend `https://...trycloudflare.com` URL on your phone.
+
+Keep both `cloudflared` terminals running while you test.
+
+> **Notes**
+>
+> - Install `cloudflared` first if needed:
+>   ```powershell
+>   winget install Cloudflare.cloudflared
+>   ```
+> - The frontend will use `NEXT_PUBLIC_BACKEND_URL` when set. If it is not set, it falls back to `localhost` on your PC or to the current hostname on your local network.
+> - Cloudflare Quick Tunnels are best for temporary development and testing, not production hosting.
+
+### 5 – Automate tunnel startup and optionally update a permanent Short.io link
+
+The repo includes a helper script that:
+
+- starts the backend container
+- opens a backend Quick Tunnel
+- restarts the frontend with `NEXT_PUBLIC_BACKEND_URL` pointing at that backend tunnel
+- opens a frontend Quick Tunnel
+- optionally creates or updates a permanent Short.io link so the same short URL can point at the new frontend tunnel after each restart
+
+Run it from the repo root:
+
+```bash
+bash ./scripts/Start-PhoneTunnels.sh
+```
+
+On Windows, you can keep using `.\scripts\Start-PhoneTunnels.ps1`.
+
+For repeat use, create a local ignored config file first:
+
+```bash
+mkdir -p .local/phone-tunnels
+cp ./scripts/PhoneTunnels.config.example.sh ./.local/phone-tunnels/config.sh
+```
+
+Then edit `.local/phone-tunnels/config.sh` and fill in at least:
+
+```bash
+SHORTIO_API_KEY='your-shortio-api-key'
+SHORTIO_DOMAIN='your-account.short.gy'
+SHORTIO_PATH='poker'
+```
+
+After that, just run:
+
+```bash
+bash ./scripts/Start-PhoneTunnels.sh
+```
+
+On the first run, the script creates `https://your-account.short.gy/poker`. On later runs, it reuses the saved Short.io link ID from `.local/phone-tunnels/state.json` and updates the destination automatically.
+
+The script resolves values in this order:
+
+- command-line parameters
+- `.local/phone-tunnels/config.sh`
+- environment variables
+- built-in defaults
+
+The script prints the backend tunnel URL, frontend tunnel URL, and the permanent Short.io URL if configured.
+
+To stop the background `cloudflared` processes and Docker services later, run:
+
+```bash
+bash ./scripts/Stop-PhoneTunnels.sh
+```
+
+On Windows, the equivalent is `.\scripts\Stop-PhoneTunnels.ps1`.
+
+Closing the terminal window does not stop the tunnels, because the helper script launches `cloudflared` as background processes.
 
 ## Backend API
 
