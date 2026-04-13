@@ -246,20 +246,46 @@ const EMPTY_HAND: HandState = {
 
 const suitSym = (s: string) => ({ s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' }[s] ?? s);
 
-function initPlayersForSeatMap(seatMap: number[], stack: number, botSeat: number): PlayerState[] {
-    return seatMap.map((seat, i) => ({
+function stackMapFromSeatMap(seatMap: number[], stacks: number[]): Map<number, number> {
+    const bySeat = new Map<number, number>();
+    seatMap.forEach((seat, idx) => {
+        const stack = stacks[idx];
+        if (typeof stack === 'number' && Number.isFinite(stack)) {
+            bySeat.set(seat, Math.max(0, Math.trunc(stack)));
+        }
+    });
+    return bySeat;
+}
+
+function initPlayersForSeatMap(
+    seatMap: number[],
+    stackSource: number | Map<number, number>,
+    defaultStack: number,
+    botSeat: number,
+): PlayerState[] {
+    return seatMap.map((seat, i) => {
+        const resolvedStack = typeof stackSource === 'number'
+            ? stackSource
+            : (stackSource.get(seat) ?? defaultStack);
+        return {
         position: i,
-        stack,
+        stack: resolvedStack,
         bet: 0,
         hole_cards: seat === botSeat ? [] : null,
         is_bot: seat === botSeat,
-        is_active: true,
+        is_active: resolvedStack > 0,
         has_acted: false,
-    }));
+        };
+    });
 }
 
-function buildHandFromSeatMap(seatMap: number[], stack: number, botSeat: number): HandState {
-    const players = initPlayersForSeatMap(seatMap, stack, botSeat);
+function buildHandFromSeatMap(
+    seatMap: number[],
+    stackSource: number | Map<number, number>,
+    defaultStack: number,
+    botSeat: number,
+): HandState {
+    const players = initPlayersForSeatMap(seatMap, stackSource, defaultStack, botSeat);
     const botPosition = seatMap.indexOf(botSeat);
 
     return {
@@ -270,6 +296,17 @@ function buildHandFromSeatMap(seatMap: number[], stack: number, botSeat: number)
         startingStacks: players.map((player) => player.stack),
         currentPlayerIdx: 0,
     };
+}
+
+function deriveStackSource(
+    sourceSeatMap: number[] | null | undefined,
+    sourceStacks: number[] | null | undefined,
+    defaultStack: number,
+): number | Map<number, number> {
+    if (Array.isArray(sourceSeatMap) && Array.isArray(sourceStacks) && sourceSeatMap.length === sourceStacks.length && sourceSeatMap.length > 0) {
+        return stackMapFromSeatMap(sourceSeatMap, sourceStacks);
+    }
+    return defaultStack;
 }
 
 function firstActivePlayerFrom(players: PlayerState[], startPos: number): number {
@@ -1156,14 +1193,10 @@ export default function PlayPage() {
         }
         nextHandTimerRef.current = setTimeout(() => {
             const nextHand = mapBackendStateToNextHand(data.next_game_state);
-            const nextBotStack = nextHand.players.find((player) => player.is_bot)?.stack ?? 0;
+            const nextStacks = nextHand.players.map((player) => player.stack);
 
             const newProfit = sessionProfit + data.delta;
-            const newStacks = (() => {
-                const next = [...sessionStacks];
-                next[0] = nextBotStack;
-                return next.length > 0 ? next : [nextBotStack];
-            })();
+            const newStacks = nextStacks;
 
             setSessionProfit(newProfit);
             setSessionStacks(newStacks);
@@ -1266,8 +1299,9 @@ export default function PlayPage() {
     const startNewHand = useCallback(() => {
         const nextBotSeat = HOST_BOT_SEAT;
         const nextSeatMap = compactSeatMap([nextBotSeat, ...manualSeats, ...connectedOpponentSeats]);
-        const baseStack = sessionStacks[0] ?? buyIn;
-        const nextHand = buildHandFromSeatMap(nextSeatMap, baseStack, nextBotSeat);
+        const stackSource = deriveStackSource(hand.seatMap, sessionStacks, buyIn);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, nextBotSeat);
+        const nextStacks = nextHand.players.map((player) => player.stack);
 
         if (nextHandTimerRef.current) {
             clearTimeout(nextHandTimerRef.current);
@@ -1276,6 +1310,7 @@ export default function PlayPage() {
         autoResolveSingleLeftRef.current = false;
         setHistory([]);
         setBotSeat(nextBotSeat);
+        setSessionStacks(nextStacks);
         setPhase('deal-hole');
         setHand(nextHand);
         setPickingFor(null);
@@ -1293,12 +1328,12 @@ export default function PlayPage() {
         // Ensure session exists
         if (!sessionId && !getSessionCookie()) {
             void createSession().then(() => {
-                void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats });
+                void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats, sessionStacks: nextStacks });
             });
         } else {
-            void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats });
+            void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: nextBotSeat, manualSeats, sessionStacks: nextStacks });
         }
-    }, [buyIn, connectedOpponentSeats, createSession, manualSeats, saveSession, sessionId, sessionStacks]);
+    }, [buyIn, connectedOpponentSeats, createSession, hand.seatMap, manualSeats, saveSession, sessionId, sessionStacks]);
 
     const handleSeatLobbyClick = useCallback((seat: number) => {
         if (connectedOpponentSeats.includes(seat)) {
@@ -1314,14 +1349,17 @@ export default function PlayPage() {
             : compactSeatMap([...manualSeats, seat]).filter((value) => value !== HOST_BOT_SEAT);
         setManualSeats(nextManualSeats);
         const nextSeatMap = compactSeatMap([HOST_BOT_SEAT, ...nextManualSeats, ...connectedOpponentSeats]);
-        const nextHand = buildHandFromSeatMap(nextSeatMap, sessionStacks[0] ?? buyIn, HOST_BOT_SEAT);
+        const stackSource = deriveStackSource(hand.seatMap, sessionStacks, buyIn);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, HOST_BOT_SEAT);
+        const nextStacks = nextHand.players.map((player) => player.stack);
+        setSessionStacks(nextStacks);
         setHand((prev) => ({
             ...nextHand,
             holeCards: prev.holeCards,
             communityCards: prev.communityCards,
         }));
-        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: HOST_BOT_SEAT, manualSeats: nextManualSeats });
-    }, [buyIn, connectedOpponentSeats, manualSeats, saveSession, sessionStacks]);
+        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat: HOST_BOT_SEAT, manualSeats: nextManualSeats, sessionStacks: nextStacks });
+    }, [buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, saveSession, sessionStacks]);
 
     useEffect(() => {
         if (phase !== 'deal-hole' || pickingFor === 'showdown') {
@@ -1339,13 +1377,17 @@ export default function PlayPage() {
             return;
         }
 
-        const nextHand = buildHandFromSeatMap(nextSeatMap, sessionStacks[0] ?? buyIn, botSeat);
+        const stackSource = deriveStackSource(hand.seatMap, sessionStacks, buyIn);
+        const nextHand = buildHandFromSeatMap(nextSeatMap, stackSource, buyIn, botSeat);
+        const nextStacks = nextHand.players.map((player) => player.stack);
+        setSessionStacks(nextStacks);
         setHand((prev) => ({
             ...nextHand,
             holeCards: prev.holeCards,
             communityCards: prev.communityCards,
         }));
-    }, [botSeat, buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, phase, pickingFor, sessionStacks]);
+        void saveSession({ phase: 'deal-hole', hand: nextHand, botSeat, manualSeats, sessionStacks: nextStacks });
+    }, [botSeat, buyIn, connectedOpponentSeats, hand.seatMap, manualSeats, phase, pickingFor, saveSession, sessionStacks]);
 
     useEffect(() => {
         if (phase !== 'deal-hole') {
@@ -1561,9 +1603,6 @@ export default function PlayPage() {
                     showBack={false}
                     onBack={() => undefined}
                     onStart={() => {
-                        if (sessionStacks.length === 0) {
-                            setSessionStacks([buyIn]);
-                        }
                         startNewHand();
                     }}
                     onEnd={() => {
