@@ -115,7 +115,7 @@ type HandState = {
     isLoading: boolean;
 };
 type HistoryEntry = { phase: Phase; hand: HandState; label: string };
-type ShowdownEntry = { playerIndex: number; position: number; cards: Card[]; mucked: boolean };
+type ShowdownEntry = { playerIndex: number; position: number; seat: number; cards: Card[]; mucked: boolean };
 
 type BackendLegalActions = {
     actor_index: number;
@@ -1135,6 +1135,7 @@ export default function PlayPage() {
             .map(({ player, index }) => ({
                 playerIndex: index,
                 position: player.position,
+                seat: hand.seatMap[index] ?? player.position,
                 cards: [],
                 mucked: false,
             }));
@@ -1749,6 +1750,7 @@ export default function PlayPage() {
                     communityCards={hand.communityCards}
                     street={hand.street}
                     players={hand.players}
+                    seatMap={hand.seatMap}
                     playerNames={playerNames}
                     tableSeats={playTableSeats}
                     currentPlayerIdx={hand.currentPlayerIdx}
