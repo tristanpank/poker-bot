@@ -26,8 +26,25 @@ jest.mock('../../app/lib/backend', () => ({
 
 const mockFetch = jest.fn();
 
+// Suppress residual act() warnings that come from async polling effects
+// firing after a test has already finished its assertions. All tests pass
+// and the warnings do not indicate real problems.
+let consoleErrorSpy: jest.SpyInstance;
+
 beforeAll(() => {
   global.fetch = mockFetch;
+  consoleErrorSpy = jest
+    .spyOn(console, 'error')
+    .mockImplementation((...args) => {
+      // Let through any error that is NOT the act() warning
+      if (typeof args[0] === 'string' && args[0].includes('not wrapped in act')) return;
+      // eslint-disable-next-line no-console
+      console.warn(...args);
+    });
+});
+
+afterAll(() => {
+  consoleErrorSpy.mockRestore();
 });
 
 afterEach(() => {
@@ -76,45 +93,55 @@ describe('JoinPage – idle state', () => {
     });
   });
 
-  it('renders the page heading', () => {
-    render(<JoinPage />);
+  // Helper: render JoinPage and flush the initial polling useEffect so that
+  // setBotSeat / setAvailableSeats state updates are wrapped in act().
+  async function renderAndSettle() {
+    await act(async () => {
+      render(<JoinPage />);
+    });
+  }
+
+  it('renders the page heading', async () => {
+    await renderAndSettle();
     expect(screen.getByRole('heading', { name: /join poker session/i })).toBeInTheDocument();
   });
 
-  it('renders the session code input', () => {
-    render(<JoinPage />);
+  it('renders the session code input', async () => {
+    await renderAndSettle();
     expect(screen.getByPlaceholderText('ABC123')).toBeInTheDocument();
   });
 
-  it('renders the player name input', () => {
-    render(<JoinPage />);
+  it('renders the player name input', async () => {
+    await renderAndSettle();
     expect(screen.getByPlaceholderText(/player/i)).toBeInTheDocument();
   });
 
-  it('renders the Join Session button', () => {
-    render(<JoinPage />);
+  it('renders the Join Session button', async () => {
+    await renderAndSettle();
     expect(screen.getByRole('button', { name: /join session/i })).toBeInTheDocument();
   });
 
-  it('Join button is disabled when code is less than 6 characters', () => {
-    render(<JoinPage />);
+  it('Join button is disabled when code is less than 6 characters', async () => {
+    await renderAndSettle();
     const input = screen.getByPlaceholderText('ABC123');
-    fireEvent.change(input, { target: { value: 'AB' } });
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'AB' } });
+    });
     expect(screen.getByRole('button', { name: /join session/i })).toBeDisabled();
   });
 
-  it('renders the seat picker with 6 seat buttons', () => {
-    render(<JoinPage />);
-    // Each seat in sixSeatLayout renders a button
-    const seatButtons = screen.getAllByRole('button');
-    // At least 6 buttons: 6 seat buttons + join button
-    expect(seatButtons.length).toBeGreaterThanOrEqual(6);
+  it('renders the seat picker with at least 7 buttons (6 seats + join)', async () => {
+    await renderAndSettle();
+    const buttons = screen.getAllByRole('button');
+    expect(buttons.length).toBeGreaterThanOrEqual(7);
   });
 
-  it('uppercases the code as it is typed', () => {
-    render(<JoinPage />);
+  it('uppercases the code as it is typed', async () => {
+    await renderAndSettle();
     const input = screen.getByPlaceholderText('ABC123') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'abc123' } });
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'abc123' } });
+    });
     expect(input.value).toBe('ABC123');
   });
 });
