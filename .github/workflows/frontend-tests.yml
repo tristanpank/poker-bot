@@ -1,0 +1,77 @@
+# GitHub Actions workflow for Poker Bot Frontend
+# Runs Jest unit and integration tests on every push and pull request
+
+name: Frontend Tests
+
+on:
+  push:
+    branches: ["**"]          # Run on every branch push
+  pull_request:
+    branches: [main, master]  # Also run when targeting main
+
+jobs:
+  test:
+    name: Jest (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x, 22.x]   # Test against LTS and current
+
+    defaults:
+      run:
+        working-directory: next-poker-app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+          cache-dependency-path: next-poker-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --no-coverage --ci --reporters=default --reporters=jest-junit
+        env:
+          CI: true
+          JEST_JUNIT_OUTPUT_DIR: ./test-results
+          JEST_JUNIT_OUTPUT_NAME: frontend-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()   # Upload even if tests fail so you can inspect failures
+        with:
+          name: frontend-test-results-node-${{ matrix.node-version }}
+          path: next-poker-app/test-results/frontend-results.xml
+
+  lint:
+    name: ESLint
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: next-poker-app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: "npm"
+          cache-dependency-path: next-poker-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+        continue-on-error: true   # Don't fail the workflow on lint warnings
