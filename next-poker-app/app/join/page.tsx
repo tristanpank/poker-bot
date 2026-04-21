@@ -436,8 +436,8 @@ export default function JoinPage() {
     : isStreaming && phase !== 'live'
       ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
       : isStreaming
-      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-      : 'bg-slate-700/50 text-slate-400 border border-slate-600/30';
+        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+        : 'bg-slate-700/50 text-slate-400 border border-slate-600/30';
 
   const isBusy = isJoining || isStartingWebcam || isStoppingWebcam;
 
@@ -528,15 +528,14 @@ export default function JoinPage() {
                       key={seat}
                       onClick={() => setPlayerPosition(seat)}
                       disabled={isDisabled}
-                      className={`absolute ${className} flex h-20 w-20 -translate-y-1/2 flex-col items-center justify-center rounded-3xl border text-center text-[11px] font-semibold transition-all ${
-                        isBotSeat
-                          ? 'border-sky-400/40 bg-sky-500/10 text-sky-100'
-                          : taken
-                            ? 'cursor-not-allowed border-slate-700/40 bg-slate-900/80 text-slate-500 opacity-60'
-                            : isSelected
-                              ? 'border-emerald-400 bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
-                              : 'border-slate-600/30 bg-slate-800/80 text-slate-300 hover:bg-slate-700/80 hover:border-slate-500/40'
-                      }`}
+                      className={`absolute ${className} flex h-20 w-20 flex-col items-center justify-center rounded-3xl border text-center text-[11px] font-semibold transition-all ${isBotSeat
+                        ? 'border-sky-400/40 bg-sky-500/10 text-sky-100'
+                        : taken
+                          ? 'cursor-not-allowed border-slate-700/40 bg-slate-900/80 text-slate-500 opacity-60'
+                          : isSelected
+                            ? 'border-emerald-400 bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/25'
+                            : 'border-slate-600/30 bg-slate-800/80 text-slate-300 hover:bg-slate-700/80 hover:border-slate-500/40'
+                        }`}
                     >
                       <span className="uppercase tracking-[0.16em]">{getSeatLabel(seat)}</span>
                       <span className="mt-1 text-[10px] text-white/80">
@@ -562,7 +561,7 @@ export default function JoinPage() {
                       ? 'Waiting for the host to choose the bot seat.'
                       : hasAnyAvailableSeat
                         ? 'Choose any open seat. Grey seats are already occupied.'
-                      : 'All seats are currently taken.'}
+                        : 'All seats are currently taken.'}
                 </p>
               )}
             </div>
