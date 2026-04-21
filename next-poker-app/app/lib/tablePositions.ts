@@ -9,12 +9,12 @@ export const tablePositionByPlayers: Record<number, string[]> = {
 export const FULL_RING_SEAT_COUNT = 6;
 
 export const sixSeatLayout = [
-  { seat: 0, className: 'left-1/2 top-0 -translate-x-1/2' },
-  { seat: 1, className: 'right-[8%] top-[15%] translate-x-1/2' },
-  { seat: 2, className: 'right-[8%] bottom-[15%] translate-x-1/2' },
-  { seat: 3, className: 'left-1/2 bottom-0 -translate-x-1/2' },
-  { seat: 4, className: 'left-[8%] bottom-[15%] -translate-x-1/2' },
-  { seat: 5, className: 'left-[8%] top-[15%] -translate-x-1/2' },
+  { seat: 0, className: 'left-1/2 top-[2%] -translate-x-1/2' },
+  { seat: 1, className: 'right-[14%] top-[15%] translate-x-1/2' },
+  { seat: 2, className: 'right-[14%] bottom-[15%] translate-x-1/2' },
+  { seat: 3, className: 'left-1/2 bottom-[2%] -translate-x-1/2' },
+  { seat: 4, className: 'left-[14%] bottom-[15%] -translate-x-1/2' },
+  { seat: 5, className: 'left-[14%] top-[15%] -translate-x-1/2' },
 ] as const;
 
 export function getTablePosition(position: number, tableSize: number): string {
